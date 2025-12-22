@@ -1,0 +1,21 @@
+# LiveKit Agent Framework
+livekit-agents[silero,turn-detector]~=1.2
+livekit-plugins-openai>=0.7.0
+livekit-plugins-deepgram>=0.6.0
+livekit-plugins-assemblyai>=0.2.0
+livekit-plugins-cartesia>=0.2.0
+livekit-plugins-noise-cancellation~=0.2
+
+# Google Calendar API
+google-auth>=2.0.0
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.1.0
+google-api-python-client>=2.0.0
+
+# Contact & Date Utilities
+phonenumbers>=8.13.0
+email-validator>=2.0.0
+python-dateutil>=2.8.0
+
+# Environment & Config
+python-dotenv>=1.0

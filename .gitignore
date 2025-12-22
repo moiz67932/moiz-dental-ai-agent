@@ -1,0 +1,30 @@
+# Environment variables
+.env
+.env.*
+.env.local
+
+# Google OAuth secrets & tokens
+google_oauth_client_secret.json
+google_token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+
+# Project-specific folders
+KMS/
+Website/
+
+# OS / Editor
+.DS_Store
+.vscode/
+
+# Logs / cache
+*.log
+.cache/
