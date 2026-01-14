@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 try:
     from google.oauth2 import service_account
     from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
     from googleapiclient.discovery import build
     _GOOGLE_LIBS_AVAILABLE = True
 except Exception:
@@ -30,6 +31,50 @@ _SCOPES = ["https://www.googleapis.com/auth/calendar"]
 # Cache services by a stable key (so we don't rebuild each call)
 _SERVICE_CACHE: dict[str, Any] = {}
 _CACHE_LOCK = threading.Lock()
+
+# Global callback for token refresh persistence
+_TOKEN_REFRESH_CALLBACK: Optional[callable] = None
+
+
+def set_token_refresh_callback(callback: callable):
+    """
+    Register a callback to be invoked when OAuth tokens are refreshed.
+    The callback receives (new_token_dict: dict) and should persist it.
+    """
+    global _TOKEN_REFRESH_CALLBACK
+    _TOKEN_REFRESH_CALLBACK = callback
+
+
+class RefreshableCredentials(Credentials):
+    """
+    Extended Credentials that invokes a callback when tokens are refreshed.
+    This enables non-blocking persistence of refreshed tokens to the database.
+    """
+    
+    def __init__(self, *args, on_refresh_callback: Optional[callable] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_refresh_callback = on_refresh_callback
+    
+    def refresh(self, request):
+        """Refresh the token and invoke callback with new token data."""
+        super().refresh(request)
+        
+        # After refresh, invoke callback with new token data
+        if self._on_refresh_callback or _TOKEN_REFRESH_CALLBACK:
+            new_token_dict = {
+                "token": self.token,
+                "refresh_token": self.refresh_token,
+                "token_uri": self.token_uri,
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "scopes": list(self.scopes) if self.scopes else list(_SCOPES),
+            }
+            callback = self._on_refresh_callback or _TOKEN_REFRESH_CALLBACK
+            if callback:
+                try:
+                    callback(new_token_dict)
+                except Exception as e:
+                    print(f"[calendar] Token refresh callback error: {e}")
 
 
 @dataclass(frozen=True)
@@ -60,14 +105,40 @@ def _fingerprint_auth(auth: CalendarAuth) -> str:
     return json.dumps(base, sort_keys=True)
 
 
-def _build_google_credentials(auth: CalendarAuth):
+def _build_google_credentials(auth: CalendarAuth, on_refresh_callback: Optional[callable] = None):
+    """
+    Build Google credentials from CalendarAuth.
+    
+    For OAuth tokens, uses RefreshableCredentials to enable non-blocking
+    persistence of refreshed tokens back to the database.
+    """
     if not _GOOGLE_LIBS_AVAILABLE:
         return None
 
     if auth.auth_type == "oauth_user":
         info = dict(auth.secret_json)
         info.setdefault("token_uri", "https://oauth2.googleapis.com/token")
-        return Credentials.from_authorized_user_info(info, scopes=_SCOPES)
+        
+        # Use RefreshableCredentials for callback support
+        creds = RefreshableCredentials(
+            token=info.get("token"),
+            refresh_token=info.get("refresh_token"),
+            token_uri=info.get("token_uri"),
+            client_id=info.get("client_id"),
+            client_secret=info.get("client_secret"),
+            scopes=info.get("scopes") or _SCOPES,
+            on_refresh_callback=on_refresh_callback,
+        )
+        
+        # Check if token needs immediate refresh
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                print("[calendar] Token was expired, refreshed successfully.")
+            except Exception as e:
+                print(f"[calendar] Token refresh failed: {e}")
+        
+        return creds
 
     if auth.auth_type == "service_account":
         creds = service_account.Credentials.from_service_account_info(
@@ -80,10 +151,15 @@ def _build_google_credentials(auth: CalendarAuth):
     raise ValueError(f"Unsupported auth_type: {auth.auth_type}")
 
 
-def _get_calendar_service(auth: Optional[CalendarAuth] = None):
+def _get_calendar_service(auth: Optional[CalendarAuth] = None, on_refresh_callback: Optional[callable] = None):
     """
     Return a Google Calendar service or None (dry-run).
     If auth is None, falls back to env-file behavior (local dev).
+    
+    Args:
+        auth: CalendarAuth object with credentials
+        on_refresh_callback: Optional callback invoked when tokens are refreshed.
+                            Receives dict with new token data for persistence.
     """
     if not _GOOGLE_LIBS_AVAILABLE:
         print("[calendar] Google libs not installed → DRY-RUN mode.")
@@ -96,7 +172,7 @@ def _get_calendar_service(auth: Optional[CalendarAuth] = None):
             if key in _SERVICE_CACHE:
                 return _SERVICE_CACHE[key]
 
-            creds = _build_google_credentials(auth)
+            creds = _build_google_credentials(auth, on_refresh_callback=on_refresh_callback)
             service = build("calendar", "v3", credentials=creds, cache_discovery=False)
             _SERVICE_CACHE[key] = service
             return service
