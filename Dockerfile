@@ -49,7 +49,6 @@ COPY agent_v2.py .
 COPY contact_utils.py .
 COPY calendar_client.py .
 COPY supabase_calendar_store.py .
-COPY base_prompt.py . 
 
 # Environment config
 ENV PYTHONUNBUFFERED=1
