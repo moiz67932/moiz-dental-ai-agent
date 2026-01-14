@@ -55,7 +55,7 @@ if not logger.handlers:
 # LiveKit Imports
 # =============================================================================
 
-from livekit import agents
+from livekit import agents, rtc
 from livekit.agents import (
     AutoSubscribe,
     JobContext,
@@ -69,6 +69,7 @@ from livekit.agents import (
     llm,  # For ChatContext
 )
 from livekit.agents.llm import function_tool  # v1.2.14 decorator for tools
+from livekit.rtc import ParticipantKind  # For SIP participant detection
 from livekit.plugins import (
     openai as openai_plugin,
     silero,
@@ -1577,6 +1578,7 @@ async def snappy_entrypoint(ctx: JobContext):
     5. Non-blocking booking
     6. Global state for tool access
     7. Dynamic Slot-Aware Prompting - system prompt refreshes every turn!
+    8. SIP Telephony Support - auto-detect inbound calls & pre-fill caller phone
     """
     global _GLOBAL_STATE, _GLOBAL_CLINIC_TZ, _GLOBAL_CLINIC_INFO, _REFRESH_AGENT_MEMORY
     
@@ -1589,10 +1591,51 @@ async def snappy_entrypoint(ctx: JobContext):
     participant = await ctx.wait_for_participant()
     logger.info(f"[LIFECYCLE] Participant: {participant.identity}")
     
-    # Get called number
-    metadata = json.loads(ctx.job.metadata) if ctx.job.metadata else {}
-    sip_info = metadata.get("sip", {}) if isinstance(metadata, dict) else {}
-    called_num = sip_info.get("toUser", os.getenv("DEFAULT_TEST_NUMBER", "+13103410536"))
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 📞 SIP TELEPHONY DETECTION — Prioritize real SIP metadata over job metadata
+    # ═══════════════════════════════════════════════════════════════════════════
+    called_num = None
+    caller_phone = None
+    is_sip_call = False
+    
+    # PRIORITY 1: Real SIP participant metadata (production telephony)
+    if participant.kind == ParticipantKind.PARTICIPANT_KIND_SIP:
+        is_sip_call = True
+        # Extract SIP attributes from participant
+        sip_attrs = participant.attributes or {}
+        caller_phone = sip_attrs.get("sip.phoneNumber") or sip_attrs.get("sip.callingNumber")
+        called_num = sip_attrs.get("sip.toUser") or sip_attrs.get("sip.calledNumber")
+        
+        logger.info(f"📞 [SIP] Inbound call detected!")
+        logger.info(f"📞 [SIP] Caller (from): {caller_phone}")
+        logger.info(f"📞 [SIP] Called (to): {called_num}")
+        
+        # Pre-fill caller's phone immediately — agent won't ask for it!
+        if caller_phone:
+            clean_phone = normalize_phone(caller_phone, DEFAULT_PHONE_REGION)
+            if clean_phone:
+                state.phone_e164 = clean_phone
+                state.phone_last4 = clean_phone[-4:]
+                state.phone_confirmed = True  # Auto-confirmed from SIP
+                logger.info(f"📞 [SIP] ✓ Caller phone pre-filled: ***{state.phone_last4}")
+    
+    # PRIORITY 2: Job metadata (LiveKit Playground / testing)
+    if not called_num:
+        metadata = json.loads(ctx.job.metadata) if ctx.job.metadata else {}
+        sip_info = metadata.get("sip", {}) if isinstance(metadata, dict) else {}
+        called_num = sip_info.get("toUser")
+        # Also check for caller in job metadata
+        if not caller_phone:
+            caller_phone = sip_info.get("fromUser") or sip_info.get("phoneNumber")
+        
+        if called_num:
+            logger.info(f"[METADATA] Using job metadata: toUser={called_num}")
+    
+    # PRIORITY 3: Fallback to environment default (for local testing only)
+    # NOTE: Comment out in production to ensure proper SIP routing
+    if not called_num:
+        called_num = os.getenv("DEFAULT_TEST_NUMBER", "+13103410536")
+        logger.warning(f"[FALLBACK] Using default test number: {called_num}")
     
     # ⚡ SINGLE DB QUERY
     clinic_info, agent_info, settings, agent_name = await fetch_clinic_context_optimized(called_num)
@@ -1769,6 +1812,33 @@ async def snappy_entrypoint(ctx: JobContext):
         logger.debug(f"[MEMORY] User speech committed, refreshing agent memory...")
         refresh_agent_memory()
         logger.info(f"[STATE] Current: {state.slot_summary()}")
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 📞 SIP PARTICIPANT EVENT — Handle late-joining SIP participants
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    @ctx.room.on("participant_connected")
+    def _on_participant_joined(p: rtc.RemoteParticipant):
+        """
+        Handle SIP participants that join after initial connection.
+        Auto-capture caller phone from SIP metadata for zero-ask booking.
+        """
+        if p.kind == ParticipantKind.PARTICIPANT_KIND_SIP:
+            sip_attrs = p.attributes or {}
+            caller_phone = sip_attrs.get("sip.phoneNumber") or sip_attrs.get("sip.callingNumber")
+            
+            logger.info(f"📞 [SIP EVENT] Participant joined: {p.identity}")
+            
+            # Pre-fill phone if not already captured
+            if caller_phone and not state.phone_e164:
+                clean_phone = normalize_phone(caller_phone, DEFAULT_PHONE_REGION)
+                if clean_phone:
+                    state.phone_e164 = clean_phone
+                    state.phone_last4 = clean_phone[-4:]
+                    state.phone_confirmed = True
+                    logger.info(f"📞 [SIP EVENT] ✓ Auto-captured phone: ***{state.phone_last4}")
+                    # Refresh agent memory so it knows phone is captured
+                    refresh_agent_memory()
     
     # Start the session
     await session.start(
