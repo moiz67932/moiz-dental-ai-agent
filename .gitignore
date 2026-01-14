@@ -1,30 +1,115 @@
-# Environment variables
+# =============================================================================
+# PRODUCTION .gitignore — Agent V2 Voice AI
+# =============================================================================
+# Auto-generated for production deployment. Excludes secrets, development
+# artifacts, test files, and legacy/unused code.
+
+# =============================================================================
+# 🔐 SECRETS & CREDENTIALS (NEVER COMMIT)
+# =============================================================================
 .env
-.env.*
 .env.local
+.env.production
+.env.*.local
+*.pem
+*.key
 
-# Google OAuth secrets & tokens
-google_oauth_client_secret.json
+# Google OAuth & Service Account tokens
 google_token.json
+google_oauth_client_secret.json
+*.json
+!package.json
+!package-lock.json
 
-# Python
+# =============================================================================
+# 🐍 PYTHON DEVELOPMENT ARTIFACTS
+# =============================================================================
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Virtual environments
+# Virtual Environments
 venv/
+ENV/
+env/
 .venv/
+.env/
 
-# Project-specific folders
-KMS/
-Website/
+# =============================================================================
+# 🧪 TESTING (NOT FOR PRODUCTION)
+# =============================================================================
+test_*.py
+*_test.py
+tests/
+pytest.ini
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
 
-# OS / Editor
-.DS_Store
+# =============================================================================
+# 🗑️ LEGACY/UNUSED FILES (Not imported by agent_v2.py)
+# =============================================================================
+# Old agent version
+agent.py
+
+# Extraction module (inline in agent_v2.py now)
+extraction/
+
+# Intent router (not used)
+intent_router.py
+
+# Knowledge/RAG (commented out, not active)
+knowledge/
+
+# Utility/setup scripts (not needed in production)
+fix_prompts.py
+knowledge_uploader.py
+oauth_bootstrap.py
+
+# Prompts module (prompt is inline in agent_v2.py)
+prompts/
+
+# =============================================================================
+# 💻 IDE & EDITOR
+# =============================================================================
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
 
-# Logs / cache
+# =============================================================================
+# 📦 MISC
+# =============================================================================
 *.log
-.cache/
+logs/
+KMS/
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp
