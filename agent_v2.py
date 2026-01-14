@@ -106,6 +106,9 @@ from supabase import create_client
 
 load_dotenv(".env.local")
 
+# Telephony agent identity (must match SIP trunk dispatch rules)
+LIVEKIT_AGENT_NAME = os.getenv("LIVEKIT_AGENT_NAME", "telephony_agent")
+
 DEFAULT_TZ = os.getenv("DEFAULT_TIMEZONE", "Asia/Karachi")
 DEFAULT_MIN = int(os.getenv("DEFAULT_APPT_MINUTES", "60"))
 DEFAULT_PHONE_REGION = os.getenv("DEFAULT_PHONE_REGION", "PK")
@@ -2150,6 +2153,8 @@ async def snappy_entrypoint(ctx: JobContext):
 # =============================================================================
 
 def prewarm(proc: agents.JobProcess):
+    logger.info(f"[TELEPHONY] Worker identity set to: {LIVEKIT_AGENT_NAME}")
+    
     try:
         silero.VAD.load()
         logger.info("[PREWARM] ✓ VAD loaded")
@@ -2175,5 +2180,7 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=snappy_entrypoint,
             prewarm_fnc=prewarm,
+            agent_name=LIVEKIT_AGENT_NAME,  # Must match SIP trunk dispatch rules
+            load_threshold=1.0,  # Prioritize this agent for incoming telephony calls
         )
     )
