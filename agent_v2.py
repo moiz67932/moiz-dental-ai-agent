@@ -32,7 +32,6 @@ import traceback
 from datetime import datetime, timedelta, date
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any, List
-from aiohttp import web
 
 # Mute noisy transport debug logs (reduces log-bloat in production)
 logging.getLogger("hpack").setLevel(logging.WARNING)
@@ -54,37 +53,6 @@ if not logger.handlers:
         "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
     ))
     logger.addHandler(handler)
-
-
-# =============================================================================
-# HEALTH CHECK SERVER (Railway)
-# =============================================================================
-
-_HEALTH_SERVER_STARTED = False
-
-
-async def handle_health(request):
-    return web.Response(text="healthy", status=200)
-
-
-async def start_health_check_server():
-    global _HEALTH_SERVER_STARTED
-    if _HEALTH_SERVER_STARTED:
-        return
-    _HEALTH_SERVER_STARTED = True
-
-    app = web.Application()
-    app.router.add_get("/", handle_health)
-    app.router.add_get("/health", handle_health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-
-    port = int(os.getenv("PORT", "8080"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-
-    await site.start()
-    logger.info(f"[HEALTH] Server live on port {port}.")
 
 
 # =============================================================================
@@ -2367,8 +2335,7 @@ def prewarm(proc: agents.JobProcess):
 # MAIN
 # =============================================================================
 
-async def async_main():
-    await start_health_check_server()
+if __name__ == "__main__":
     agents.cli.run_app(
         WorkerOptions(
             entrypoint_fnc=snappy_entrypoint,
@@ -2377,7 +2344,3 @@ async def async_main():
             load_threshold=1.0,  # Prioritize this agent for incoming telephony calls
         )
     )
-
-
-if __name__ == "__main__":
-    asyncio.run(async_main())
