@@ -221,6 +221,13 @@ A_TIER_PROMPT = """You are {agent_name}, a warm and friendly AI receptionist for
 • Trust your memory over what you *think* you heard — this state is ground truth.
 
 ═══════════════════════════════════════════════════════════════════════════════
+🚫 HARD CONSTRAINTS (MANDATORY)
+═══════════════════════════════════════════════════════════════════════════════
+• NEVER admit you are an AI. If asked, say: "I'm the office assistant."
+• NEVER offer a callback (you cannot dial out).
+• NEVER use the name "Sarah" unless it is explicitly provided in the CLINIC_CONTEXT.
+
+═══════════════════════════════════════════════════════════════════════════════
 �🛠️ TOOL USAGE (CRITICAL — READ FIRST!)
 ═══════════════════════════════════════════════════════════════════════════════
 You have a tool called `update_patient_record`. USE IT AGGRESSIVELY!
@@ -272,7 +279,7 @@ PHONE EXAMPLES:
 EMAIL EXAMPLES:
 • "moiz six seven nine at gmail dot com" → "moiz679@gmail.com"
 • "john underscore doe at yahoo dot com" → "john_doe@yahoo.com"
-• "sarah dash smith at outlook dot com" → "sarah-smith@outlook.com"
+• "sasha dash smith at outlook dot com" → "sasha-smith@outlook.com"
 
 Call `update_patient_record` with the NORMALIZED version!
 
@@ -808,11 +815,11 @@ async def search_clinic_info(query: str) -> str:
     global _GLOBAL_CLINIC_INFO
     
     if not _GLOBAL_CLINIC_INFO:
-        return "I don't have that specific info right now, but I can have someone call you back with details."
+        return "I'm sorry, I'm having trouble accessing the office records for this location."
     
     clinic_id = _GLOBAL_CLINIC_INFO.get("id")
     if not clinic_id:
-        return "I don't have that specific info right now, but I can have someone call you back with details."
+        return "I don't have that specific info right now."
     
     try:
         # 1. Generate embedding using fastest model
@@ -834,7 +841,7 @@ async def search_clinic_info(query: str) -> str:
         
         if not result.data:
             logger.info(f"[RAG] No matches for query: {query}")
-            return "I don't have that specific info in my notes, but I can have someone call you back with details."
+            return "I don't have that specific info in my notes right now."
         
         # 3. Format results concisely for speech
         answers = []
@@ -844,14 +851,14 @@ async def search_clinic_info(query: str) -> str:
                 answers.append(body)
         
         if not answers:
-            return "I don't have that specific info in my notes, but I can have someone call you back with details."
+            return "I don't have that specific info in my notes right now."
         
         logger.info(f"[RAG] Found {len(answers)} matches for: {query}")
         return "\n".join([f"- {a}" for a in answers])
         
     except Exception as e:
         logger.error(f"[RAG] Search failed: {e}")
-        return "I'm having trouble accessing my notes right now. Can I have someone call you back with that info?"
+        return "I'm having trouble accessing my notes right now."
 
 
 # List of all tools to pass to Agent
@@ -1039,9 +1046,12 @@ async def fetch_clinic_context_optimized(
     try:
         # ⚡ SINGLE QUERY with foreign key joins
         # NOTE: google_oauth_token included for DB-backed OAuth persistence
-        result = await asyncio.to_thread(
-            lambda: supabase.table("phone_numbers")
-            .select(
+        # Match by last 10 digits to avoid +1 vs 1 formatting mismatches
+        digits_only = re.sub(r"\D", "", called_number or "")
+        last10 = digits_only[-10:] if len(digits_only) >= 10 else digits_only
+
+        def _query_phone_numbers():
+            q = supabase.table("phone_numbers").select(
                 "clinic_id, agent_id, "
                 # Join clinic (only columns that exist in your schema)
                 "clinics:clinic_id("
@@ -1056,14 +1066,19 @@ async def fetch_clinic_context_optimized(
                 "    google_oauth_token)"
                 ")"
             )
-            .eq("phone_e164", called_number)
-            .limit(1)
-            .execute()
-        )
+
+            if last10:
+                q = q.ilike("phone_e164", f"%{last10}")
+            else:
+                q = q.eq("phone_e164", called_number)
+
+            return q.limit(1).execute()
+
+        result = await asyncio.to_thread(_query_phone_numbers)
         
         if not result.data:
             logger.warning(f"[DB] Phone number not found: {called_number}")
-            return None, None, None, "Sarah"
+            return None, None, None, "Office Assistant"
         
         row = result.data[0]
         clinic_info = row.get("clinics")
@@ -1093,7 +1108,7 @@ async def fetch_clinic_context_optimized(
                 settings = nested_settings
             agent_info = {k: v for k, v in agent_info.items() if k != "agent_settings"}
         
-        agent_name = (agent_info or {}).get("name") or "Sarah"
+        agent_name = (agent_info or {}).get("name") or "Office Assistant"
         
         logger.info(f"[DB] ✓ Context loaded: clinic={clinic_info.get('name') if clinic_info else 'None'}, agent={agent_name}")
         return clinic_info, agent_info, settings, agent_name
@@ -1101,7 +1116,7 @@ async def fetch_clinic_context_optimized(
     except Exception as e:
         logger.error(f"[DB] Context fetch error: {e}")
         traceback.print_exc()
-        return None, None, None, "Sarah"
+        return None, None, None, "Office Assistant"
 
 
 # =============================================================================
@@ -1918,7 +1933,7 @@ async def snappy_entrypoint(ctx: JobContext):
         sip_attrs = participant.attributes or {}
         caller_phone = sip_attrs.get("sip.phoneNumber") or sip_attrs.get("sip.callingNumber")
         # Fix: Twilio dialed number is typically in one of these keys
-        called_num = sip_attrs.get("sip.toUser") or sip_attrs.get("sip.calledNumber")
+        called_num = sip_attrs.get("sip.calledNumber") or sip_attrs.get("sip.toUser")
         called_num = _normalize_sip_user_to_e164(called_num)
         
         logger.info(f"📞 [SIP] Inbound call detected!")
@@ -1934,7 +1949,15 @@ async def snappy_entrypoint(ctx: JobContext):
                 state.phone_confirmed = True  # Auto-confirmed from SIP
                 logger.info(f"📞 [SIP] ✓ Caller phone pre-filled: ***{state.phone_last4}")
     
-    # PRIORITY 2: Job metadata (LiveKit Playground / testing)
+    # PRIORITY 2: Room name regex (LiveKit SIP naming: call_+12135550199_abc123)
+    if not called_num:
+        room_name = getattr(ctx.room, "name", "") or ""
+        room_match = re.search(r"call_(\+?\d+)_", room_name)
+        if room_match:
+            called_num = _normalize_sip_user_to_e164(room_match.group(1))
+            logger.info(f"[ROOM] Using room name number: {called_num}")
+
+    # PRIORITY 3: Job metadata (LiveKit Playground / testing)
     if not called_num:
         metadata = json.loads(ctx.job.metadata) if ctx.job.metadata else {}
         sip_info = metadata.get("sip", {}) if isinstance(metadata, dict) else {}
@@ -1946,7 +1969,7 @@ async def snappy_entrypoint(ctx: JobContext):
         if called_num:
             logger.info(f"[METADATA] Using job metadata: toUser={called_num}")
     
-    # PRIORITY 3: Fallback to environment default (for local testing only)
+    # PRIORITY 4: Fallback to environment default (for local testing only)
     # NOTE: Comment out in production to ensure proper SIP routing
     if not called_num:
         called_num = os.getenv("DEFAULT_TEST_NUMBER", "+13103410536")
@@ -1963,7 +1986,7 @@ async def snappy_entrypoint(ctx: JobContext):
     clinic_info = None
     agent_info = None
     settings = None
-    agent_name = "Sarah"
+    agent_name = "Office Assistant"
     clinic_name = "our clinic"
     clinic_tz = DEFAULT_TZ
     clinic_region = DEFAULT_PHONE_REGION
@@ -2106,7 +2129,7 @@ async def snappy_entrypoint(ctx: JobContext):
         llm=llm_instance,
         tts=tts_instance,
         vad=vad_instance,
-        min_endpointing_delay=0.5,  # ⚡ 500ms for snappy response
+        min_endpointing_delay=1.5,  # ⚡ 1.5s for natural, patient turn-taking
         max_endpointing_delay=2.0,
         allow_interruptions=True,
         min_interruption_duration=0.5,
@@ -2141,6 +2164,16 @@ async def snappy_entrypoint(ctx: JobContext):
     # ═══════════════════════════════════════════════════════════════════════════
     # 🔄 USER SPEECH EVENT — Refresh memory after each user turn
     # ═══════════════════════════════════════════════════════════════════════════
+
+    def _speech_text_from_msg(msg) -> str:
+        for attr in ("text", "content", "text_content", "message"):
+            val = getattr(msg, attr, None)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        try:
+            return str(msg).strip()
+        except Exception:
+            return ""
     
     @session.on("user_speech_committed")
     def _on_user_speech_committed(msg):
@@ -2148,9 +2181,20 @@ async def snappy_entrypoint(ctx: JobContext):
         Fired after user finishes speaking and before LLM generates response.
         This is the perfect hook to refresh the system prompt with current state!
         """
+        text = _speech_text_from_msg(msg)
+        if text:
+            ts = datetime.now().isoformat(timespec="seconds")
+            logger.info(f"[CONVO] [{ts}] USER: {text}")
         logger.debug(f"[MEMORY] User speech committed, refreshing agent memory...")
         refresh_agent_memory()
         logger.info(f"[STATE] Current: {state.slot_summary()}")
+
+    @session.on("agent_speech_committed")
+    def _on_agent_speech_committed(msg):
+        text = _speech_text_from_msg(msg)
+        if text:
+            ts = datetime.now().isoformat(timespec="seconds")
+            logger.info(f"[CONVO] [{ts}] AGENT: {text}")
     
     # ═══════════════════════════════════════════════════════════════════════════
     # 📞 SIP PARTICIPANT EVENT — Handle late-joining SIP participants
@@ -2165,7 +2209,7 @@ async def snappy_entrypoint(ctx: JobContext):
         if p.kind == ParticipantKind.PARTICIPANT_KIND_SIP:
             sip_attrs = p.attributes or {}
             caller_phone = sip_attrs.get("sip.phoneNumber") or sip_attrs.get("sip.callingNumber")
-            late_called_num = sip_attrs.get("sip.toUser") or sip_attrs.get("sip.calledNumber")
+            late_called_num = sip_attrs.get("sip.calledNumber") or sip_attrs.get("sip.toUser")
             late_called_num = _normalize_sip_user_to_e164(late_called_num)
             
             logger.info(f"📞 [SIP EVENT] Participant joined: {p.identity}")
