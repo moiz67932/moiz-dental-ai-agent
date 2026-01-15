@@ -1905,8 +1905,6 @@ async def snappy_entrypoint(ctx: JobContext):
     7. Dynamic Slot-Aware Prompting - system prompt refreshes every turn!
     8. SIP Telephony Support - auto-detect inbound calls & pre-fill caller phone
     """
-    asyncio.create_task(start_health_check_server())
-
     global _GLOBAL_STATE, _GLOBAL_CLINIC_TZ, _GLOBAL_CLINIC_INFO, _REFRESH_AGENT_MEMORY
     
     state = PatientState()
@@ -2369,7 +2367,8 @@ def prewarm(proc: agents.JobProcess):
 # MAIN
 # =============================================================================
 
-if __name__ == "__main__":
+async def async_main():
+    await start_health_check_server()
     agents.cli.run_app(
         WorkerOptions(
             entrypoint_fnc=snappy_entrypoint,
@@ -2378,3 +2377,7 @@ if __name__ == "__main__":
             load_threshold=1.0,  # Prioritize this agent for incoming telephony calls
         )
     )
+
+
+if __name__ == "__main__":
+    asyncio.run(async_main())
