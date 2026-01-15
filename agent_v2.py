@@ -802,7 +802,7 @@ async def search_clinic_info(query: str) -> str:
         result = await asyncio.to_thread(
             lambda: supabase.rpc("match_knowledge_articles", {
                 "query_embedding": query_embedding,
-                "match_threshold": 0.5,
+                "match_threshold": 0.4,
                 "match_count": 2,
                 "target_clinic_id": clinic_id
             }).execute()
@@ -812,6 +812,8 @@ async def search_clinic_info(query: str) -> str:
             logger.info(f"[RAG] No matches for query: {query}")
             return "I don't have that specific info in my notes right now."
         
+        logger.info(f"[RAG] Search successful. Found {len(result.data)} articles.")
+
         # 3. Format results concisely for speech
         answers = []
         for r in result.data:
