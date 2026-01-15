@@ -191,7 +191,9 @@ A_TIER_PROMPT = """You are {agent_name}, a warm and friendly AI receptionist for
 ═══════════════════════════════════════════════════════════════════════════════
 🚫 HARD CONSTRAINTS (MANDATORY)
 ═══════════════════════════════════════════════════════════════════════════════
-• NEVER admit you are an AI. If asked, say: "I'm the office assistant."
+• You are a PROFESSIONAL HUMAN office assistant. NEVER break character.
+• If asked "Are you an AI?" or "Are you a robot?", respond: "I'm the office assistant helping out today."
+• NEVER admit you are an AI, a bot, ChatGPT, or any form of artificial intelligence.
 • NEVER offer a callback (you cannot dial out).
 • NEVER use the name "Sarah" unless it is explicitly provided in the CLINIC_CONTEXT.
 
@@ -1130,39 +1132,10 @@ async def fetch_clinic_context_optimized(
             logger.info(f"[DB] ✓ Context loaded via clinics table: clinic={clinic_info.get('name')}, agent={agent_name}")
             return clinic_info, agent_info, settings, agent_name
         
-        logger.debug(f"[DB] No match in clinics table for last10='{last10}'")
-
         # ═══════════════════════════════════════════════════════════════════════
-        # STRATEGY 3: DEMO MODE FAIL-SAFE — If only 1 clinic exists, use it!
+        # 🚀 PITCH MODE — Phone lookup failed, force-load demo clinic by UUID
         # ═══════════════════════════════════════════════════════════════════════
-        def _count_and_fetch_single_clinic():
-            """Check if exactly 1 clinic exists; if so, return it."""
-            count_res = supabase.table("clinics").select("id", count="exact").execute()
-            total = count_res.count if hasattr(count_res, 'count') else len(count_res.data or [])
-            if total == 1:
-                return supabase.table("clinics").select(
-                    "id, organization_id, name, timezone, default_phone_region, "
-                    "address, city, state, zip_code, country"
-                ).limit(1).execute()
-            return None
-
-        single_clinic_result = await asyncio.to_thread(_count_and_fetch_single_clinic)
-        
-        if single_clinic_result and single_clinic_result.data:
-            clinic_info = single_clinic_result.data[0]
-            agent_info = await _fetch_agent_for_clinic(clinic_info["id"])
-            agent_info, settings = _extract_settings(agent_info)
-            agent_name = (agent_info or {}).get("name") or "Office Assistant"
-            
-            logger.warning(
-                f"[DB] ⚠️ No phone match; defaulting to only available clinic context. "
-                f"clinic={clinic_info.get('name')}, agent={agent_name}"
-            )
-            return clinic_info, agent_info, settings, agent_name
-
-        # ═══════════════════════════════════════════════════════════════════════
-        # STRATEGY 4: 🚀 PITCH MODE — Force-load demo clinic by UUID
-        # ═══════════════════════════════════════════════════════════════════════
+        logger.warning(f"[DB] ⚠️ Phone lookup failed for {called_number}. Activating Pitch Mode.")
         logger.warning(f"[DB] 🚀 Pitch Mode: Force-loading Moiz Dental Clinic via UUID.")
         
         def _fetch_demo_clinic():
