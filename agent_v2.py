@@ -66,7 +66,7 @@ from livekit.agents import (
     WorkerOptions,
     Agent,
     AgentSession,
-    RoomInputOptions,
+    RoomOptions,
     RunContext,
     metrics as lk_metrics,
     MetricsCollectedEvent,
@@ -80,7 +80,6 @@ from livekit.plugins import (
     deepgram as deepgram_plugin,
     assemblyai as assemblyai_plugin,
     cartesia as cartesia_plugin,
-    noise_cancellation,
 )
 
 # =============================================================================
@@ -2252,6 +2251,7 @@ async def snappy_entrypoint(ctx: JobContext):
         if text:
             ts = datetime.now().isoformat(timespec="seconds")
             logger.info(f"[CONVO] [{ts}] USER: {text}")
+            logger.info(f"[AUDIO] User audio received: {text}")
         logger.debug(f"[MEMORY] User speech committed, refreshing agent memory...")
         refresh_agent_memory()
         logger.info(f"[STATE] Current: {state.slot_summary()}")
@@ -2321,8 +2321,7 @@ async def snappy_entrypoint(ctx: JobContext):
     await session.start(
         room=ctx.room,
         agent=snappy_agent,
-        room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVC(),
+        room_options=RoomOptions(
             close_on_disconnect=True,
         ),
     )
