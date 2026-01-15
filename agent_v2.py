@@ -1998,13 +1998,18 @@ async def snappy_entrypoint(ctx: JobContext):
                 state.phone_confirmed = True  # Auto-confirmed from SIP
                 logger.info(f"📞 [SIP] ✓ Caller phone pre-filled: ***{state.phone_last4}")
     
-    # PRIORITY 2: Room name regex (LiveKit SIP naming: call_+12135550199_abc123)
+    # PRIORITY 2: Room name regex — flexible US phone number extraction
+    # Matches +1XXXXXXXXXX anywhere in room name (e.g., call_+13103410536_abc123)
     if not called_num:
         room_name = getattr(ctx.room, "name", "") or ""
-        room_match = re.search(r"call_(\+?\d+)_", room_name)
+        # Try US format first (+1 followed by 10 digits)
+        room_match = re.search(r"(\+1\d{10})", room_name)
+        if not room_match:
+            # Fallback: any number in call_{number}_ format
+            room_match = re.search(r"call_(\+?\d+)_", room_name)
         if room_match:
             called_num = _normalize_sip_user_to_e164(room_match.group(1))
-            logger.info(f"[ROOM] Using room name number: {called_num}")
+            logger.info(f"[ROOM] ✓ Extracted phone from room name: {called_num}")
 
     # PRIORITY 3: Job metadata (LiveKit Playground / testing)
     if not called_num:
@@ -2041,14 +2046,17 @@ async def snappy_entrypoint(ctx: JobContext):
     clinic_region = DEFAULT_PHONE_REGION
     agent_lang = "en-US"
 
-    # Opportunistic fast-wait (<=250ms) to get real clinic/agent info without harming TTFB
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 🏥 IDENTITY-FIRST: Wait up to 2s for DB context (better silence than wrong name)
+    # ═══════════════════════════════════════════════════════════════════════════
     if context_task:
         try:
             clinic_info, agent_info, settings, agent_name = await asyncio.wait_for(
-                asyncio.shield(context_task), timeout=0.25
+                asyncio.shield(context_task), timeout=2.0
             )
+            logger.info(f"[DB] ✓ Context loaded in <2s: clinic={clinic_info.get('name') if clinic_info else 'None'}")
         except asyncio.TimeoutError:
-            pass
+            logger.warning("[DB] ⚠️ Context fetch exceeded 2s timeout — using defaults")
 
     # Apply whatever context we have at this point
     _GLOBAL_CLINIC_INFO = clinic_info
@@ -2132,8 +2140,18 @@ async def snappy_entrypoint(ctx: JobContext):
     # Build initial prompt (may be placeholder; we'll refresh once DB context arrives)
     initial_system_prompt = get_updated_instructions()
 
-    # Voice pre-buffering: say something immediately (do not wait on DB/LLM history)
-    greeting = "Hello!"
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 🎙️ GREETING: Use DB greeting_text if context loaded, otherwise fallback
+    # ═══════════════════════════════════════════════════════════════════════════
+    if settings and settings.get("greeting_text"):
+        greeting = settings.get("greeting_text")
+        logger.info(f"[GREETING] Using DB greeting: {greeting[:50]}...")
+    elif clinic_info:
+        greeting = f"Hi, thanks for calling {clinic_name}! How can I help you today?"
+        logger.info(f"[GREETING] Using clinic-aware greeting for {clinic_name}")
+    else:
+        greeting = "Hello! Thanks for calling. How can I help you today?"
+        logger.info("[GREETING] Using default greeting (DB context not loaded)")
     
     # ⚡ HIGH-PERFORMANCE LLM with function calling
     llm_instance = openai_plugin.LLM(
@@ -2312,10 +2330,14 @@ async def snappy_entrypoint(ctx: JobContext):
     # Say greeting ASAP (don't await; let TTS start immediately)
     asyncio.create_task(session.say(greeting))
 
-    # Finish context load (if it didn't complete yet) and refresh prompt/greeting
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 🔄 DEFERRED CONTEXT LOAD — Only if 2s timeout was exceeded
+    # ═══════════════════════════════════════════════════════════════════════════
+    # NOTE: With 2s timeout above, this rarely triggers. It's a safety net.
     if context_task and not context_task.done():
         try:
             clinic_info, agent_info, settings, agent_name = await context_task
+            logger.info(f"[DB] ✓ Deferred context loaded: {clinic_info.get('name') if clinic_info else 'None'}")
 
             _GLOBAL_CLINIC_INFO = clinic_info
             _GLOBAL_AGENT_SETTINGS = settings
@@ -2331,10 +2353,11 @@ async def snappy_entrypoint(ctx: JobContext):
 
             refresh_agent_memory()
 
+            # Send proper greeting now that we have context (only if we didn't have it before)
             followup = (settings or {}).get("greeting_text") or (
                 f"Hi, I'm {agent_name} from {clinic_name}. How can I help you today?"
             )
-            if followup and followup.strip().lower() not in {"hello", "hello!"}:
+            if followup:
                 asyncio.create_task(session.say(followup))
 
         except Exception as e:
