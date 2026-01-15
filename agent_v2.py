@@ -32,6 +32,11 @@ import traceback
 from datetime import datetime, timedelta, date
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any, List
+from aiohttp import web
+
+# Mute noisy transport debug logs (reduces log-bloat in production)
+logging.getLogger("hpack").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
@@ -49,6 +54,37 @@ if not logger.handlers:
         "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
     ))
     logger.addHandler(handler)
+
+
+# =============================================================================
+# HEALTH CHECK SERVER (Railway)
+# =============================================================================
+
+_HEALTH_SERVER_STARTED = False
+
+
+async def handle_health(request):
+    return web.Response(text="healthy", status=200)
+
+
+async def start_health_check_server():
+    global _HEALTH_SERVER_STARTED
+    if _HEALTH_SERVER_STARTED:
+        return
+    _HEALTH_SERVER_STARTED = True
+
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+
+    await site.start()
+    logger.info(f"[HEALTH] Server live on port {port}.")
 
 
 # =============================================================================
@@ -106,6 +142,8 @@ from supabase import create_client
 
 load_dotenv(".env.local")
 
+ENVIRONMENT = (os.getenv("ENVIRONMENT") or "development").strip().lower()
+
 # Telephony agent identity (must match SIP trunk dispatch rules)
 LIVEKIT_AGENT_NAME = os.getenv("LIVEKIT_AGENT_NAME", "telephony_agent")
 
@@ -132,6 +170,35 @@ BOOKED_STATUSES = ["scheduled", "confirmed"]
 GOOGLE_CALENDAR_AUTH_MODE = os.getenv("GOOGLE_CALENDAR_AUTH", "oauth")
 GOOGLE_OAUTH_TOKEN_PATH = os.getenv("GOOGLE_OAUTH_TOKEN", "./google_token.json")
 GOOGLE_CALENDAR_ID_DEFAULT = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+
+
+def _normalize_sip_user_to_e164(raw: Optional[str]) -> Optional[str]:
+    """Best-effort normalization for SIP headers like sip.toUser/sip.calledNumber."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    # Strip common SIP URI wrappers
+    s = s.replace("sip:", "")
+    if "@" in s:
+        s = s.split("@", 1)[0]
+
+    # Keep only digits and '+'
+    s = re.sub(r"[^\d+]", "", s)
+    if not s:
+        return None
+
+    # Convert 00-prefixed international numbers
+    if s.startswith("00"):
+        s = "+" + s[2:]
+
+    # If it's digits-only, assume missing '+' and add it
+    if not s.startswith("+") and s.isdigit() and len(s) >= 10:
+        s = "+" + s
+
+    return s
 
 
 # =============================================================================
@@ -1823,6 +1890,8 @@ async def snappy_entrypoint(ctx: JobContext):
     7. Dynamic Slot-Aware Prompting - system prompt refreshes every turn!
     8. SIP Telephony Support - auto-detect inbound calls & pre-fill caller phone
     """
+    asyncio.create_task(start_health_check_server())
+
     global _GLOBAL_STATE, _GLOBAL_CLINIC_TZ, _GLOBAL_CLINIC_INFO, _REFRESH_AGENT_MEMORY
     
     state = PatientState()
@@ -1840,6 +1909,7 @@ async def snappy_entrypoint(ctx: JobContext):
     called_num = None
     caller_phone = None
     is_sip_call = False
+    used_fallback_called_num = False
     
     # PRIORITY 1: Real SIP participant metadata (production telephony)
     if participant.kind == ParticipantKind.PARTICIPANT_KIND_SIP:
@@ -1847,7 +1917,9 @@ async def snappy_entrypoint(ctx: JobContext):
         # Extract SIP attributes from participant
         sip_attrs = participant.attributes or {}
         caller_phone = sip_attrs.get("sip.phoneNumber") or sip_attrs.get("sip.callingNumber")
+        # Fix: Twilio dialed number is typically in one of these keys
         called_num = sip_attrs.get("sip.toUser") or sip_attrs.get("sip.calledNumber")
+        called_num = _normalize_sip_user_to_e164(called_num)
         
         logger.info(f"📞 [SIP] Inbound call detected!")
         logger.info(f"📞 [SIP] Caller (from): {caller_phone}")
@@ -1866,7 +1938,7 @@ async def snappy_entrypoint(ctx: JobContext):
     if not called_num:
         metadata = json.loads(ctx.job.metadata) if ctx.job.metadata else {}
         sip_info = metadata.get("sip", {}) if isinstance(metadata, dict) else {}
-        called_num = sip_info.get("toUser")
+        called_num = _normalize_sip_user_to_e164(sip_info.get("toUser"))
         # Also check for caller in job metadata
         if not caller_phone:
             caller_phone = sip_info.get("fromUser") or sip_info.get("phoneNumber")
@@ -1879,27 +1951,49 @@ async def snappy_entrypoint(ctx: JobContext):
     if not called_num:
         called_num = os.getenv("DEFAULT_TEST_NUMBER", "+13103410536")
         logger.warning(f"[FALLBACK] Using default test number: {called_num}")
-    
-    # ⚡ SINGLE DB QUERY
-    clinic_info, agent_info, settings, agent_name = await fetch_clinic_context_optimized(called_num)
-    
-    # Set global clinic info and settings for booking tool (DB-backed OAuth)
+        used_fallback_called_num = True
+
+    # ⚡ FAST-PATH CONTEXT: start the optimized fetch immediately once called_num is known.
+    # Do not block audio startup on this; we only wait a tiny budget to personalize if it returns fast.
+    context_task: Optional[asyncio.Task] = None
+    if called_num:
+        context_task = asyncio.create_task(fetch_clinic_context_optimized(called_num))
+
+    # Defaults (used if DB context isn't ready yet)
+    clinic_info = None
+    agent_info = None
+    settings = None
+    agent_name = "Sarah"
+    clinic_name = "our clinic"
+    clinic_tz = DEFAULT_TZ
+    clinic_region = DEFAULT_PHONE_REGION
+    agent_lang = "en-US"
+
+    # Opportunistic fast-wait (<=250ms) to get real clinic/agent info without harming TTFB
+    if context_task:
+        try:
+            clinic_info, agent_info, settings, agent_name = await asyncio.wait_for(
+                asyncio.shield(context_task), timeout=0.25
+            )
+        except asyncio.TimeoutError:
+            pass
+
+    # Apply whatever context we have at this point
     _GLOBAL_CLINIC_INFO = clinic_info
-    
-    # Set global agent settings for DB-backed OAuth token refresh
+
     global _GLOBAL_AGENT_SETTINGS
     _GLOBAL_AGENT_SETTINGS = settings
-    
-    clinic_name = (clinic_info or {}).get("name") or "our clinic"
-    clinic_tz = (clinic_info or {}).get("timezone") or DEFAULT_TZ
-    clinic_region = (clinic_info or {}).get("default_phone_region") or DEFAULT_PHONE_REGION
-    agent_lang = (agent_info or {}).get("default_language") or "en-US"
-    
+
+    clinic_name = (clinic_info or {}).get("name") or clinic_name
+    clinic_tz = (clinic_info or {}).get("timezone") or clinic_tz
+    clinic_region = (clinic_info or {}).get("default_phone_region") or clinic_region
+    agent_lang = (agent_info or {}).get("default_language") or agent_lang
+
     state.tz = clinic_tz
     _GLOBAL_CLINIC_TZ = clinic_tz  # Set global for tool timezone anchoring
+
     schedule = load_schedule_from_settings(settings or {})
-    
-    # Set global schedule for tools to access (duration lookup, validation)
+
     global _GLOBAL_SCHEDULE
     _GLOBAL_SCHEDULE = schedule
     
@@ -1963,13 +2057,11 @@ async def snappy_entrypoint(ctx: JobContext):
     # Set global refresh callback for tools to use
     _REFRESH_AGENT_MEMORY = refresh_agent_memory
     
-    # Build initial prompt with empty state
+    # Build initial prompt (may be placeholder; we'll refresh once DB context arrives)
     initial_system_prompt = get_updated_instructions()
-    
-    # Greeting (context-aware from DB)
-    greeting = (settings or {}).get("greeting_text") or (
-        f"Hi, I'm {agent_name} from {clinic_name}. How can I help you today?"
-    )
+
+    # Voice pre-buffering: say something immediately (do not wait on DB/LLM history)
+    greeting = "Hello!"
     
     # ⚡ HIGH-PERFORMANCE LLM with function calling
     llm_instance = openai_plugin.LLM(
@@ -2073,6 +2165,8 @@ async def snappy_entrypoint(ctx: JobContext):
         if p.kind == ParticipantKind.PARTICIPANT_KIND_SIP:
             sip_attrs = p.attributes or {}
             caller_phone = sip_attrs.get("sip.phoneNumber") or sip_attrs.get("sip.callingNumber")
+            late_called_num = sip_attrs.get("sip.toUser") or sip_attrs.get("sip.calledNumber")
+            late_called_num = _normalize_sip_user_to_e164(late_called_num)
             
             logger.info(f"📞 [SIP EVENT] Participant joined: {p.identity}")
             
@@ -2086,6 +2180,31 @@ async def snappy_entrypoint(ctx: JobContext):
                     logger.info(f"📞 [SIP EVENT] ✓ Auto-captured phone: ***{state.phone_last4}")
                     # Refresh agent memory so it knows phone is captured
                     refresh_agent_memory()
+
+            # Late dialed-number metadata is common; refresh context if we started with a fallback.
+            if late_called_num and used_fallback_called_num:
+                logger.info(f"📞 [SIP EVENT] ✓ Late called number detected: {late_called_num}")
+                # Fire-and-forget context refresh
+                async def _refresh_context():
+                    nonlocal clinic_info, agent_info, settings, agent_name
+                    nonlocal clinic_name, clinic_tz, clinic_region, agent_lang
+                    try:
+                        ci, ai, st, an = await fetch_clinic_context_optimized(late_called_num)
+                        clinic_info, agent_info, settings, agent_name = ci, ai, st, (an or agent_name)
+                        globals()["_GLOBAL_CLINIC_INFO"] = clinic_info
+                        globals()["_GLOBAL_AGENT_SETTINGS"] = settings
+                        globals()["_GLOBAL_SCHEDULE"] = load_schedule_from_settings(settings or {})
+                        clinic_name = (clinic_info or {}).get("name") or clinic_name
+                        clinic_tz = (clinic_info or {}).get("timezone") or clinic_tz
+                        clinic_region = (clinic_info or {}).get("default_phone_region") or clinic_region
+                        agent_lang = (agent_info or {}).get("default_language") or agent_lang
+                        state.tz = clinic_tz
+                        globals()["_GLOBAL_CLINIC_TZ"] = clinic_tz
+                        refresh_agent_memory()
+                    except Exception as e:
+                        logger.warning(f"[DB] Late context refresh failed: {e}")
+
+                asyncio.create_task(_refresh_context())
     
     # Start the session
     await session.start(
@@ -2096,9 +2215,37 @@ async def snappy_entrypoint(ctx: JobContext):
             close_on_disconnect=True,
         ),
     )
-    
-    # Say greeting
-    await session.say(greeting)
+
+    # Say greeting ASAP (don't await; let TTS start immediately)
+    asyncio.create_task(session.say(greeting))
+
+    # Finish context load (if it didn't complete yet) and refresh prompt/greeting
+    if context_task and not context_task.done():
+        try:
+            clinic_info, agent_info, settings, agent_name = await context_task
+
+            _GLOBAL_CLINIC_INFO = clinic_info
+            _GLOBAL_AGENT_SETTINGS = settings
+
+            clinic_name = (clinic_info or {}).get("name") or clinic_name
+            clinic_tz = (clinic_info or {}).get("timezone") or clinic_tz
+            clinic_region = (clinic_info or {}).get("default_phone_region") or clinic_region
+            agent_lang = (agent_info or {}).get("default_language") or agent_lang
+
+            state.tz = clinic_tz
+            _GLOBAL_CLINIC_TZ = clinic_tz
+            _GLOBAL_SCHEDULE = load_schedule_from_settings(settings or {})
+
+            refresh_agent_memory()
+
+            followup = (settings or {}).get("greeting_text") or (
+                f"Hi, I'm {agent_name} from {clinic_name}. How can I help you today?"
+            )
+            if followup and followup.strip().lower() not in {"hello", "hello!"}:
+                asyncio.create_task(session.say(followup))
+
+        except Exception as e:
+            logger.warning(f"[DB] Deferred context load failed: {e}")
     
     # Shutdown
     async def _on_shutdown():
@@ -2164,10 +2311,13 @@ def prewarm(proc: agents.JobProcess):
     # Verify calendar
     print("\n" + "="*50)
     print("[CONFIG] Verifying calendar...")
-    if GOOGLE_OAUTH_TOKEN_PATH and os.path.exists(GOOGLE_OAUTH_TOKEN_PATH):
-        print(f"[CONFIG] ✓ OAuth token: {GOOGLE_OAUTH_TOKEN_PATH}")
+    if ENVIRONMENT == "production":
+        print("[CONFIG] ✓ Production: using Supabase-backed OAuth token (skipping local file check)")
     else:
-        print(f"[CONFIG] ❌ OAuth token missing")
+        if GOOGLE_OAUTH_TOKEN_PATH and os.path.exists(GOOGLE_OAUTH_TOKEN_PATH):
+            print(f"[CONFIG] ✓ OAuth token: {GOOGLE_OAUTH_TOKEN_PATH}")
+        else:
+            print(f"[CONFIG] ❌ OAuth token missing")
     print("="*50 + "\n")
 
 
