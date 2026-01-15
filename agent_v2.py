@@ -1001,6 +1001,9 @@ class PatientState:
 # OPTIMIZED SUPABASE FETCH — SINGLE QUERY WITH JOINS + DEMO FALLBACK
 # =============================================================================
 
+# 🚀 PITCH MODE: Hardcoded demo clinic UUID for guaranteed fallback
+DEMO_CLINIC_ID = "5afce5fa-8436-43a3-af65-da29ccad7228"
+
 async def fetch_clinic_context_optimized(
     called_number: str,
 ) -> Tuple[Optional[dict], Optional[dict], Optional[dict], str]:
@@ -1011,6 +1014,7 @@ async def fetch_clinic_context_optimized(
     1. phone_numbers table: Match last 10 digits (ignores +1/+92 prefixes)
     2. clinics table: Direct phone match on clinic record (if stored there)
     3. DEMO FALLBACK: If only 1 clinic exists in DB, use it automatically
+    4. PITCH MODE: Force-load DEMO_CLINIC_ID as ultimate fallback
     
     Returns: (clinic_info, agent_info, agent_settings, agent_name)
     """
@@ -1157,9 +1161,34 @@ async def fetch_clinic_context_optimized(
             return clinic_info, agent_info, settings, agent_name
 
         # ═══════════════════════════════════════════════════════════════════════
-        # NO MATCH FOUND — Return defaults
+        # STRATEGY 4: 🚀 PITCH MODE — Force-load demo clinic by UUID
         # ═══════════════════════════════════════════════════════════════════════
-        logger.warning(f"[DB] ❌ No clinic context found for: {called_number} (tried phone_numbers, clinics, and demo fallback)")
+        logger.warning(f"[DB] 🚀 Pitch Mode: Force-loading Moiz Dental Clinic via UUID.")
+        
+        def _fetch_demo_clinic():
+            """Force-fetch the demo clinic by hardcoded UUID."""
+            return supabase.table("clinics").select(
+                "id, organization_id, name, timezone, default_phone_region, "
+                "address, city, state, zip_code, country"
+            ).eq("id", DEMO_CLINIC_ID).limit(1).execute()
+
+        demo_result = await asyncio.to_thread(_fetch_demo_clinic)
+        
+        if demo_result.data:
+            clinic_info = demo_result.data[0]
+            agent_info = await _fetch_agent_for_clinic(DEMO_CLINIC_ID)
+            agent_info, settings = _extract_settings(agent_info)
+            agent_name = (agent_info or {}).get("name") or "Office Assistant"
+            
+            logger.info(
+                f"[DB] ✓ Pitch Mode context loaded: clinic={clinic_info.get('name')}, agent={agent_name}"
+            )
+            return clinic_info, agent_info, settings, agent_name
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # ABSOLUTE FALLBACK — Demo clinic UUID not found in DB
+        # ═══════════════════════════════════════════════════════════════════════
+        logger.error(f"[DB] ❌ CRITICAL: Demo clinic UUID {DEMO_CLINIC_ID} not found in database!")
         return None, None, None, "Office Assistant"
 
     except Exception as e:
