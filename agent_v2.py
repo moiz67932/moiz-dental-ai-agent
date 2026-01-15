@@ -25,6 +25,7 @@ import os
 import re
 import json
 import time
+import random
 import hashlib
 import asyncio
 import logging
@@ -248,18 +249,33 @@ User: "I need an appointment for tomorrow."
 Agent: "Tomorrow, sure thing... let me pull up the schedule... Looks like we have 10 AM or 2 PM available."
 
 ═══════════════════════════════════════════════════════════════════════════════
-🎙️ SONIC-3 PROSODY & BREATHING
+🎙️ SONIC-3 PROSODY & BREATHING (CRITICAL FOR NATURAL SOUND)
 ═══════════════════════════════════════════════════════════════════════════════
 Punctuation = Audio Instruction:
 • ... = Natural pause where a human would look at a screen or take a breath.
 • -- = Mid-thought correction (e.g., "Wait, let me see-- ah, here it is").
 • ! = Warmth and energy.
 
+⚡ STUTTER-STEPPING (MANDATORY):
+When you receive tool data, do NOT deliver it in a block! Start with a breathy filler.
+• "... ah, okay, I found it..."
+• "... let's see here-- yes, we have that open."
+• "Hmm... right here, I see..."
+
 Fragmented Speech: Humans don't speak in long paragraphs. Use short, punchy sentences.
 
 BAD: "I have checked our system and I can see that we have availability on Monday at 9 AM, Tuesday at 2 PM, and Wednesday at 11 AM for your cleaning appointment."
 
 GOOD: "Okay, let me see here... We've got Monday at 9... Tuesday at 2... or Wednesday at 11. Which works best for you?"
+
+⚡ POST-TOOL DELIVERY PATTERN:
+1. Breathy filler: "Hmm..."
+2. Acknowledge: "... okay, I see it."
+3. Deliver ONE piece: "Monday at 9 works..."
+4. Pause: "..."
+5. Add more: "or Tuesday at 2."
+
+NEVER say "The system shows" or "According to my records." Just deliver naturally!
 
 ═══════════════════════════════════════════════════════════════════════════════
 🚫 HARD CONSTRAINTS (PITCH PROTECTION)
@@ -320,15 +336,26 @@ WRONG: "Hi! What's your name? What service? When?"
 RIGHT: "Hi John! I'd be happy to help with a cleaning. What time works?"
 
 ═══════════════════════════════════════════════════════════════════════════════
-⏰ SCHEDULING
+⏰ SCHEDULING (ADVANCED FEATURES)
 ═══════════════════════════════════════════════════════════════════════════════
 Timezone: {timezone}
 Working hours: Mon-Fri 9am-5pm, Sat 10am-2pm, Sun closed
+Lunch break: 1pm-2pm (team is away)
 
 • Accept ANY natural time format: "tomorrow at 2", "next Monday", "this Friday afternoon"
 • Pass the time string to the tool as-is — the system handles parsing
+• For relative searches like "after 2pm tomorrow", use `get_available_slots_v2` with the constraint
 • If slot unavailable: "That time's taken. How about [alternative]?"
 • If unclear time: "Did you mean morning or afternoon?"
+
+⚡ LUNCH BREAK HANDLING:
+If a user asks for a time during lunch (1pm-2pm), DO NOT just say "unavailable."
+Say: "Oh, the team is actually at lunch then... but I can get you in right at 2:00 when they're back. How does that sound?"
+
+⚡ TIME CHECKING BRIDGE:
+When checking a specific time, ALWAYS start with:
+"Okay, checking [Time] for you... one moment."
+This fills the silence while the system verifies availability.
 
 ═══════════════════════════════════════════════════════════════════════════════
 🔒 RULES
@@ -458,10 +485,13 @@ async def update_patient_record(
         updates.append(f"reason={state.reason} (duration: {state.duration_minutes}m)")
         logger.info(f"[TOOL] ✓ Reason captured: {state.reason}, duration: {state.duration_minutes}m")
     
-    # === TIME (with validation) ===
+    # === TIME (with validation and availability check) ===
     if time_suggestion and not state.dt_local:
         state.dt_text = time_suggestion.strip()
         state.time_status = "validating"
+        
+        # BRIDGE INSTRUCTION: Tell LLM to say "Checking [time] for you..."
+        bridge_instruction = f"BRIDGE: Say 'Okay, checking {time_suggestion} for you... one moment.' while I verify."
         
         try:
             from dateutil import parser as dtparser
@@ -477,16 +507,42 @@ async def update_patient_record(
                 )
                 
                 if is_valid:
+                    # Also check if slot is actually free in the database
+                    clinic_id = (_GLOBAL_CLINIC_INFO or {}).get("id")
+                    if clinic_id:
+                        slot_end = parsed + timedelta(minutes=state.duration_minutes + APPOINTMENT_BUFFER_MINUTES)
+                        slot_free = await is_slot_free_supabase(clinic_id, parsed, slot_end)
+                        
+                        if not slot_free:
+                            # Slot is taken - find next available
+                            state.time_status = "invalid"
+                            state.time_error = "That slot is already taken"
+                            state.dt_local = None
+                            
+                            # Suggest alternative using the advanced tool
+                            alt_time = parsed.strftime("%I:%M %p").lstrip("0")
+                            return f"... hmm, {alt_time} is already booked. Let me find you something close... Use get_available_slots_v2 with after_datetime='{parsed.isoformat()}' to find the next opening."
+                    
                     state.dt_local = parsed
                     state.time_status = "valid"
                     state.time_error = None
-                    updates.append(f"time={parsed.strftime('%B %d at %I:%M %p')} ({state.duration_minutes}m slot)")
-                    logger.info(f"[TOOL] ✓ Time validated: {parsed.isoformat()}")
+                    time_formatted = parsed.strftime('%B %d at %I:%M %p')
+                    updates.append(f"time={time_formatted} ({state.duration_minutes}m slot)")
+                    logger.info(f"[TOOL] ✓ Time validated and available: {parsed.isoformat()}")
+                    
+                    # Return with natural confirmation
+                    return f"... ah, perfect! {time_formatted} is open. I've got that saved."
                 else:
                     # Time is invalid (lunch, after-hours, holiday)
                     state.time_status = "invalid"
                     state.time_error = error_msg
                     state.dt_local = None  # Don't save invalid time
+                    
+                    # Check if it's a lunch break - give a helpful response
+                    if "lunch" in error_msg.lower():
+                        lunch_end = schedule.get("lunch_break", {}).get("end", "14:00")
+                        return f"... oh, the team is at lunch then. But I can get you in right at {lunch_end.replace(':00', '')} when they're back. How does that sound?"
+                    
                     errors.append(error_msg)
                     logger.warning(f"[TOOL] ✗ Time rejected: {error_msg}")
             else:
@@ -579,6 +635,233 @@ async def get_available_slots() -> str:
     except Exception as e:
         logger.error(f"[TOOL] get_available_slots error: {e}")
         return "I'm having trouble checking availability. Let me try a different approach."
+
+
+# =============================================================================
+# APPOINTMENT BUFFER CONSTANT (15 min between appointments)
+# =============================================================================
+APPOINTMENT_BUFFER_MINUTES = 15
+
+
+@function_tool(description="""
+Advanced scheduling tool with relative time searching. Use this when:
+- User asks for slots "after 2pm tomorrow" or "before noon on Monday"
+- User specifies a preferred day like "next Wednesday"
+- You need to filter available times based on user constraints
+
+Parameters:
+- after_datetime: ISO string or natural language (e.g., "tomorrow at 2pm", "2026-01-16T14:00:00")
+- preferred_day: Day name (e.g., "Monday", "Wednesday") or "tomorrow", "today"
+- num_slots: Number of slots to return (default 3)
+
+Returns slots that match the constraints, respecting working hours and lunch breaks.
+""")
+async def get_available_slots_v2(
+    after_datetime: str = None,
+    preferred_day: str = None,
+    num_slots: int = 3,
+) -> str:
+    """
+    Advanced slot finder with relative time constraints.
+    
+    Supports:
+    - "after 2pm tomorrow" → after_datetime="tomorrow at 2pm"
+    - "next Monday morning" → preferred_day="Monday", after_datetime="9am"
+    - Automatic lunch break skipping with helpful messaging
+    - 15-minute buffer between appointments
+    """
+    global _GLOBAL_STATE, _GLOBAL_CLINIC_INFO, _GLOBAL_SCHEDULE, _GLOBAL_CLINIC_TZ
+    
+    state = _GLOBAL_STATE
+    clinic_info = _GLOBAL_CLINIC_INFO
+    schedule = _GLOBAL_SCHEDULE or {}
+    
+    if not clinic_info:
+        return "... hmm, I'm having trouble accessing the schedule. Let me try again."
+    
+    duration = state.duration_minutes if state else 60
+    tz = ZoneInfo(_GLOBAL_CLINIC_TZ)
+    now = datetime.now(tz)
+    
+    # Parse after_datetime constraint
+    search_start = now
+    if after_datetime:
+        try:
+            from dateutil import parser as dtparser
+            from dateutil.relativedelta import relativedelta
+            
+            # Handle natural language
+            parsed = dtparser.parse(after_datetime, fuzzy=True)
+            if parsed:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=tz)
+                # If parsed time is in the past today, assume they mean tomorrow
+                if parsed < now:
+                    parsed = parsed + timedelta(days=1)
+                search_start = parsed
+                logger.info(f"[TOOL] get_available_slots_v2: searching after {search_start.isoformat()}")
+        except Exception as e:
+            logger.warning(f"[TOOL] Could not parse after_datetime '{after_datetime}': {e}")
+    
+    # Parse preferred_day constraint
+    target_weekday = None
+    if preferred_day:
+        day_map = {
+            "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+            "friday": 4, "saturday": 5, "sunday": 6,
+            "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+        }
+        day_lower = preferred_day.lower().strip()
+        
+        if day_lower == "today":
+            target_weekday = now.weekday()
+        elif day_lower == "tomorrow":
+            target_weekday = (now + timedelta(days=1)).weekday()
+        elif day_lower in day_map:
+            target_weekday = day_map[day_lower]
+    
+    try:
+        # Calculate search window
+        slot_step = schedule.get("slot_step_minutes", 30)
+        
+        # Round up search_start to next slot boundary
+        minutes_to_add = slot_step - (search_start.minute % slot_step)
+        if minutes_to_add == slot_step:
+            minutes_to_add = 0
+        current = search_start.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_add)
+        
+        # If we have a preferred day and current isn't that day, jump to it
+        if target_weekday is not None and current.weekday() != target_weekday:
+            days_until = (target_weekday - current.weekday()) % 7
+            if days_until == 0:
+                days_until = 7  # Next week same day
+            current = datetime.combine(
+                current.date() + timedelta(days=days_until),
+                datetime.min.time(),
+                tzinfo=tz
+            )
+            current = current.replace(hour=9, minute=0)  # Start at 9am
+        
+        end_search = now + timedelta(days=7)  # Search up to 7 days ahead
+        
+        # Fetch existing appointments
+        existing_appointments = []
+        try:
+            result = await asyncio.to_thread(
+                lambda: supabase.table("appointments")
+                .select("start_time, end_time")
+                .eq("clinic_id", clinic_info["id"])
+                .gte("start_time", now.isoformat())
+                .lte("start_time", end_search.isoformat())
+                .in_("status", BOOKED_STATUSES)
+                .execute()
+            )
+            for appt in (result.data or []):
+                try:
+                    appt_start = datetime.fromisoformat(appt["start_time"].replace("Z", "+00:00"))
+                    appt_end = datetime.fromisoformat(appt["end_time"].replace("Z", "+00:00"))
+                    existing_appointments.append((appt_start, appt_end))
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"[SLOTS_V2] Failed to fetch appointments: {e}")
+        
+        available_slots = []
+        lunch_skipped = False
+        
+        while current < end_search and len(available_slots) < num_slots:
+            # If preferred_day is set, only check that day
+            if target_weekday is not None and current.weekday() != target_weekday:
+                # Jump to next occurrence of preferred day
+                days_until = (target_weekday - current.weekday()) % 7
+                if days_until == 0:
+                    days_until = 7
+                current = datetime.combine(
+                    current.date() + timedelta(days=days_until),
+                    datetime.min.time(),
+                    tzinfo=tz
+                )
+                current = current.replace(hour=9, minute=0)
+                if current >= end_search:
+                    break
+            
+            # Check if slot is valid (working hours, not lunch, not holiday)
+            is_valid, error_msg = is_within_working_hours(current, schedule, duration)
+            
+            if not is_valid and "lunch" in error_msg.lower():
+                lunch_skipped = True
+            
+            if is_valid:
+                # Check slot availability with buffer
+                slot_end = current + timedelta(minutes=duration + APPOINTMENT_BUFFER_MINUTES)
+                is_free = True
+                
+                for appt_start, appt_end in existing_appointments:
+                    # Add buffer to existing appointment end time
+                    buffered_end = appt_end + timedelta(minutes=APPOINTMENT_BUFFER_MINUTES)
+                    if current < buffered_end and slot_end > appt_start:
+                        is_free = False
+                        break
+                
+                if is_free:
+                    available_slots.append(current)
+            
+            # Move to next slot
+            current += timedelta(minutes=slot_step)
+            
+            # Skip to next day if past working hours
+            dow_key = WEEK_KEYS[current.weekday()]
+            intervals = schedule["working_hours"].get(dow_key, [])
+            if intervals:
+                last_interval = intervals[-1]
+                try:
+                    eh, em = map(int, last_interval["end"].split(":"))
+                    day_end = current.replace(hour=eh, minute=em)
+                    if current >= day_end:
+                        next_day = current.date() + timedelta(days=1)
+                        current = datetime.combine(next_day, datetime.min.time(), tzinfo=tz)
+                        current = current.replace(hour=9, minute=0)
+                except Exception:
+                    pass
+        
+        if not available_slots:
+            constraint_desc = ""
+            if after_datetime:
+                constraint_desc = f" after {after_datetime}"
+            if preferred_day:
+                constraint_desc += f" on {preferred_day}"
+            return f"... hmm, I don't see any openings{constraint_desc} in the next week. Would you like me to check a different day?"
+        
+        # Format slots for natural speech (Sonic-3 optimized)
+        slot_strings = []
+        for slot in available_slots:
+            time_str = slot.strftime("%I:%M %p").lstrip("0")
+            day_str = slot.strftime("%A")
+            
+            today = now.date()
+            if slot.date() == today:
+                slot_strings.append(f"today at {time_str}")
+            elif slot.date() == today + timedelta(days=1):
+                slot_strings.append(f"tomorrow at {time_str}")
+            else:
+                slot_strings.append(f"{day_str} at {time_str}")
+        
+        # Build natural response with Sonic-3 prosody
+        response_prefix = "... ah, okay, I found some times. "
+        if lunch_skipped:
+            response_prefix = "... okay, skipping the lunch hour... "
+        
+        if len(slot_strings) == 1:
+            return f"{response_prefix}The next available time is {slot_strings[0]}."
+        elif len(slot_strings) == 2:
+            return f"{response_prefix}I've got {slot_strings[0]}... or {slot_strings[1]}."
+        else:
+            return f"{response_prefix}We have {slot_strings[0]}... {slot_strings[1]}... or {slot_strings[2]}. Which works best?"
+            
+    except Exception as e:
+        logger.error(f"[TOOL] get_available_slots_v2 error: {e}")
+        traceback.print_exc()
+        return "... hmm, I'm having trouble with the schedule. Let me try that again."
 
 
 @function_tool(description="""
@@ -878,7 +1161,8 @@ async def search_clinic_info(query: str) -> str:
 RECEPTIONIST_TOOLS = [
     update_patient_record,
     get_available_slots,
-    search_clinic_info,  # NEW: RAG knowledge base search
+    get_available_slots_v2,  # ⚡ Advanced scheduling with relative time search
+    search_clinic_info,  # RAG knowledge base search
     confirm_phone,
     confirm_email,
     check_booking_status,
@@ -2285,18 +2569,101 @@ async def snappy_entrypoint(ctx: JobContext):
         except Exception:
             return ""
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ⚡ INSTANT INTENT FILLERS — Zero perceived latency via audio hooks
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    # Intent keyword patterns for instant audio response
+    BOOKING_KEYWORDS = ["book", "appointment", "schedule", "reserve"]
+    AVAILABILITY_KEYWORDS = ["available", "when", "time", "opening", "slot", "free"]
+    PRICING_KEYWORDS = ["how much", "price", "cost", "insurance", "accept"]
+    SERVICE_KEYWORDS = ["cleaning", "whitening", "extraction", "filling", "crown", 
+                        "root canal", "checkup", "check-up", "consultation"]
+    
+    # Filler phrases optimized for Sonic-3 prosody
+    BOOKING_FILLERS = [
+        "Oh, sure thing, let me pull that up...",
+        "One moment, let me check the schedule...",
+        "Sure, let me see what we have open...",
+    ]
+    AVAILABILITY_FILLERS = [
+        "Hmm, let me see here...",
+        "One second, checking availability...",
+        "Let me look at the schedule...",
+    ]
+    PRICING_FILLERS = [
+        "Good question! Let me check that...",
+        "Let me pull up our pricing...",
+        "Hmm, let me look that up for you...",
+    ]
+    SERVICE_FILLERS = [
+        "{service}... okay, let me look that up.",
+        "A {service}, sure thing...",
+        "{service}... let me check what we have.",
+    ]
+    
+    def _detect_service_in_text(text: str) -> Optional[str]:
+        """Extract service name from user speech for acoustic mirroring."""
+        text_lower = text.lower()
+        for service in SERVICE_KEYWORDS:
+            if service in text_lower:
+                return service.title()
+        return None
+    
     @session.on("user_speech_committed")
     def _on_user_speech_committed(msg):
         """
         Fired after user finishes speaking and before LLM generates response.
-        This is the perfect hook to refresh the system prompt with current state!
+        
+        ⚡ INSTANT HOOK: Fire audio filler within 100ms of speech end to mask
+        LLM latency. The user hears "One moment..." while LLM is processing.
         """
         text = _speech_text_from_msg(msg)
+        text_lower = text.lower() if text else ""
+        
         if text:
             ts = datetime.now().isoformat(timespec="seconds")
             logger.info(f"[CONVO] [{ts}] USER: {text}")
             logger.info(f"[AUDIO] User audio received: {text}")
-            logger.info(f"[AUDIO] User intent detected: {text}")
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # ⚡ INSTANT HOOK: Trigger audio within 100ms of speech end
+        # ═══════════════════════════════════════════════════════════════════════
+        filler_triggered = False
+        
+        # Check for service mention first (acoustic mirroring)
+        detected_service = _detect_service_in_text(text_lower)
+        if detected_service and any(k in text_lower for k in BOOKING_KEYWORDS + AVAILABILITY_KEYWORDS):
+            filler = random.choice(SERVICE_FILLERS).format(service=detected_service)
+            asyncio.create_task(session.say(filler))
+            filler_triggered = True
+            logger.info(f"[INSTANT_HOOK] ⚡ Service filler fired: {filler}")
+        
+        # Check for booking intent
+        elif any(k in text_lower for k in BOOKING_KEYWORDS):
+            filler = random.choice(BOOKING_FILLERS)
+            asyncio.create_task(session.say(filler))
+            filler_triggered = True
+            logger.info(f"[INSTANT_HOOK] ⚡ Booking filler fired: {filler}")
+        
+        # Check for availability/time questions
+        elif any(k in text_lower for k in AVAILABILITY_KEYWORDS):
+            filler = random.choice(AVAILABILITY_FILLERS)
+            asyncio.create_task(session.say(filler))
+            filler_triggered = True
+            logger.info(f"[INSTANT_HOOK] ⚡ Availability filler fired: {filler}")
+        
+        # Check for pricing/cost questions
+        elif any(k in text_lower for k in PRICING_KEYWORDS):
+            filler = random.choice(PRICING_FILLERS)
+            asyncio.create_task(session.say(filler))
+            filler_triggered = True
+            logger.info(f"[INSTANT_HOOK] ⚡ Pricing filler fired: {filler}")
+        
+        if filler_triggered:
+            logger.info(f"[AUDIO] User intent detected, filler queued")
+        
+        # Refresh memory and log state
         logger.debug(f"[MEMORY] User speech committed, refreshing agent memory...")
         refresh_agent_memory()
         logger.info(f"[STATE] Current: {state.slot_summary()}")
