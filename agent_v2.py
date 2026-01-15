@@ -998,35 +998,79 @@ class PatientState:
 
 
 # =============================================================================
-# OPTIMIZED SUPABASE FETCH — SINGLE QUERY WITH JOINS
+# OPTIMIZED SUPABASE FETCH — SINGLE QUERY WITH JOINS + DEMO FALLBACK
 # =============================================================================
 
 async def fetch_clinic_context_optimized(
     called_number: str,
 ) -> Tuple[Optional[dict], Optional[dict], Optional[dict], str]:
     """
-    A-TIER: Single Supabase query with nested joins.
+    A-TIER: Robust clinic lookup with fuzzy suffix matching and demo fallback.
     
-    Replaces 4 sequential queries (~3.2s) with 1 query (~100ms).
+    LOOKUP STRATEGY (in order):
+    1. phone_numbers table: Match last 10 digits (ignores +1/+92 prefixes)
+    2. clinics table: Direct phone match on clinic record (if stored there)
+    3. DEMO FALLBACK: If only 1 clinic exists in DB, use it automatically
     
     Returns: (clinic_info, agent_info, agent_settings, agent_name)
     """
+    
+    # Helper: Extract nested settings from agent_info
+    def _extract_settings(agent_info: Optional[dict]) -> Tuple[Optional[dict], Optional[dict]]:
+        """Extract agent_settings and clean agent_info dict."""
+        if not agent_info:
+            return None, None
+        settings = None
+        nested_settings = agent_info.get("agent_settings")
+        if isinstance(nested_settings, list) and nested_settings:
+            settings = nested_settings[0]
+        elif isinstance(nested_settings, dict):
+            settings = nested_settings
+        clean_agent = {k: v for k, v in agent_info.items() if k != "agent_settings"}
+        return clean_agent, settings
+    
+    # Helper: Fetch agent by clinic_id (used when phone_numbers lacks agent link)
+    async def _fetch_agent_for_clinic(clinic_id: str) -> Optional[dict]:
+        """Fetch agent and settings for a given clinic_id."""
+        try:
+            agent_res = await asyncio.to_thread(
+                lambda: supabase.table("agents")
+                .select(
+                    "id, organization_id, clinic_id, name, default_language, status, "
+                    "agent_settings(id, greeting_text, persona_tone, collect_insurance, "
+                    "  emergency_triage_enabled, booking_confirmation_enabled, config_json, "
+                    "  google_oauth_token)"
+                )
+                .eq("clinic_id", clinic_id)
+                .limit(1)
+                .execute()
+            )
+            return agent_res.data[0] if agent_res.data else None
+        except Exception as e:
+            logger.warning(f"[DB] Agent fetch for clinic {clinic_id} failed: {e}")
+            return None
+    
     try:
-        # ⚡ SINGLE QUERY with foreign key joins
-        # NOTE: google_oauth_token included for DB-backed OAuth persistence
-        # Match by last 10 digits to avoid +1 vs 1 formatting mismatches
+        # ═══════════════════════════════════════════════════════════════════════
+        # STEP 1: Fuzzy suffix matching — use last 10 digits to ignore prefixes
+        # ═══════════════════════════════════════════════════════════════════════
         digits_only = re.sub(r"\D", "", called_number or "")
         last10 = digits_only[-10:] if len(digits_only) >= 10 else digits_only
+        
+        logger.debug(f"[DB] Looking up phone: raw='{called_number}', last10='{last10}'")
 
+        # ═══════════════════════════════════════════════════════════════════════
+        # STRATEGY 1: Search phone_numbers table with suffix match
+        # ═══════════════════════════════════════════════════════════════════════
         def _query_phone_numbers():
             q = supabase.table("phone_numbers").select(
                 "clinic_id, agent_id, "
-                # Join clinic (only columns that exist in your schema)
+                # Join clinic
                 "clinics:clinic_id("
                 "  id, organization_id, name, timezone, default_phone_region, "
                 "  address, city, state, zip_code, country"
                 "), "
-                # Join agent with nested settings (includes google_oauth_token for OAuth)
+                # Join agent with nested settings
                 "agents:agent_id("
                 "  id, organization_id, clinic_id, name, default_language, status, "
                 "  agent_settings(id, greeting_text, persona_tone, collect_insurance, "
@@ -1034,52 +1078,89 @@ async def fetch_clinic_context_optimized(
                 "    google_oauth_token)"
                 ")"
             )
-
             if last10:
                 q = q.ilike("phone_e164", f"%{last10}")
             else:
                 q = q.eq("phone_e164", called_number)
-
             return q.limit(1).execute()
 
         result = await asyncio.to_thread(_query_phone_numbers)
         
-        if not result.data:
-            logger.warning(f"[DB] Phone number not found: {called_number}")
-            return None, None, None, "Office Assistant"
+        if result.data:
+            row = result.data[0]
+            clinic_info = row.get("clinics")
+            agent_info = row.get("agents")
+            
+            # Fallback: fetch agent by clinic_id if not linked to phone
+            if not agent_info and clinic_info:
+                agent_info = await _fetch_agent_for_clinic(clinic_info["id"])
+            
+            agent_info, settings = _extract_settings(agent_info)
+            agent_name = (agent_info or {}).get("name") or "Office Assistant"
+            
+            logger.info(f"[DB] ✓ Context loaded via phone_numbers: clinic={clinic_info.get('name') if clinic_info else 'None'}, agent={agent_name}")
+            return clinic_info, agent_info, settings, agent_name
         
-        row = result.data[0]
-        clinic_info = row.get("clinics")
-        agent_info = row.get("agents")
-        
-        # Fallback: fetch agent by clinic_id if not linked to phone
-        if not agent_info and clinic_info:
-            agent_res = await asyncio.to_thread(
-                lambda: supabase.table("agents")
-                .select(
-                    "id, organization_id, clinic_id, name, default_language, status, "
-                    "agent_settings(id, greeting_text, persona_tone, config_json, google_oauth_token)"
-                )
-                .eq("clinic_id", clinic_info["id"])
-                .limit(1)
-                .execute()
+        logger.debug(f"[DB] No match in phone_numbers for last10='{last10}'")
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # STRATEGY 2: Search clinics table directly (some setups store phone there)
+        # ═══════════════════════════════════════════════════════════════════════
+        def _query_clinics_direct():
+            q = supabase.table("clinics").select(
+                "id, organization_id, name, timezone, default_phone_region, "
+                "address, city, state, zip_code, country, phone"
             )
-            agent_info = agent_res.data[0] if agent_res.data else None
+            if last10:
+                q = q.ilike("phone", f"%{last10}")
+            return q.limit(1).execute()
+
+        clinic_result = await asyncio.to_thread(_query_clinics_direct)
         
-        # Extract nested settings
-        settings = None
-        if agent_info:
-            nested_settings = agent_info.get("agent_settings")
-            if isinstance(nested_settings, list) and nested_settings:
-                settings = nested_settings[0]
-            elif isinstance(nested_settings, dict):
-                settings = nested_settings
-            agent_info = {k: v for k, v in agent_info.items() if k != "agent_settings"}
+        if clinic_result.data:
+            clinic_info = clinic_result.data[0]
+            agent_info = await _fetch_agent_for_clinic(clinic_info["id"])
+            agent_info, settings = _extract_settings(agent_info)
+            agent_name = (agent_info or {}).get("name") or "Office Assistant"
+            
+            logger.info(f"[DB] ✓ Context loaded via clinics table: clinic={clinic_info.get('name')}, agent={agent_name}")
+            return clinic_info, agent_info, settings, agent_name
         
-        agent_name = (agent_info or {}).get("name") or "Office Assistant"
+        logger.debug(f"[DB] No match in clinics table for last10='{last10}'")
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # STRATEGY 3: DEMO MODE FAIL-SAFE — If only 1 clinic exists, use it!
+        # ═══════════════════════════════════════════════════════════════════════
+        def _count_and_fetch_single_clinic():
+            """Check if exactly 1 clinic exists; if so, return it."""
+            count_res = supabase.table("clinics").select("id", count="exact").execute()
+            total = count_res.count if hasattr(count_res, 'count') else len(count_res.data or [])
+            if total == 1:
+                return supabase.table("clinics").select(
+                    "id, organization_id, name, timezone, default_phone_region, "
+                    "address, city, state, zip_code, country"
+                ).limit(1).execute()
+            return None
+
+        single_clinic_result = await asyncio.to_thread(_count_and_fetch_single_clinic)
         
-        logger.info(f"[DB] ✓ Context loaded: clinic={clinic_info.get('name') if clinic_info else 'None'}, agent={agent_name}")
-        return clinic_info, agent_info, settings, agent_name
+        if single_clinic_result and single_clinic_result.data:
+            clinic_info = single_clinic_result.data[0]
+            agent_info = await _fetch_agent_for_clinic(clinic_info["id"])
+            agent_info, settings = _extract_settings(agent_info)
+            agent_name = (agent_info or {}).get("name") or "Office Assistant"
+            
+            logger.warning(
+                f"[DB] ⚠️ No phone match; defaulting to only available clinic context. "
+                f"clinic={clinic_info.get('name')}, agent={agent_name}"
+            )
+            return clinic_info, agent_info, settings, agent_name
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # NO MATCH FOUND — Return defaults
+        # ═══════════════════════════════════════════════════════════════════════
+        logger.warning(f"[DB] ❌ No clinic context found for: {called_number} (tried phone_numbers, clinics, and demo fallback)")
+        return None, None, None, "Office Assistant"
 
     except Exception as e:
         logger.error(f"[DB] Context fetch error: {e}")
