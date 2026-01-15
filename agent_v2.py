@@ -66,7 +66,7 @@ from livekit.agents import (
     WorkerOptions,
     Agent,
     AgentSession,
-    RoomOptions,
+    RoomInputOptions,
     RunContext,
     metrics as lk_metrics,
     MetricsCollectedEvent,
@@ -2321,7 +2321,7 @@ async def snappy_entrypoint(ctx: JobContext):
     await session.start(
         room=ctx.room,
         agent=snappy_agent,
-        room_options=RoomOptions(
+        room_input_options=RoomInputOptions(
             close_on_disconnect=True,
         ),
     )
