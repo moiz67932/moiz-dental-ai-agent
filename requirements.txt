@@ -2,21 +2,21 @@
 # PRODUCTION Requirements — Moiz Dental AI Agent
 # =============================================================================
 
-# Core Framework (Automatically pulls in 'livekit' and 'rtc' dependencies)
-livekit-agents[silero]==1.3.10
+# Core Framework (Updated to allow the latest compatible 1.3.x versions)
+livekit-agents[silero]>=1.3.11
 
-# AI Plugins
-livekit-plugins-openai>=1.3.11
-livekit-plugins-deepgram>=1.3.11
-livekit-plugins-assemblyai>=1.3.11
-livekit-plugins-cartesia>=1.3.11
+# AI Plugins (Loosened to allow the resolver to find matching versions)
+livekit-plugins-openai
+livekit-plugins-deepgram
+livekit-plugins-assemblyai
+livekit-plugins-cartesia
 
 # LLM & Tools
 openai>=1.40.0
 google-api-python-client>=2.140.0
 google-auth>=2.32.0
-google-auth-oauthlib>=1.2.0
-google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.4
+google-auth-httplib2>=0.3.0
 
 # Database & Env
 supabase>=2.10.0
@@ -26,5 +26,5 @@ python-dotenv>=1.0.1
 phonenumbers>=8.13.40
 email-validator>=2.2.0
 python-dateutil>=2.9.0
-tzdata>=2024.1
+tzdata>=2025.1
 aiohttp>=3.10.0

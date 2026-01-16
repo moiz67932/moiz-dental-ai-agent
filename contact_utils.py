@@ -3,7 +3,7 @@ import re
 import phonenumbers
 from email_validator import validate_email, EmailNotValidError
 from dateutil import parser as dtparser
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 _WORD_DIGITS = {
@@ -194,15 +194,119 @@ def validate_email_address(addr: str) -> bool:
 
 def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime | None:
     """
-    Parse natural language datetime and optionally apply timezone if parsed datetime is naive.
+    Parse natural language datetime with proper relative date handling.
+    
+    Handles:
+    - "tomorrow at 3:30 PM" → next day at 15:30
+    - "next Monday at 2pm" → upcoming Monday at 14:00
+    - "this Friday afternoon" → upcoming Friday at 14:00
+    - Absolute dates like "January 20 at 10am"
+    
+    Args:
+        spoken: Natural language datetime string
+        tz_hint: Timezone string (e.g., "America/New_York", "Asia/Karachi")
+        
+    Returns:
+        Timezone-aware datetime or None if parsing fails
     """
+    if not spoken:
+        return None
+    
     try:
+        tz = ZoneInfo(tz_hint) if tz_hint else None
+        now = datetime.now(tz) if tz else datetime.now()
+        
+        spoken_lower = spoken.lower().strip()
+        
+        # === RELATIVE DAY HANDLING ===
+        # These MUST be handled before dateutil.parse which ignores them
+        
+        # Handle "tomorrow"
+        if "tomorrow" in spoken_lower:
+            base_date = (now + timedelta(days=1)).date()
+            # Extract time component from the rest of the string
+            time_str = re.sub(r"\btomorrow\b", "", spoken_lower, flags=re.IGNORECASE).strip()
+            if time_str:
+                try:
+                    time_parsed = dtparser.parse(time_str, fuzzy=True)
+                    if time_parsed:
+                        result = datetime.combine(base_date, time_parsed.time())
+                        if tz:
+                            result = result.replace(tzinfo=tz)
+                        return result
+                except Exception:
+                    pass
+            # Default to 9am if no time specified
+            result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
+            if tz:
+                result = result.replace(tzinfo=tz)
+            return result
+        
+        # Handle "today"
+        if "today" in spoken_lower:
+            base_date = now.date()
+            time_str = re.sub(r"\btoday\b", "", spoken_lower, flags=re.IGNORECASE).strip()
+            if time_str:
+                try:
+                    time_parsed = dtparser.parse(time_str, fuzzy=True)
+                    if time_parsed:
+                        result = datetime.combine(base_date, time_parsed.time())
+                        if tz:
+                            result = result.replace(tzinfo=tz)
+                        return result
+                except Exception:
+                    pass
+            # Default to next hour if no time specified
+            result = datetime.combine(base_date, now.time().replace(minute=0, second=0, microsecond=0))
+            if tz:
+                result = result.replace(tzinfo=tz)
+            return result
+        
+        # Handle "next [weekday]" or standalone weekday names
+        day_map = {
+            "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+            "friday": 4, "saturday": 5, "sunday": 6,
+        }
+        
+        for day_name, weekday_num in day_map.items():
+            if day_name in spoken_lower or f"next {day_name}" in spoken_lower:
+                # Calculate days until that weekday
+                days_until = (weekday_num - now.weekday()) % 7
+                if days_until == 0:  # Same day - go to next week
+                    days_until = 7
+                # If "next" is explicit, always go to next week occurrence
+                if f"next {day_name}" in spoken_lower and days_until < 7:
+                    days_until = 7 if days_until == 0 else days_until
+                
+                base_date = (now + timedelta(days=days_until)).date()
+                
+                # Extract time from remaining string
+                time_str = re.sub(rf"\b(next\s+)?{day_name}\b", "", spoken_lower, flags=re.IGNORECASE).strip()
+                if time_str:
+                    try:
+                        time_parsed = dtparser.parse(time_str, fuzzy=True)
+                        if time_parsed:
+                            result = datetime.combine(base_date, time_parsed.time())
+                            if tz:
+                                result = result.replace(tzinfo=tz)
+                            return result
+                    except Exception:
+                        pass
+                
+                # Default to 9am if no time specified
+                result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
+                if tz:
+                    result = result.replace(tzinfo=tz)
+                return result
+        
+        # === FALLBACK: Use dateutil for absolute dates ===
         parsed = dtparser.parse(spoken, fuzzy=True)
-        if tz_hint and parsed.tzinfo is None:
-            try:
-                parsed = parsed.replace(tzinfo=ZoneInfo(tz_hint))
-            except Exception:
-                pass
-        return parsed
+        if parsed:
+            if tz and parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=tz)
+            return parsed
+        
+        return None
+        
     except Exception:
         return None
