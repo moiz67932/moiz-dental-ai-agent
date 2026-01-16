@@ -490,8 +490,8 @@ async def update_patient_record(
         state.dt_text = time_suggestion.strip()
         state.time_status = "validating"
         
-        # BRIDGE INSTRUCTION: Tell LLM to say "Checking [time] for you..."
-        bridge_instruction = f"BRIDGE: Say 'Okay, checking {time_suggestion} for you... one moment.' while I verify."
+        # Log the narrative check starting
+        logger.info(f"[TOOL] ⏰ Checking time: {time_suggestion}...")
         
         try:
             from dateutil import parser as dtparser
@@ -500,6 +500,10 @@ async def update_patient_record(
             if parsed:
                 if parsed.tzinfo is None:
                     parsed = parsed.replace(tzinfo=ZoneInfo(_GLOBAL_CLINIC_TZ))
+                
+                # Format for speech
+                time_spoken = parsed.strftime("%I:%M %p").lstrip("0")
+                day_spoken = parsed.strftime("%A")
                 
                 # Validate against working hours and lunch break
                 is_valid, error_msg = is_within_working_hours(
@@ -514,15 +518,17 @@ async def update_patient_record(
                         slot_free = await is_slot_free_supabase(clinic_id, parsed, slot_end)
                         
                         if not slot_free:
-                            # Slot is taken - find next available
+                            # Slot is taken - provide helpful alternative
                             state.time_status = "invalid"
                             state.time_error = "That slot is already taken"
                             state.dt_local = None
                             
-                            # Suggest alternative using the advanced tool
-                            alt_time = parsed.strftime("%I:%M %p").lstrip("0")
-                            return f"... hmm, {alt_time} is already booked. Let me find you something close... Use get_available_slots_v2 with after_datetime='{parsed.isoformat()}' to find the next opening."
+                            logger.info(f"[TOOL] ✗ {time_spoken} is booked, suggesting alternatives")
+                            
+                            # Sonic-3 prosody: breathy filler + helpful suggestion
+                            return f"... hmm, {time_spoken} is already booked. Let me find something close... Use get_available_slots_v2 with after_datetime='{parsed.isoformat()}' to offer the next available time."
                     
+                    # ✅ Time is VALID and AVAILABLE
                     state.dt_local = parsed
                     state.time_status = "valid"
                     state.time_error = None
@@ -530,21 +536,30 @@ async def update_patient_record(
                     updates.append(f"time={time_formatted} ({state.duration_minutes}m slot)")
                     logger.info(f"[TOOL] ✓ Time validated and available: {parsed.isoformat()}")
                     
-                    # Return with natural confirmation
-                    return f"... ah, perfect! {time_formatted} is open. I've got that saved."
+                    # Sonic-3 prosody: breathy confirmation with ellipses
+                    return f"... ah, perfect! {day_spoken} at {time_spoken} is open. I've got that down."
                 else:
                     # Time is invalid (lunch, after-hours, holiday)
                     state.time_status = "invalid"
                     state.time_error = error_msg
                     state.dt_local = None  # Don't save invalid time
                     
-                    # Check if it's a lunch break - give a helpful response
+                    logger.warning(f"[TOOL] ✗ Time rejected: {error_msg}")
+                    
+                    # Check if it's a lunch break - give a helpful response with Sonic-3 prosody
                     if "lunch" in error_msg.lower():
                         lunch_end = schedule.get("lunch_break", {}).get("end", "14:00")
-                        return f"... oh, the team is at lunch then. But I can get you in right at {lunch_end.replace(':00', '')} when they're back. How does that sound?"
+                        lunch_time = lunch_end.replace(":00", "").lstrip("0")
+                        return f"... oh, the team is at lunch then-- but I can get you in right at {lunch_time} when they're back. How does that sound?"
+                    
+                    # After-hours or closed day
+                    if "closed" in error_msg.lower() or "sunday" in error_msg.lower():
+                        return f"... hmm, we're actually closed on {day_spoken}. Would another day work for you?"
+                    
+                    if "outside" in error_msg.lower() or "hours" in error_msg.lower():
+                        return f"... ah, {time_spoken} is outside our hours. We're open 9 to 5-- would morning or late afternoon work?"
                     
                     errors.append(error_msg)
-                    logger.warning(f"[TOOL] ✗ Time rejected: {error_msg}")
             else:
                 state.time_status = "pending"
                 updates.append(f"time_text={time_suggestion}")
@@ -648,6 +663,9 @@ Advanced scheduling tool with relative time searching. Use this when:
 - User asks for slots "after 2pm tomorrow" or "before noon on Monday"
 - User specifies a preferred day like "next Wednesday"
 - You need to filter available times based on user constraints
+- A requested time is unavailable and you need alternatives
+
+⚡ BRIDGE PHRASE: Before calling this tool, say: "Okay, checking slots after [time] for you... one moment."
 
 Parameters:
 - after_datetime: ISO string or natural language (e.g., "tomorrow at 2pm", "2026-01-16T14:00:00")
@@ -655,6 +673,7 @@ Parameters:
 - num_slots: Number of slots to return (default 3)
 
 Returns slots that match the constraints, respecting working hours and lunch breaks.
+Automatically skips lunch break (1pm-2pm) and provides helpful messaging.
 """)
 async def get_available_slots_v2(
     after_datetime: str = None,
@@ -2573,41 +2592,88 @@ async def snappy_entrypoint(ctx: JobContext):
     # ⚡ INSTANT INTENT FILLERS — Zero perceived latency via audio hooks
     # ═══════════════════════════════════════════════════════════════════════════
     
-    # Intent keyword patterns for instant audio response
-    BOOKING_KEYWORDS = ["book", "appointment", "schedule", "reserve"]
-    AVAILABILITY_KEYWORDS = ["available", "when", "time", "opening", "slot", "free"]
-    PRICING_KEYWORDS = ["how much", "price", "cost", "insurance", "accept"]
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ⚡ AGGRESSIVE INTENT KEYWORDS — Expanded for maximum filler coverage
+    # ═══════════════════════════════════════════════════════════════════════════
+    BOOKING_KEYWORDS = ["book", "appointment", "schedule", "reserve", "set up", "make an"]
+    AVAILABILITY_KEYWORDS = ["available", "when", "time", "opening", "slot", "free", 
+                             "next", "earliest", "soonest", "after", "before", "morning", "afternoon"]
+    PRICING_KEYWORDS = ["how much", "price", "cost", "insurance", "accept", "take", 
+                        "pricing", "fee", "charge", "pay", "delta", "aetna", "cigna", "blue cross"]
     SERVICE_KEYWORDS = ["cleaning", "whitening", "extraction", "filling", "crown", 
-                        "root canal", "checkup", "check-up", "consultation"]
+                        "root canal", "checkup", "check-up", "consultation", "exam",
+                        "invisalign", "braces", "implant", "veneer", "denture", "bridge"]
+    NAME_KEYWORDS = ["my name is", "i'm", "i am", "this is", "call me"]
     
-    # Filler phrases optimized for Sonic-3 prosody
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 🎙️ SONIC-3 OPTIMIZED FILLER PHRASES — With ellipses for natural pauses
+    # ═══════════════════════════════════════════════════════════════════════════
     BOOKING_FILLERS = [
-        "Oh, sure thing, let me pull that up...",
-        "One moment, let me check the schedule...",
+        "Oh, sure thing... let me pull that up.",
+        "Okay, one moment... let me check the schedule.",
         "Sure, let me see what we have open...",
+        "Let me check our availability for you...",
     ]
     AVAILABILITY_FILLERS = [
         "Hmm, let me see here...",
-        "One second, checking availability...",
+        "One second... checking availability.",
         "Let me look at the schedule...",
+        "Okay, checking that for you... one moment.",
     ]
     PRICING_FILLERS = [
         "Good question! Let me check that...",
         "Let me pull up our pricing...",
         "Hmm, let me look that up for you...",
+        "Sure thing... let me check our rates.",
     ]
     SERVICE_FILLERS = [
         "{service}... okay, let me look that up.",
-        "A {service}, sure thing...",
+        "A {service}... sure thing, one moment.",
         "{service}... let me check what we have.",
+        "{service}... hmm, let me pull that up.",
+    ]
+    NAME_FILLERS = [
+        "Got it... let me note that down.",
+        "Perfect... one moment while I save that.",
+        "Okay, great... let me get that in here.",
     ]
     
     def _detect_service_in_text(text: str) -> Optional[str]:
         """Extract service name from user speech for acoustic mirroring."""
         text_lower = text.lower()
-        for service in SERVICE_KEYWORDS:
-            if service in text_lower:
-                return service.title()
+        # Extended service map for better recognition
+        service_map = {
+            "cleaning": "Cleaning", "clean": "Cleaning",
+            "whitening": "Whitening", "whiten": "Whitening",
+            "extraction": "Extraction", "extract": "Extraction", "pull": "Extraction",
+            "filling": "Filling", "cavity": "Filling",
+            "crown": "Crown",
+            "root canal": "Root Canal",
+            "checkup": "Checkup", "check-up": "Checkup", "exam": "Checkup",
+            "consultation": "Consultation", "consult": "Consultation",
+            "invisalign": "Invisalign",
+            "braces": "Braces",
+            "implant": "Implant",
+            "veneer": "Veneer",
+            "denture": "Denture",
+            "bridge": "Bridge",
+        }
+        for keyword, display_name in service_map.items():
+            if keyword in text_lower:
+                return display_name
+        return None
+    
+    def _detect_name_in_text(text: str) -> Optional[str]:
+        """Extract spoken name for acoustic mirroring."""
+        import re
+        patterns = [
+            r"(?:my\s+name\s+is|i'?m|i\s+am|this\s+is|call\s+me)\s+([A-Za-z][A-Za-z\s\.'-]{1,20})",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                name = m.group(1).strip().split()[0]  # First name only
+                return name.title()
         return None
     
     @session.on("user_speech_committed")
@@ -2615,65 +2681,80 @@ async def snappy_entrypoint(ctx: JobContext):
         """
         Fired after user finishes speaking and before LLM generates response.
         
-        ⚡ INSTANT HOOK: Fire audio filler within 100ms of speech end to mask
-        LLM latency. The user hears "One moment..." while LLM is processing.
+        ⚡ AGGRESSIVE INSTANT HOOK: Fire audio filler within 100ms of speech end.
+        The user hears "One moment..." while LLM is processing = ZERO SILENCE.
+        
+        RULES:
+        1. ANY keyword match = immediate filler (no complex conditions)
+        2. Service/name detection = acoustic mirroring (repeat back slowly)
+        3. Multiple intents = pick the most specific one
         """
         text = _speech_text_from_msg(msg)
         text_lower = text.lower() if text else ""
         
         if text:
-            ts = datetime.now().isoformat(timespec="seconds")
-            logger.info(f"[CONVO] [{ts}] USER: {text}")
-            logger.info(f"[AUDIO] User audio received: {text}")
+            ts = datetime.now().strftime("%H:%M:%S")
+            # HIGH-VISIBILITY user speech logging
+            logger.info(f"👤 [USER SPEECH] [{ts}] >> {text}")
+        
+        if not text_lower:
+            return
         
         # ═══════════════════════════════════════════════════════════════════════
-        # ⚡ INSTANT HOOK: Trigger audio within 100ms of speech end
+        # ⚡ AGGRESSIVE INSTANT HOOK: Fire filler immediately on ANY keyword match
         # ═══════════════════════════════════════════════════════════════════════
-        filler_triggered = False
+        filler = None
+        filler_type = None
         
-        # Check for service mention first (acoustic mirroring)
+        # PRIORITY 1: Service mention with acoustic mirroring (most specific)
         detected_service = _detect_service_in_text(text_lower)
-        if detected_service and any(k in text_lower for k in BOOKING_KEYWORDS + AVAILABILITY_KEYWORDS):
+        if detected_service:
             filler = random.choice(SERVICE_FILLERS).format(service=detected_service)
-            asyncio.create_task(session.say(filler))
-            filler_triggered = True
-            logger.info(f"[INSTANT_HOOK] ⚡ Service filler fired: {filler}")
+            filler_type = "SERVICE_MIRROR"
         
-        # Check for booking intent
-        elif any(k in text_lower for k in BOOKING_KEYWORDS):
-            filler = random.choice(BOOKING_FILLERS)
-            asyncio.create_task(session.say(filler))
-            filler_triggered = True
-            logger.info(f"[INSTANT_HOOK] ⚡ Booking filler fired: {filler}")
+        # PRIORITY 2: Name mention with acoustic mirroring
+        elif any(k in text_lower for k in NAME_KEYWORDS):
+            detected_name = _detect_name_in_text(text)
+            if detected_name:
+                filler = f"{detected_name}... got it, let me note that down."
+                filler_type = "NAME_MIRROR"
+            else:
+                filler = random.choice(NAME_FILLERS)
+                filler_type = "NAME"
         
-        # Check for availability/time questions
-        elif any(k in text_lower for k in AVAILABILITY_KEYWORDS):
-            filler = random.choice(AVAILABILITY_FILLERS)
-            asyncio.create_task(session.say(filler))
-            filler_triggered = True
-            logger.info(f"[INSTANT_HOOK] ⚡ Availability filler fired: {filler}")
-        
-        # Check for pricing/cost questions
+        # PRIORITY 3: Pricing/insurance questions (RAG triggers)
         elif any(k in text_lower for k in PRICING_KEYWORDS):
             filler = random.choice(PRICING_FILLERS)
-            asyncio.create_task(session.say(filler))
-            filler_triggered = True
-            logger.info(f"[INSTANT_HOOK] ⚡ Pricing filler fired: {filler}")
+            filler_type = "PRICING"
         
-        if filler_triggered:
-            logger.info(f"[AUDIO] User intent detected, filler queued")
+        # PRIORITY 4: Availability/time questions
+        elif any(k in text_lower for k in AVAILABILITY_KEYWORDS):
+            filler = random.choice(AVAILABILITY_FILLERS)
+            filler_type = "AVAILABILITY"
+        
+        # PRIORITY 5: Booking intent
+        elif any(k in text_lower for k in BOOKING_KEYWORDS):
+            filler = random.choice(BOOKING_FILLERS)
+            filler_type = "BOOKING"
+        
+        # ⚡ FIRE THE FILLER IMMEDIATELY
+        if filler:
+            asyncio.create_task(session.say(filler))
+            logger.info(f"⚡ [INSTANT_HOOK] [{filler_type}] >> {filler}")
         
         # Refresh memory and log state
-        logger.debug(f"[MEMORY] User speech committed, refreshing agent memory...")
         refresh_agent_memory()
-        logger.info(f"[STATE] Current: {state.slot_summary()}")
+        logger.debug(f"[STATE] Current: {state.slot_summary()}")
 
     @session.on("agent_speech_committed")
     def _on_agent_speech_committed(msg):
         text = _speech_text_from_msg(msg)
         if text:
-            ts = datetime.now().isoformat(timespec="seconds")
-            logger.info(f"[CONVO] [{ts}] AGENT: {text}")
+            ts = datetime.now().strftime("%H:%M:%S")
+            # HIGH-VISIBILITY logging for Railway/production debugging
+            logger.info(f"🤖 [AGENT RESPONSE] [{ts}] >> {text}")
+            # Also log to debug for detailed tracing
+            logger.debug(f"[CONVO] [{ts}] AGENT: {text}")
     
     # ═══════════════════════════════════════════════════════════════════════════
     # 📞 SIP PARTICIPANT EVENT — Handle late-joining SIP participants
