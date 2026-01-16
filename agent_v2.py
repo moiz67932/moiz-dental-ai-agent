@@ -161,26 +161,38 @@ def _normalize_sip_user_to_e164(raw: Optional[str]) -> Optional[str]:
     if s.startswith("00"):
         s = "+" + s[2:]
 
-    # If it's digits-only, assume missing '+' and add it
-    if not s.startswith("+") and s.isdigit() and len(s) >= 10:
+    # If it's digits-only, assume missing '+' and add it (8+ digits for international support)
+    if not s.startswith("+") and s.isdigit() and len(s) >= 8:
         s = "+" + s
 
     return s
 
 
 def _normalize_phone_preserve_plus(raw: Optional[str], default_region: str) -> Tuple[Optional[str], str]:
-    """Normalize phone while preserving explicit international '+' prefix."""
+    """Normalize phone while preserving explicit international '+' prefix.
+    
+    Returns: Tuple[Optional[str], str] - (e164_phone, last4_digits)
+    IMPORTANT: Always unpack result as: clean_phone, last4 = _normalize_phone_preserve_plus(...)
+    """
     if not raw:
         return None, ""
 
     s = str(raw).strip()
     if s.startswith("+"):
         digits = re.sub(r"\D", "", s)
+        # Support international numbers (8+ digits covers Pakistani numbers like +923...)
         if len(digits) >= 8:
             e164 = f"+{digits}"
             return e164, e164[-4:]
 
-    return normalize_phone(s, default_region)
+    # Fallback to normalize_phone which also returns a tuple
+    result = normalize_phone(s, default_region)
+    if isinstance(result, tuple):
+        return result
+    # Safety: if normalize_phone returns just a string (shouldn't happen), wrap it
+    if result:
+        return result, result[-4:] if len(result) >= 4 else ""
+    return None, ""
 
 
 # =============================================================================
@@ -196,6 +208,7 @@ A_TIER_PROMPT = """You are {agent_name}, a receptionist for {clinic_name}.
 
 • Fields with '✓' are SAVED — never re-ask for them.
 • Fields with '?' are missing — collect these naturally.
+• Fields with '⏳' NEED CONFIRMATION — ask the user to confirm!
 
 ═══════════════════════════════════════════════════════════════════════════════
 🎯 HUMANITY
@@ -209,25 +222,28 @@ Speak like a helpful receptionist. Use brief bridge phrases like "Let me check..
 • Call `update_patient_record` IMMEDIATELY when you hear name, phone, email, reason, or time.
 • Normalize before saving: "six seven nine" → "679", "at gmail dot com" → "@gmail.com"
 • Pass times as natural language: "tomorrow at 2pm", "next Monday".
-• If a tool returns an error with a suggested time, USE that suggestion.
+• If a requested time is TAKEN, the tool returns nearby alternatives — offer those!
 
 ═══════════════════════════════════════════════════════════════════════════════
-📞 PHONE CONFIRMATION (MANDATORY)
+📞 PHONE CONFIRMATION (MANDATORY - READ CAREFULLY!)
 ═══════════════════════════════════════════════════════════════════════════════
 • ALWAYS confirm the FULL phone number verbally: "Is your phone number +92 335 1897839?"
 • NEVER confirm with just last 4 digits.
-• Only call confirm_phone(confirmed=True) AFTER user says "yes" or "yeah" or similar.
+• ⚡ CRITICAL: If state shows "PHONE: ⏳ [Number]" and user says "yes", "yeah", "correct", 
+  you MUST call confirm_phone(confirmed=True) IMMEDIATELY!
+• Only mark confirmed AFTER user explicitly confirms with affirmative response.
 
 📍 REGION AWARENESS (INTERNATIONAL PHONES)
 ═══════════════════════════════════════════════════════════════════════════════
 • Accept and confirm international phone numbers (e.g., +92 format). Do NOT force a 10-digit format.
 
 ═══════════════════════════════════════════════════════════════════════════════
-🔄 SMART REVIEW
+🔄 SMART REVIEW (SINGLE-CHANGE OPTIMIZATION)
 ═══════════════════════════════════════════════════════════════════════════════
-• If user changes ONE detail after review, confirm ONLY that detail.
-• Do NOT re-read the entire summary for a single change.
-• Proceed to booking once they confirm the change.
+• If user changes ONE detail after review, confirm ONLY that changed detail.
+• Do NOT re-read the entire summary for a single change — that's annoying!
+• Example: User says "Actually, make it 3pm" → Say "Got it, changed to 3pm. Ready to book?"
+• Proceed to booking immediately once they confirm the single change.
 
 ═══════════════════════════════════════════════════════════════════════════════
 ✅ CONFIRMATION SEMANTICS
@@ -296,8 +312,8 @@ For phone: normalize spoken numbers (e.g., 'six seven nine' → '679').
 For email: normalize spoken format (e.g., 'moiz six seven nine at gmail dot com' → 'moiz679@gmail.com').
 For time: pass natural language (e.g., 'tomorrow at 2pm', 'next Monday morning').
 
-IMPORTANT: If the tool returns an ERROR about lunch break or after-hours, DO NOT ask
-for a new time. Instead, use the suggested alternative time from the error message!
+NEARBY SLOTS: If the requested time is TAKEN, this tool automatically finds and returns 
+nearby alternatives (e.g., "9:00 AM or 11:30 AM"). Simply offer these to the patient!
 """)
 async def update_patient_record(
     name: str = None,
@@ -378,17 +394,8 @@ async def update_patient_record(
                 # parse_datetime_natural already applies timezone
                 logger.info(f"[TOOL] ⏰ Parsed '{time_suggestion}' → {parsed.isoformat()}")
 
+                # No date restriction - accept any date within 14-day booking window
                 now_local = datetime.now(ZoneInfo(_GLOBAL_CLINIC_TZ))
-                if parsed.date() > (now_local + timedelta(days=3)).date():
-                    state.time_status = "pending"
-                    state.dt_local = None
-                    state.time_error = None
-                    target_date = parsed.strftime("%B %d")
-                    logger.info(f"[TOOL] ⏰ Date is >3 days out ({target_date}); routing to find_relative_slots")
-                    return (
-                        f"... okay, let me check openings on {target_date}. "
-                        f"Use find_relative_slots with start_search_time='{parsed.isoformat()}'."
-                    )
                 
                 # Format for speech
                 time_spoken = parsed.strftime("%I:%M %p").lstrip("0")
@@ -407,15 +414,41 @@ async def update_patient_record(
                         slot_free = await is_slot_free_supabase(clinic_id, parsed, slot_end)
                         
                         if not slot_free:
-                            # Slot is taken - provide helpful alternative
+                            # Slot is taken - find nearby alternatives bidirectionally
                             state.time_status = "invalid"
                             state.time_error = "That slot is already taken"
                             state.dt_local = None
                             
-                            logger.info(f"[TOOL] ✗ {time_spoken} is booked, suggesting alternatives")
+                            logger.info(f"[TOOL] ✗ {time_spoken} is booked, searching for nearby alternatives")
                             
-                            # Sonic-3 prosody: breathy filler + helpful suggestion
-                            return f"... hmm, {time_spoken} is already booked. Let me find something close... Use get_available_slots_v2 with after_datetime='{parsed.isoformat()}' to offer the next available time."
+                            # Find alternatives around the requested time (±60 min window)
+                            alternatives = await get_alternatives_around_datetime(
+                                clinic_id=clinic_id,
+                                target_dt=parsed,
+                                duration_minutes=state.duration_minutes,
+                                schedule=schedule,
+                                tz_str=_GLOBAL_CLINIC_TZ,
+                                window_minutes=60,
+                                num_slots=2,
+                            )
+                            
+                            if alternatives:
+                                # Format alternatives for speech
+                                alt_times = []
+                                for alt in alternatives:
+                                    alt_time_str = alt.strftime("%I:%M %p").lstrip("0")
+                                    if alt.date() == parsed.date():
+                                        alt_times.append(alt_time_str)
+                                    else:
+                                        alt_times.append(f"{alt.strftime('%A')} at {alt_time_str}")
+                                
+                                if len(alt_times) == 1:
+                                    return f"... I'm sorry, {time_spoken} is booked. I can do {alt_times[0]} that same day. Would that work?"
+                                else:
+                                    return f"... I'm sorry, {time_spoken} is booked. I can do {alt_times[0]} or {alt_times[1]} that same day. Which works for you?"
+                            else:
+                                # No nearby alternatives, suggest checking another time
+                                return f"... hmm, {time_spoken} is booked and I don't see openings nearby. Would you like a different day?"
                     
                     # ✅ Time is VALID and AVAILABLE
                     state.dt_local = parsed
@@ -508,11 +541,11 @@ async def get_available_slots() -> str:
             tz_str=_GLOBAL_CLINIC_TZ,
             duration_minutes=duration,
             num_slots=3,
-            days_ahead=3,
+            days_ahead=14,  # Extended to 14-day window for international booking
         )
         
         if not slots:
-            return "No available slots in the next 3 days. Would you like me to check further out?"
+            return "No available slots in the next 2 weeks. Would you like me to check a specific date?"
         
         # Format slots for speech
         slot_strings = []
@@ -643,7 +676,7 @@ async def get_available_slots_v2(
             )
             current = current.replace(hour=9, minute=0)  # Start at 9am
         
-        end_search = now + timedelta(days=7)  # Search up to 7 days ahead
+        end_search = now + timedelta(days=14)  # Extended 14-day search window
         
         # Fetch existing appointments
         existing_appointments = []
@@ -921,7 +954,7 @@ async def find_relative_slots(
         
         if not available_slots:
             time_desc = start_search_time or "that time"
-            return f"... hmm, I don't see any openings after {time_desc}. Would you like me to check a different day?"
+            return f"... hmm, I don't see any openings after {time_desc} in the next 2 weeks. Would you like me to check a different day?"
         
         # If find_last, return the last slot found
         if find_last:
@@ -1808,6 +1841,116 @@ def get_duration_for_service(service: str, schedule: Dict[str, Any]) -> int:
             return mins
     
     return 60  # Default duration
+
+
+async def get_alternatives_around_datetime(
+    clinic_id: str,
+    target_dt: datetime,
+    duration_minutes: int,
+    schedule: Dict[str, Any],
+    tz_str: str,
+    window_minutes: int = 60,
+    num_slots: int = 2,
+) -> List[datetime]:
+    """
+    Bidirectional slot search: Find available slots BEFORE and AFTER the requested time.
+    
+    This implements the "Nearby Slots" logic requested by ChatGPT:
+    - If user asks for 10 AM and it's taken, search 30-60 mins before AND after
+    - Returns up to num_slots alternatives (e.g., 9:00 AM and 11:30 AM)
+    
+    Algorithm:
+    1. Search backwards from target_dt (within window_minutes)
+    2. Search forwards from target_dt (within window_minutes)
+    3. Merge results, prioritizing closest to requested time
+    
+    Args:
+        clinic_id: Clinic UUID for appointment lookup
+        target_dt: The requested datetime that was unavailable
+        duration_minutes: Appointment duration
+        schedule: Working hours config
+        tz_str: Timezone string
+        window_minutes: How far before/after to search (default 60 min)
+        num_slots: Max alternatives to return (default 2)
+    
+    Returns:
+        List of available datetime slots, sorted by proximity to target_dt
+    """
+    tz = ZoneInfo(tz_str)
+    slot_step = schedule.get("slot_step_minutes", 30)
+    
+    # Fetch existing appointments for the target date
+    day_start = target_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+    
+    existing_appointments = []
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table("appointments")
+            .select("start_time, end_time")
+            .eq("clinic_id", clinic_id)
+            .gte("start_time", day_start.isoformat())
+            .lt("start_time", day_end.isoformat())
+            .in_("status", BOOKED_STATUSES)
+            .execute()
+        )
+        for appt in (result.data or []):
+            try:
+                appt_start = datetime.fromisoformat(appt["start_time"].replace("Z", "+00:00"))
+                appt_end = datetime.fromisoformat(appt["end_time"].replace("Z", "+00:00"))
+                existing_appointments.append((appt_start, appt_end))
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"[NEARBY_SLOTS] Failed to fetch appointments: {e}")
+    
+    def is_slot_available(check_dt: datetime) -> bool:
+        """Check if a slot is free (working hours + no conflicts)."""
+        is_valid, _ = is_within_working_hours(check_dt, schedule, duration_minutes)
+        if not is_valid:
+            return False
+        
+        slot_end = check_dt + timedelta(minutes=duration_minutes + APPOINTMENT_BUFFER_MINUTES)
+        for appt_start, appt_end in existing_appointments:
+            buffered_end = appt_end + timedelta(minutes=APPOINTMENT_BUFFER_MINUTES)
+            if check_dt < buffered_end and slot_end > appt_start:
+                return False
+        return True
+    
+    alternatives = []
+    
+    # Search BACKWARDS from target time
+    search_back = target_dt - timedelta(minutes=slot_step)
+    earliest = target_dt - timedelta(minutes=window_minutes)
+    while search_back >= earliest and len(alternatives) < num_slots:
+        # Round to slot step
+        rounded = search_back.replace(
+            minute=(search_back.minute // slot_step) * slot_step,
+            second=0, microsecond=0
+        )
+        if is_slot_available(rounded):
+            alternatives.append(rounded)
+        search_back -= timedelta(minutes=slot_step)
+    
+    # Search FORWARDS from target time
+    search_forward = target_dt + timedelta(minutes=slot_step)
+    latest = target_dt + timedelta(minutes=window_minutes)
+    while search_forward <= latest and len(alternatives) < num_slots:
+        # Round to slot step
+        rounded = search_forward.replace(
+            minute=(search_forward.minute // slot_step) * slot_step,
+            second=0, microsecond=0
+        )
+        if is_slot_available(rounded):
+            alternatives.append(rounded)
+        search_forward += timedelta(minutes=slot_step)
+    
+    # Sort by proximity to target time
+    alternatives.sort(key=lambda dt: abs((dt - target_dt).total_seconds()))
+    
+    logger.info(f"[NEARBY_SLOTS] Found {len(alternatives)} alternatives around {target_dt.strftime('%I:%M %p')}: {[a.strftime('%I:%M %p') for a in alternatives]}")
+    
+    return alternatives[:num_slots]
 
 
 async def get_next_available_slots(
@@ -2747,9 +2890,11 @@ async def snappy_entrypoint(ctx: JobContext):
                 if clean_phone:
                     state.phone_e164 = clean_phone
                     state.phone_last4 = last4
-                    state.phone_confirmed = True
-                    logger.info(f"📞 [SIP EVENT] ✓ Auto-captured phone: ***{state.phone_last4}")
-                    # Refresh agent memory so it knows phone is captured
+                    state.phone_confirmed = False  # NEVER auto-confirm - always ask user
+                    state.phone_source = "sip"
+                    state.pending_confirm = "phone"
+                    logger.info(f"📞 [SIP EVENT] ⏳ Phone pre-filled (needs confirmation): {clean_phone}")
+                    # Refresh agent memory so it knows phone needs confirmation
                     refresh_agent_memory()
 
             # Late dialed-number metadata is common; refresh context if we started with a fallback.
