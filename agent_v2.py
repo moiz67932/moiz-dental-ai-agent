@@ -168,6 +168,21 @@ def _normalize_sip_user_to_e164(raw: Optional[str]) -> Optional[str]:
     return s
 
 
+def _normalize_phone_preserve_plus(raw: Optional[str], default_region: str) -> Tuple[Optional[str], str]:
+    """Normalize phone while preserving explicit international '+' prefix."""
+    if not raw:
+        return None, ""
+
+    s = str(raw).strip()
+    if s.startswith("+"):
+        digits = re.sub(r"\D", "", s)
+        if len(digits) >= 8:
+            e164 = f"+{digits}"
+            return e164, e164[-4:]
+
+    return normalize_phone(s, default_region)
+
+
 # =============================================================================
 # LEAN PROMPT — ACCURACY-FIRST, LOW LATENCY
 # =============================================================================
@@ -199,9 +214,13 @@ Speak like a helpful receptionist. Use brief bridge phrases like "Let me check..
 ═══════════════════════════════════════════════════════════════════════════════
 📞 PHONE CONFIRMATION (MANDATORY)
 ═══════════════════════════════════════════════════════════════════════════════
-• ALWAYS confirm the FULL phone number verbally: "Is your number +1 310 555 1234?"
+• ALWAYS confirm the FULL phone number verbally: "Is your phone number +92 335 1897839?"
 • NEVER confirm with just last 4 digits.
 • Only call confirm_phone(confirmed=True) AFTER user says "yes" or "yeah" or similar.
+
+📍 REGION AWARENESS (INTERNATIONAL PHONES)
+═══════════════════════════════════════════════════════════════════════════════
+• Accept and confirm international phone numbers (e.g., +92 format). Do NOT force a 10-digit format.
 
 ═══════════════════════════════════════════════════════════════════════════════
 🔄 SMART REVIEW
@@ -224,6 +243,11 @@ Speak like a helpful receptionist. Use brief bridge phrases like "Let me check..
 • Never admit you are AI — say "I'm the office assistant."
 • Never offer callbacks (you cannot dial out).
 • Timezone: {timezone} | Hours: Mon-Fri 9-5, Sat 10-2, Sun closed | Lunch: 1-2pm
+
+📅 BOOKING LOGIC (DATE-SPECIFIC)
+═══════════════════════════════════════════════════════════════════════════════
+• If the user mentions a specific date (like January 20th), ALWAYS call find_relative_slots with that date.
+• Do NOT just tell them what is available today.
 """
 
 
@@ -309,9 +333,10 @@ async def update_patient_record(
     # === PHONE ===
     if phone and not state.phone_e164:
         clean_phone = re.sub(r"[^\d+]", "", phone)
-        if len(clean_phone) >= 10:
+        digits_len = len(re.sub(r"\D", "", clean_phone))
+        if digits_len >= 8:
             state.phone_e164 = clean_phone if clean_phone.startswith("+") else f"+{clean_phone}"
-            state.phone_last4 = clean_phone[-4:]
+            state.phone_last4 = re.sub(r"\D", "", clean_phone)[-4:]
             # NEVER auto-confirm phone - always require explicit user confirmation
             state.phone_confirmed = False
             state.phone_source = "user_spoken"
@@ -352,6 +377,18 @@ async def update_patient_record(
             if parsed:
                 # parse_datetime_natural already applies timezone
                 logger.info(f"[TOOL] ⏰ Parsed '{time_suggestion}' → {parsed.isoformat()}")
+
+                now_local = datetime.now(ZoneInfo(_GLOBAL_CLINIC_TZ))
+                if parsed.date() > (now_local + timedelta(days=3)).date():
+                    state.time_status = "pending"
+                    state.dt_local = None
+                    state.time_error = None
+                    target_date = parsed.strftime("%B %d")
+                    logger.info(f"[TOOL] ⏰ Date is >3 days out ({target_date}); routing to find_relative_slots")
+                    return (
+                        f"... okay, let me check openings on {target_date}. "
+                        f"Use find_relative_slots with start_search_time='{parsed.isoformat()}'."
+                    )
                 
                 # Format for speech
                 time_spoken = parsed.strftime("%I:%M %p").lstrip("0")
@@ -825,7 +862,9 @@ async def find_relative_slots(
         if target_date:
             end_search = datetime.combine(target_date, datetime.max.time(), tzinfo=tz)
         else:
-            end_search = now + timedelta(days=3)
+            end_search = now + timedelta(days=14)
+
+        logger.info(f"🔍 [SLOTS] Searching window: {now.date()} to {end_search.date()}")
         
         # Fetch existing appointments
         existing_appointments = []
@@ -940,9 +979,10 @@ async def confirm_phone(confirmed: bool, new_phone: str = None) -> str:
     if new_phone:
         # User provided a correction
         clean_phone = re.sub(r"[^\d+]", "", new_phone)
-        if len(clean_phone) >= 10:
+        digits_len = len(re.sub(r"\D", "", clean_phone))
+        if digits_len >= 8:
             state.phone_e164 = clean_phone if clean_phone.startswith("+") else f"+{clean_phone}"
-            state.phone_last4 = clean_phone[-4:]
+            state.phone_last4 = re.sub(r"\D", "", clean_phone)[-4:]
             state.phone_confirmed = False
             state.phone_source = "user_spoken"
             state.pending_confirm = "phone"
@@ -1776,7 +1816,7 @@ async def get_next_available_slots(
     tz_str: str,
     duration_minutes: int = 60,
     num_slots: int = 3,
-    days_ahead: int = 3,
+    days_ahead: int = 14,
 ) -> List[datetime]:
     """
     Find the next N available appointment slots.
@@ -1797,6 +1837,7 @@ async def get_next_available_slots(
     current = now.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_add)
     
     end_search = now + timedelta(days=days_ahead)
+    logger.info(f"🔍 [SLOTS] Searching window: {now.date()} to {end_search.date()}")
     
     # Fetch existing appointments from Supabase
     existing_appointments = []
@@ -2419,7 +2460,7 @@ async def snappy_entrypoint(ctx: JobContext):
         # Pre-fill caller's phone from SIP - but NEVER auto-confirm!
         # Agent MUST confirm full phone number with user before booking
         if caller_phone:
-            clean_phone, last4 = normalize_phone(caller_phone, DEFAULT_PHONE_REGION)
+            clean_phone, last4 = _normalize_phone_preserve_plus(caller_phone, DEFAULT_PHONE_REGION)
             if clean_phone:
                 state.phone_e164 = clean_phone
                 state.phone_last4 = last4
@@ -2702,10 +2743,10 @@ async def snappy_entrypoint(ctx: JobContext):
             
             # Pre-fill phone if not already captured
             if caller_phone and not state.phone_e164:
-                clean_phone = normalize_phone(caller_phone, DEFAULT_PHONE_REGION)
+                clean_phone, last4 = _normalize_phone_preserve_plus(caller_phone, DEFAULT_PHONE_REGION)
                 if clean_phone:
                     state.phone_e164 = clean_phone
-                    state.phone_last4 = clean_phone[-4:]
+                    state.phone_last4 = last4
                     state.phone_confirmed = True
                     logger.info(f"📞 [SIP EVENT] ✓ Auto-captured phone: ***{state.phone_last4}")
                     # Refresh agent memory so it knows phone is captured
