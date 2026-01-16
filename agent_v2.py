@@ -1112,7 +1112,7 @@ Example: "Just to confirm, is your number +92 335 189 7839?"
 IMPORTANT: When user says "yes", "yeah", "correct" etc., call confirm_phone(confirmed=True).
 When user says "no", "wrong", "incorrect", call confirm_phone(confirmed=False).
 """)
-async def confirm_phone(confirmed: bool, new_phone: str = None) -> str:
+async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None) -> str:
     """
     Mark phone as confirmed or update with correction.
     
@@ -3389,7 +3389,7 @@ async def snappy_entrypoint(ctx: JobContext):
     )
 
     # Say greeting ASAP (don't await; let TTS start immediately)
-    asyncio.create_task(session.say(greeting))
+    session.say(greeting)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 🔄 DEFERRED CONTEXT LOAD — Only if 2s timeout was exceeded
