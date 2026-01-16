@@ -308,14 +308,11 @@ Speak like a helpful receptionist. Use brief bridge phrases like "Let me check..
 • NEVER confirm with just last 4 digits — always say the complete number with country code.
 • ⚡ CRITICAL: If state shows "PHONE: ⏳ [Number]" and user says "yes", "yeah", "correct", 
   you MUST call confirm_phone(confirmed=True) IMMEDIATELY!
-• Once phone shows "PHONE: ✓", it is LOCKED — NEVER ask about phone again!
-• Only ask about phone ONCE if state shows ⏳ — don't keep repeating!
+• Only mark confirmed AFTER user explicitly confirms with affirmative response.
 
 📍 REGION AWARENESS (INTERNATIONAL PHONES)
 ═══════════════════════════════════════════════════════════════════════════════
-• Accept international formats: +92 (Pakistan), +1 (US/Canada), +44 (UK), etc.
-• Do NOT force US 10-digit format on international numbers!
-• If number starts with +, accept it AS-IS (it's already E.164 international format).
+• Accept and confirm international phone numbers (e.g., +92 format). Do NOT force a 10-digit format.
 
 ═══════════════════════════════════════════════════════════════════════════════
 🔄 SMART REVIEW (SINGLE-CHANGE OPTIMIZATION)
@@ -1162,19 +1159,16 @@ async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None) -> str
         # Safety guard before confirming
         _ensure_phone_is_string(state)
         state.phone_confirmed = True
-        # 🔒 LOCK: Clear ALL phone-related pending states to prevent re-confirmation loop
-        if state.pending_confirm == "phone":
-            state.pending_confirm = None
-        if state.pending_confirm_field == "phone":
-            state.pending_confirm_field = None
-        logger.info(f"[TOOL] ✓ Phone CONFIRMED & LOCKED: {state.phone_e164}")
-        # Trigger memory refresh so LLM sees phone is now locked
+        state.pending_confirm = None if state.pending_confirm == "phone" else state.pending_confirm
+        state.pending_confirm_field = None if state.pending_confirm_field == "phone" else state.pending_confirm_field
+        logger.info(f"[TOOL] ✓ Phone CONFIRMED: {state.phone_e164}")
+        # Trigger memory refresh
         if _REFRESH_AGENT_MEMORY:
             try:
                 _REFRESH_AGENT_MEMORY()
             except Exception:
                 pass
-        return "Phone CONFIRMED and LOCKED. Move on to gather remaining info - do NOT mention phone again."
+        return "Phone confirmed! Continue gathering remaining info."
     else:
         # User said "no" - clear and re-ask
         old_phone = state.phone_e164
@@ -1594,14 +1588,14 @@ class PatientState:
         
         if phone_display and self.phone_confirmed:
             speakable = speakable_phone(phone_display)
-            lines.append(f"• PHONE: ✓ {speakable} — LOCKED & CONFIRMED. NEVER mention or ask about phone again!")
+            lines.append(f"• PHONE: ✓ {speakable} — CONFIRMED. Do NOT ask again.")
         elif phone_display:
             speakable = speakable_phone(phone_display)
             source_note = f" (from {self.phone_source})" if self.phone_source else ""
-            lines.append(f"• PHONE: ⏳ {speakable}{source_note} — NEEDS ONE confirmation!")
-            lines.append(f"  → SAY ONCE: 'Is your phone number {speakable}?'")
-            lines.append(f"  → If YES/YEAH/CORRECT: call confirm_phone(confirmed=True) and MOVE ON")
-            lines.append(f"  → If NO/WRONG: call confirm_phone(confirmed=False)")
+            lines.append(f"• PHONE: ⏳ {speakable}{source_note} — MUST CONFIRM FULL NUMBER with user!")
+            lines.append(f"  → SAY: 'Just to confirm, is your phone number {speakable}?'")
+            lines.append(f"  → If user says YES: call confirm_phone(confirmed=True)")
+            lines.append(f"  → If user says NO: call confirm_phone(confirmed=False)")
         else:
             lines.append("• PHONE: ? — Still needed. Ask naturally.")
         
@@ -2854,10 +2848,6 @@ async def snappy_entrypoint(ctx: JobContext):
     is_sip_call = False
     used_fallback_called_num = False
     
-    # 🛡️ GUARD: Track processed participants to prevent duplicate SIP events
-    processed_participant_ids: set = set()
-    sip_events_handled = {"initial": False, "connected": False}
-    
     # PRIORITY 1: Real SIP participant metadata (production telephony)
     if participant.kind == ParticipantKind.PARTICIPANT_KIND_SIP:
         is_sip_call = True
@@ -2872,15 +2862,9 @@ async def snappy_entrypoint(ctx: JobContext):
         logger.info(f"📞 [SIP] Caller (from): {caller_phone}")
         logger.info(f"📞 [SIP] Called (to): {called_num}")
         
-        # Mark initial SIP event as processed
-        sip_events_handled["initial"] = True
-        processed_participant_ids.add(participant.identity)
-        
         # Pre-fill caller's phone from SIP - but NEVER auto-confirm!
         # Agent MUST confirm full phone number with user before booking
-        # NOTE: clinic_region is already initialized above with DEFAULT_PHONE_REGION
         if caller_phone:
-            # Use clinic_region which was initialized at the start of this function
             clean_phone, last4 = _normalize_phone_preserve_plus(caller_phone, clinic_region)
             if clean_phone:
                 state.phone_e164 = str(clean_phone)  # Enforce string type
@@ -3299,15 +3283,6 @@ async def snappy_entrypoint(ctx: JobContext):
         
         logger.info(f"[CONFIRM] Deterministic routing: pending='{pending}', is_yes={is_yes}")
         
-        # 🔒 IMMEDIATELY clear pending state to prevent duplicate handling
-        # This prevents the LLM from also trying to handle this confirmation
-        if pending == "phone":
-            state.pending_confirm = None if state.pending_confirm == "phone" else state.pending_confirm
-            state.pending_confirm_field = None if state.pending_confirm_field == "phone" else state.pending_confirm_field
-        elif pending == "email":
-            state.pending_confirm = None if state.pending_confirm == "email" else state.pending_confirm
-            state.pending_confirm_field = None if state.pending_confirm_field == "email" else state.pending_confirm_field
-        
         # Async handler for phone confirmation
         async def _handle_phone_confirm_async(confirmed: bool):
             try:
@@ -3351,18 +3326,10 @@ async def snappy_entrypoint(ctx: JobContext):
     @ctx.room.on("participant_connected")
     def _on_participant_joined(p: rtc.RemoteParticipant):
         """
-        SYNC callback - Handle SIP participants that join after initial connection.
+        Handle SIP participants that join after initial connection.
         Auto-capture caller phone from SIP metadata for zero-ask booking.
-        Uses guards to prevent duplicate event processing.
         """
-        # 🛡️ GUARD: Skip if already processed this participant
-        if p.identity in processed_participant_ids:
-            logger.debug(f"[SIP EVENT] Skipping duplicate event for {p.identity}")
-            return
-        
         if p.kind == ParticipantKind.PARTICIPANT_KIND_SIP:
-            # Mark as processed to prevent duplicates
-            processed_participant_ids.add(p.identity)
             sip_attrs = p.attributes or {}
             caller_phone = sip_attrs.get("sip.phoneNumber") or sip_attrs.get("sip.callingNumber")
             late_called_num = sip_attrs.get("sip.calledNumber") or sip_attrs.get("sip.toUser")
@@ -3421,17 +3388,13 @@ async def snappy_entrypoint(ctx: JobContext):
         ),
     )
 
-    # 🎙️ Say greeting ASAP (don't await; let TTS start immediately)
-    # Track that greeting was sent to prevent duplicates
-    greeting_sent = True
+    # Say greeting ASAP (don't await; let TTS start immediately)
     session.say(greeting)
-    logger.info(f"[GREETING] ✓ Initial greeting sent")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 🔄 DEFERRED CONTEXT LOAD — Only if initial timeout was exceeded
+    # 🔄 DEFERRED CONTEXT LOAD — Only if 2s timeout was exceeded
     # ═══════════════════════════════════════════════════════════════════════════
-    # NOTE: With 5s timeout above, this rarely triggers. It's a safety net.
-    # ⚠️ IMPORTANT: Do NOT send a second greeting here - greeting was already sent above
+    # NOTE: With 2s timeout above, this rarely triggers. It's a safety net.
     if context_task and not context_task.done():
         try:
             clinic_info, agent_info, settings, agent_name = await context_task
@@ -3450,11 +3413,13 @@ async def snappy_entrypoint(ctx: JobContext):
             _GLOBAL_SCHEDULE = load_schedule_from_settings(settings or {})
 
             refresh_agent_memory()
-            
-            # ⚠️ DO NOT send a duplicate greeting here!
-            # The greeting was already sent above after session.start()
-            # Just log that we got the deferred context
-            logger.info(f"[DB] Context loaded late but greeting already sent - continuing with updated context")
+
+            # Send proper greeting now that we have context (only if we didn't have it before)
+            followup = (settings or {}).get("greeting_text") or (
+                f"Hi, I'm {agent_name} from {clinic_name}. How can I help you today?"
+            )
+            if followup:
+                asyncio.create_task(session.say(followup))
 
         except Exception as e:
             logger.warning(f"[DB] Deferred context load failed: {e}")
