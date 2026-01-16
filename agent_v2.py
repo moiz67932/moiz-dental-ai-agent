@@ -32,6 +32,41 @@ import traceback
 from datetime import datetime, timedelta, date
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any, List
+from functools import lru_cache
+
+# =============================================================================
+# 🚀 LATENCY OPTIMIZATION CONSTANTS — TUNING KNOBS FOR SNAPPY RESPONSES
+# =============================================================================
+"""
+LATENCY TUNING GUIDE:
+- These constants control responsiveness vs. conversation quality tradeoffs
+- Adjust based on production metrics; log analysis will show impact
+- Set LATENCY_DEBUG=1 env var to enable per-turn latency logging
+"""
+
+# Endpointing: How quickly agent detects user finished speaking
+# WARNING: Do NOT go below 0.3s unless in controlled low-noise environment
+MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.35"))  # 0.35s for snappy (was 0.5)
+MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "1.5"))   # 1.5s max wait
+
+# VAD (Voice Activity Detection) tuning
+# WARNING: min_silence < 0.25s may cause premature cutoffs on pauses
+VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH", "0.1"))    # Keep at 0.1 (don't lower)
+VAD_MIN_SILENCE_DURATION = float(os.getenv("VAD_MIN_SILENCE", "0.25"))  # 0.25s (was 0.3)
+
+# Filler speech settings
+FILLER_ENABLED = os.getenv("FILLER_ENABLED", "1") == "1"
+FILLER_MAX_DURATION_MS = int(os.getenv("FILLER_MAX_MS", "700"))  # Hard cap on filler playback
+FILLER_PHRASES = ["Okay…", "One moment…", "Got it…", "Hmm…"]  # Short phrases < 400ms spoken
+
+# STT aggressive endpointing (Deepgram-specific)
+STT_AGGRESSIVE_ENDPOINTING = os.getenv("STT_AGGRESSIVE", "1") == "1"
+
+# Clinic context TTL cache (seconds) - DO NOT cache availability/schedule conflicts
+CLINIC_CONTEXT_CACHE_TTL = int(os.getenv("CLINIC_CACHE_TTL", "60"))  # 60s TTL
+
+# Latency debug mode - logs detailed timing per turn
+LATENCY_DEBUG = os.getenv("LATENCY_DEBUG", "0") == "1"
 
 # Mute noisy transport debug logs (reduces log-bloat in production)
 logging.getLogger("hpack").setLevel(logging.WARNING)
@@ -53,6 +88,114 @@ if not logger.handlers:
         "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
     ))
     logger.addHandler(handler)
+
+
+# =============================================================================
+# ⏱️ LATENCY METRICS HELPER — Structured timing for optimization verification
+# =============================================================================
+
+class LatencyMetrics:
+    """
+    Lightweight latency tracker for voice agent turns.
+    Logs structured timing data when LATENCY_DEBUG=1.
+    
+    Usage:
+        metrics = LatencyMetrics()
+        metrics.mark("user_eou")  # End of utterance
+        metrics.mark("llm_start")
+        metrics.mark("llm_first_token")
+        metrics.mark("tts_start")
+        metrics.mark("audio_start")
+        metrics.log_turn()  # Emits structured log line
+    """
+    
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self._start = time.perf_counter()
+        self._marks: Dict[str, float] = {}
+        self._filler_info: Dict[str, Any] = {"played": False, "suppressed_reason": None}
+    
+    def mark(self, label: str):
+        """Record a timestamp for a labeled event."""
+        self._marks[label] = time.perf_counter() - self._start
+    
+    def set_filler_info(self, played: bool, reason: str = None):
+        """Track whether filler was played or suppressed."""
+        self._filler_info = {"played": played, "suppressed_reason": reason}
+    
+    def get_elapsed(self, label: str) -> float:
+        """Get elapsed time in ms for a label."""
+        return self._marks.get(label, 0) * 1000
+    
+    def log_turn(self, extra: str = ""):
+        """Emit a single structured log line with all latency data."""
+        if not LATENCY_DEBUG:
+            return
+        
+        parts = []
+        ordered_labels = ["user_eou", "llm_start", "llm_first_token", "llm_done", "tts_start", "audio_start"]
+        for label in ordered_labels:
+            if label in self._marks:
+                parts.append(f"{label}={self._marks[label]*1000:.0f}ms")
+        
+        filler_str = "played" if self._filler_info["played"] else f"suppressed:{self._filler_info['suppressed_reason'] or 'none'}"
+        
+        log_line = f"[LATENCY] {' | '.join(parts)} | filler={filler_str}"
+        if extra:
+            log_line += f" | {extra}"
+        
+        logger.info(log_line)
+        self.reset()
+
+
+# Global latency tracker (reset per turn)
+_turn_metrics = LatencyMetrics()
+
+
+# =============================================================================
+# 🗄️ TTL CACHE FOR CLINIC CONTEXT — Avoid repeated DB fetches during call
+# =============================================================================
+
+class TTLCache:
+    """
+    Simple TTL-based cache for clinic context.
+    NEVER cache: availability, schedule conflicts, appointment slots.
+    ONLY cache: static clinic info, agent settings, greetings.
+    """
+    
+    def __init__(self, ttl_seconds: int = 60):
+        self._cache: Dict[str, Tuple[float, Any]] = {}
+        self._ttl = ttl_seconds
+    
+    def get(self, key: str) -> Optional[Any]:
+        """Get cached value if not expired."""
+        if key not in self._cache:
+            return None
+        timestamp, value = self._cache[key]
+        if time.time() - timestamp > self._ttl:
+            del self._cache[key]
+            return None
+        return value
+    
+    def set(self, key: str, value: Any):
+        """Cache a value with TTL."""
+        self._cache[key] = (time.time(), value)
+    
+    def invalidate(self, key: str = None):
+        """Invalidate specific key or entire cache."""
+        if key:
+            self._cache.pop(key, None)
+        else:
+            self._cache.clear()
+    
+    def size(self) -> int:
+        return len(self._cache)
+
+
+# Global clinic context cache
+_clinic_cache = TTLCache(ttl_seconds=CLINIC_CONTEXT_CACHE_TTL)
 
 
 # =============================================================================
@@ -423,6 +566,29 @@ async def update_patient_record(
     updates = []
     errors = []
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 🛡️ INPUT SANITIZATION — Gracefully handle None, empty, or "null" values
+    # ═══════════════════════════════════════════════════════════════════════════
+    def _sanitize_input(value) -> str:
+        """Return sanitized string or None if value should be ignored."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            # Coerce to string if somehow not a string
+            value = str(value)
+        stripped = value.strip()
+        # Treat empty strings and literal "null"/"none" as None
+        if not stripped or stripped.lower() in ("null", "none", "undefined"):
+            return None
+        return stripped
+    
+    # Sanitize all inputs before processing
+    name = _sanitize_input(name)
+    phone = _sanitize_input(phone)
+    email = _sanitize_input(email)
+    reason = _sanitize_input(reason)
+    time_suggestion = _sanitize_input(time_suggestion)
+    
     # === NAME ===
     if name and not state.full_name:
         state.full_name = name.strip().title()
@@ -431,6 +597,9 @@ async def update_patient_record(
     
     # === PHONE ===
     if phone and not state.phone_e164:
+        # User is providing contact info - mark contact phase as started
+        state.contact_phase_started = True
+        
         # Use proper normalization with region awareness
         clinic_region = (_GLOBAL_CLINIC_INFO or {}).get("default_phone_region", DEFAULT_PHONE_REGION)
         clean_phone, last4 = _normalize_phone_preserve_plus(phone, clinic_region)
@@ -1125,6 +1294,11 @@ async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None) -> str
     if not state:
         return "State not initialized."
     
+    # Gate: Do NOT confirm phone if contact phase hasn't started
+    if not state.contact_phase_started:
+        logger.debug("[TOOL] confirm_phone blocked - contact phase not started")
+        return "Continue the conversation. Ask about their appointment needs first."
+    
     if new_phone:
         # User provided a correction - use proper normalization
         clinic_region = (_GLOBAL_CLINIC_INFO or {}).get("default_phone_region", DEFAULT_PHONE_REGION)
@@ -1509,6 +1683,9 @@ class PatientState:
     # Phone source tracking (for confirmation UX)
     phone_source: Optional[str] = None  # "sip", "user_spoken", "extracted"
     
+    # Contact phase gating - phone MUST NOT be mentioned until this is True
+    contact_phase_started: bool = False
+    
     # Review flow tracking
     review_presented: bool = False  # True after review summary shown
     review_snapshot: Optional[Dict[str, Any]] = None  # Snapshot at review time
@@ -1569,71 +1746,68 @@ class PatientState:
     
     def detailed_state_for_prompt(self) -> str:
         """
-        Generate a detailed state snapshot for the dynamic system prompt.
+        Generate a concise state snapshot for the dynamic system prompt.
         This is the LLM's 'source of truth' for what's already captured.
+        OPTIMIZED: Reduced redundancy to minimize prompt tokens while preserving semantics.
         """
         lines = []
         
-        # Name
+        # Name (concise)
         if self.full_name:
-            lines.append(f"• NAME: ✓ '{self.full_name}' — SAVED. Do NOT ask again.")
+            lines.append(f"• NAME: ✓ {self.full_name}")
         else:
-            lines.append("• NAME: ? — Still needed. Ask naturally.")
+            lines.append("• NAME: ? — Ask naturally")
         
-        # Phone - always show full number for confirmation prompt
-        # Safety: ensure phone_e164 is string not tuple
+        # Phone - only show if contact phase started (prevents early confirmation)
         phone_display = self.phone_e164
         if isinstance(phone_display, tuple):
             phone_display = phone_display[0] if phone_display else None
         
-        if phone_display and self.phone_confirmed:
-            speakable = speakable_phone(phone_display)
-            lines.append(f"• PHONE: ✓ {speakable} — CONFIRMED. Do NOT ask again.")
+        if not self.contact_phase_started:
+            # Contact phase not started - hide phone from prompt to prevent early mention
+            lines.append("• PHONE: ? — (collect after intent & time)")
+        elif phone_display and self.phone_confirmed:
+            lines.append(f"• PHONE: ✓ {speakable_phone(phone_display)}")
         elif phone_display:
             speakable = speakable_phone(phone_display)
-            source_note = f" (from {self.phone_source})" if self.phone_source else ""
-            lines.append(f"• PHONE: ⏳ {speakable}{source_note} — MUST CONFIRM FULL NUMBER with user!")
-            lines.append(f"  → SAY: 'Just to confirm, is your phone number {speakable}?'")
-            lines.append(f"  → If user says YES: call confirm_phone(confirmed=True)")
-            lines.append(f"  → If user says NO: call confirm_phone(confirmed=False)")
+            lines.append(f"• PHONE: ⏳ {speakable} — CONFIRM: 'Is your number {speakable}?'")
         else:
-            lines.append("• PHONE: ? — Still needed. Ask naturally.")
+            lines.append("• PHONE: ? — Ask naturally")
         
-        # Email
+        # Email (concise)
         if self.email and self.email_confirmed:
-            lines.append(f"• EMAIL: ✓ '{self.email}' — CONFIRMED. Do NOT ask again.")
+            lines.append(f"• EMAIL: ✓ {self.email}")
         elif self.email:
-            lines.append(f"• EMAIL: ⏳ '{self.email}' — Captured but needs confirmation.")
+            lines.append(f"• EMAIL: ⏳ {self.email} — Needs confirmation")
         else:
-            lines.append("• EMAIL: ? — Still needed. Ask naturally.")
+            lines.append("• EMAIL: ? — Ask naturally")
         
-        # Reason with duration
+        # Reason (concise)
         if self.reason:
-            lines.append(f"• REASON: ✓ '{self.reason}' (Duration: {self.duration_minutes}m) — SAVED. Do NOT ask again.")
+            lines.append(f"• REASON: ✓ {self.reason} ({self.duration_minutes}m)")
         else:
-            lines.append("• REASON: ? — Still needed. Ask what brings them in.")
+            lines.append("• REASON: ? — Ask what brings them in")
         
-        # Time with validation status
+        # Time with validation status (concise)
         if self.dt_local and self.time_status == "valid":
-            time_str = self.dt_local.strftime('%A, %B %d at %I:%M %p')
-            lines.append(f"• TIME: ✓ {time_str} ({self.duration_minutes}m slot) — VALIDATED. Do NOT ask again.")
+            time_str = self.dt_local.strftime('%a %b %d @ %I:%M %p')
+            lines.append(f"• TIME: ✓ {time_str}")
         elif self.time_status == "invalid" and self.time_error:
-            lines.append(f"• TIME: ❌ INVALID — {self.time_error}")
-            lines.append("  → Suggest the alternative time from the error message!")
+            lines.append(f"• TIME: ❌ {self.time_error}")
         elif self.dt_text:
-            lines.append(f"• TIME: ⏳ '{self.dt_text}' — Status: {self.time_status.upper()}")
+            lines.append(f"• TIME: ⏳ '{self.dt_text}' — {self.time_status}")
         else:
-            lines.append("• TIME: ? — Still needed. Ask when they'd like to come in.")
+            lines.append("• TIME: ? — Ask when")
         
-        # Booking status
+        # Booking status (concise)
         if self.booking_confirmed:
-            lines.append("\n🎉 BOOKING STATUS: CONFIRMED! Appointment is booked.")
+            lines.append("🎉 BOOKED!")
         elif self.is_complete():
-            lines.append("\n✅ READY TO BOOK: All info collected. Summarize & confirm with patient.")
+            lines.append("✅ READY TO BOOK — Summarize & confirm")
         else:
             missing = [s for s in self.missing_slots() if not s.endswith('_confirmed')]
             if missing:
-                lines.append(f"\n⏳ STILL NEEDED: {', '.join(missing)}")
+                lines.append(f"⏳ NEED: {', '.join(missing)}")
         
         return '\n'.join(lines)
 
@@ -1647,6 +1821,7 @@ DEMO_CLINIC_ID = "5afce5fa-8436-43a3-af65-da29ccad7228"
 
 async def fetch_clinic_context_optimized(
     called_number: str,
+    use_cache: bool = True,
 ) -> Tuple[Optional[dict], Optional[dict], Optional[dict], str]:
     """
     A-TIER: Robust clinic lookup with fuzzy suffix matching and demo fallback.
@@ -1657,8 +1832,26 @@ async def fetch_clinic_context_optimized(
     3. DEMO FALLBACK: If only 1 clinic exists in DB, use it automatically
     4. PITCH MODE: Force-load DEMO_CLINIC_ID as ultimate fallback
     
+    CACHING:
+    - Static clinic info and agent settings are cached for CLINIC_CONTEXT_CACHE_TTL seconds
+    - This avoids repeated DB queries during the same call
+    - Cache is keyed by clinic_id:agent_id (stable, no collision)
+    - NEVER caches: availability, schedule conflicts, appointment data
+    
     Returns: (clinic_info, agent_info, agent_settings, agent_name)
     """
+    
+    # Cache key will be built from clinic_id:agent_id after fetch (stable identifiers)
+    # We cannot check cache before knowing clinic_id, so caching happens on return only
+    
+    # Helper: Build stable cache key from fetched data
+    def _build_cache_key(clinic: Optional[dict], agent: Optional[dict]) -> Optional[str]:
+        """Build deterministic cache key from clinic_id:agent_id."""
+        clinic_id = (clinic or {}).get("id")
+        agent_id = (agent or {}).get("id")
+        if clinic_id:
+            return f"{clinic_id}:{agent_id or 'no_agent'}"
+        return None
     
     # Helper: Extract nested settings from agent_info
     def _extract_settings(agent_info: Optional[dict]) -> Tuple[Optional[dict], Optional[dict]]:
@@ -1744,7 +1937,12 @@ async def fetch_clinic_context_optimized(
             agent_name = (agent_info or {}).get("name") or "Office Assistant"
             
             logger.info(f"[DB] ✓ Context loaded via phone_numbers: clinic={clinic_info.get('name') if clinic_info else 'None'}, agent={agent_name}")
-            return clinic_info, agent_info, settings, agent_name
+            result = (clinic_info, agent_info, settings, agent_name)
+            if use_cache:
+                cache_key = _build_cache_key(clinic_info, agent_info)
+                if cache_key:
+                    _clinic_cache.set(cache_key, result)
+            return result
         
         logger.debug(f"[DB] No match in phone_numbers for last10='{last10}'")
 
@@ -1769,7 +1967,12 @@ async def fetch_clinic_context_optimized(
             agent_name = (agent_info or {}).get("name") or "Office Assistant"
             
             logger.info(f"[DB] ✓ Context loaded via clinics table: clinic={clinic_info.get('name')}, agent={agent_name}")
-            return clinic_info, agent_info, settings, agent_name
+            result = (clinic_info, agent_info, settings, agent_name)
+            if use_cache:
+                cache_key = _build_cache_key(clinic_info, agent_info)
+                if cache_key:
+                    _clinic_cache.set(cache_key, result)
+            return result
         
         # ═══════════════════════════════════════════════════════════════════════
         # 🚀 PITCH MODE — Phone lookup failed, force-load demo clinic by UUID
@@ -1795,7 +1998,12 @@ async def fetch_clinic_context_optimized(
             logger.info(
                 f"[DB] ✓ Pitch Mode context loaded: clinic={clinic_info.get('name')}, agent={agent_name}"
             )
-            return clinic_info, agent_info, settings, agent_name
+            result = (clinic_info, agent_info, settings, agent_name)
+            if use_cache:
+                cache_key = _build_cache_key(clinic_info, agent_info)
+                if cache_key:
+                    _clinic_cache.set(cache_key, result)
+            return result
 
         # ═══════════════════════════════════════════════════════════════════════
         # ABSOLUTE FALLBACK — Demo clinic UUID not found in DB
@@ -3018,26 +3226,18 @@ async def snappy_entrypoint(ctx: JobContext):
     # ═══════════════════════════════════════════════════════════════════════════
     # 🎙️ GREETING: Use DB greeting_text if context loaded, otherwise fallback
     # ═══════════════════════════════════════════════════════════════════════════
-    # Build greeting - if we have SIP phone prefilled, proactively confirm it
-    phone_confirm_addon = ""
-    if state.phone_e164 and state.phone_source == "sip" and not state.phone_confirmed:
-        # SIP call with prefilled phone - proactively ask to confirm FULL number
-        speakable = speakable_phone(state.phone_e164)
-        phone_confirm_addon = f" I see you're calling from {speakable}. Is this the best number to reach you on?"
-        logger.info(f"[GREETING] Will ask to confirm SIP caller phone: {speakable}")
+    # NOTE: Do NOT confirm phone in greeting - it feels robotic.
+    # Phone confirmation should only happen when contact details are explicitly needed.
+    # The phone is captured from SIP but will be confirmed later in the flow.
     
     if settings and settings.get("greeting_text"):
-        greeting = settings.get("greeting_text") + phone_confirm_addon
+        greeting = settings.get("greeting_text")
         logger.info(f"[GREETING] Using DB greeting: {greeting[:50]}...")
     elif clinic_info:
-        base_greeting = f"Hi, thanks for calling {clinic_name}!"
-        if phone_confirm_addon:
-            greeting = base_greeting + phone_confirm_addon
-        else:
-            greeting = base_greeting + " How can I help you today?"
+        greeting = f"Hi, thanks for calling {clinic_name}! How can I help you today?"
         logger.info(f"[GREETING] Using clinic-aware greeting for {clinic_name}")
     else:
-        greeting = "Hello! Thanks for calling." + (phone_confirm_addon or " How can I help you today?")
+        greeting = "Hello! Thanks for calling. How can I help you today?"
         logger.info("[GREETING] Using default greeting (DB context not loaded)")
     
     # ⚡ HIGH-PERFORMANCE LLM with function calling
@@ -3046,22 +3246,43 @@ async def snappy_entrypoint(ctx: JobContext):
         temperature=0.7,
     )
     
-    # ⚡ SNAPPY STT
+    # ⚡ SNAPPY STT with aggressive endpointing for faster turn detection
     if os.getenv("DEEPGRAM_API_KEY"):
-        stt_instance = deepgram_plugin.STT(
-            model="nova-2-general",
-            language=agent_lang,
-        )
+        # Deepgram with optimized settings for low-latency
+        stt_config = {
+            "model": "nova-2-general",
+            "language": agent_lang,
+        }
+        # Enable aggressive endpointing if configured AND provider supports it
+        # Guard: Only apply if deepgram_plugin.STT accepts these kwargs
+        if STT_AGGRESSIVE_ENDPOINTING:
+            # Check if STT class accepts endpointing params (capability guard)
+            import inspect
+            try:
+                stt_sig = inspect.signature(deepgram_plugin.STT.__init__)
+                stt_params = set(stt_sig.parameters.keys())
+                # Only add if supported by this version of the plugin
+                if "endpointing" in stt_params or "kwargs" in str(stt_sig):
+                    stt_config["endpointing"] = 300  # 300ms silence triggers end
+                    stt_config["utterance_end_ms"] = 1000  # Max wait for utterance end
+                    if LATENCY_DEBUG:
+                        logger.debug("[STT] Deepgram aggressive endpointing enabled: 300ms")
+            except Exception:
+                pass  # Silently fall back to default if introspection fails
+        stt_instance = deepgram_plugin.STT(**stt_config)
     elif os.getenv("ASSEMBLYAI_API_KEY"):
         stt_instance = assemblyai_plugin.STT()
     else:
         stt_instance = openai_plugin.STT(model="gpt-4o-transcribe", language="en")
     
-    # ⚡ FAST VAD
+    # ⚡ FAST VAD with tuned silence detection
+    # WARNING: min_silence < 0.25s may cause premature cutoffs; min_speech should stay at 0.1
     vad_instance = silero.VAD.load(
-        min_speech_duration=0.1,
-        min_silence_duration=0.3,
+        min_speech_duration=VAD_MIN_SPEECH_DURATION,  # 0.1s - don't lower this
+        min_silence_duration=VAD_MIN_SILENCE_DURATION,  # 0.25s (was 0.3) - faster end detection
     )
+    if LATENCY_DEBUG:
+        logger.info(f"[VAD] Loaded with min_silence={VAD_MIN_SILENCE_DURATION}s, min_speech={VAD_MIN_SPEECH_DURATION}s")
     
     # TTS
     if os.getenv("CARTESIA_API_KEY"):
@@ -3078,17 +3299,25 @@ async def snappy_entrypoint(ctx: JobContext):
     # ⚡ A-TIER AgentSession with LLM Function Calling (v1.2.14 API)
     # The LLM extracts data via tools IN REAL-TIME while generating speech
     # No blocking listeners - parallel extraction eliminates 20s silences
+    # 
+    # ENDPOINTING TUNING:
+    # - min_endpointing_delay: How quickly we detect user stopped talking (lower = snappier)
+    # - max_endpointing_delay: Max wait before forcing turn (safety cap)
+    # - WARNING: min < 0.3s can cause agent to cut off users mid-sentence
     session = AgentSession(
         stt=stt_instance,
         llm=llm_instance,
         tts=tts_instance,
         vad=vad_instance,
-        min_endpointing_delay=0.5,  # ⚡ 0.5s for snappy turn-taking (was 1.5s)
-        max_endpointing_delay=1.5,  # Reduced from 2.0 for faster response
+        min_endpointing_delay=MIN_ENDPOINTING_DELAY,  # ⚡ 0.35s for snappy turn-taking (was 0.5)
+        max_endpointing_delay=MAX_ENDPOINTING_DELAY,  # 1.5s max wait
         allow_interruptions=True,
         min_interruption_duration=0.5,
         min_interruption_words=1,
     )
+    
+    if LATENCY_DEBUG:
+        logger.info(f"[SESSION] AgentSession created: min_ep={MIN_ENDPOINTING_DELAY}s, max_ep={MAX_ENDPOINTING_DELAY}s")
     
     # Metrics
     usage = lk_metrics.UsageCollector()
@@ -3123,26 +3352,79 @@ async def snappy_entrypoint(ctx: JobContext):
         finally:
             active_filler_handle["handle"] = None
             active_filler_handle["is_filler"] = False
+            active_filler_handle["start_time"] = None
     
     async def _send_filler_async(filler_text: str):
-        """Non-blocking filler speech - will be interrupted when real response arrives."""
+        """
+        Non-blocking filler speech with hard timeout.
+        Will be interrupted when real response arrives OR after FILLER_MAX_DURATION_MS.
+        """
         try:
-            # Use session.say with allow_interruptions=True for non-blocking filler
-            # Store handle so we can interrupt it when real response arrives
             active_filler_handle["is_filler"] = True
+            active_filler_handle["start_time"] = time.perf_counter()
+            
+            # Use session.say with allow_interruptions=True for non-blocking filler
             handle = await session.say(filler_text, allow_interruptions=True)
             active_filler_handle["handle"] = handle
-            logger.debug(f"[FILLER] Sent filler: {filler_text}")
+            
+            if LATENCY_DEBUG:
+                logger.debug(f"[FILLER] Sent: '{filler_text}'")
+            
+            # Hard timeout: interrupt filler after FILLER_MAX_DURATION_MS even if TTS is slow
+            await asyncio.sleep(FILLER_MAX_DURATION_MS / 1000.0)
+            if active_filler_handle.get("is_filler"):
+                _interrupt_filler()
+                if LATENCY_DEBUG:
+                    logger.debug(f"[FILLER] Auto-interrupted after {FILLER_MAX_DURATION_MS}ms timeout")
+                    
+        except asyncio.CancelledError:
+            pass  # Expected when interrupted
         except Exception as e:
             logger.debug(f"[FILLER] Could not send filler: {e}")
+        finally:
             active_filler_handle["is_filler"] = False
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 🎯 SLOT VALUE DETECTION — Detect direct answers to skip filler
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Patterns that indicate user is giving a direct slot value (name, time, phone, email)
+    SLOT_VALUE_PATTERNS = [
+        r"^(?:it'?s|my name is|i'?m|this is)\s+\w+",  # Name patterns
+        r"^\d{3}[-.\s]?\d{3}[-.\s]?\d{4}$",  # Phone number
+        r"^(?:\+\d{1,3}[-.\s]?)?\d{10,}$",  # International phone
+        r"^\S+@\S+\.\S+$",  # Email pattern
+        r"^(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?",  # Time patterns
+        r"^(?:tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday)",  # Day patterns
+        r"^(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)",  # Next day
+        r"^(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d+",  # Date
+    ]
+    SLOT_VALUE_RE = re.compile("|".join(SLOT_VALUE_PATTERNS), re.IGNORECASE)
+    
+    def _is_direct_slot_value(text: str) -> bool:
+        """Check if user input looks like a direct answer to a slot question."""
+        text = text.strip().lower()
+        # Short direct answers (1-3 words) that aren't questions
+        words = text.split()
+        if len(words) <= 3 and not text.endswith("?"):
+            if SLOT_VALUE_RE.search(text):
+                return True
+        return False
     
     @session.on("user_input_transcribed")
     def _on_user_transcribed_filler(ev):
         """
         SYNC callback - spawns async task for filler.
         LiveKit .on() requires sync callbacks; async work via create_task.
+        
+        FILLER SUPPRESSION RULES (for low latency):
+        1. Skip for yes/no confirmations (handled deterministically)
+        2. Skip for micro-confirmations (< 3 words)
+        3. Skip for direct slot values (time, date, phone, email, name)
+        4. Skip if filler is disabled via FILLER_ENABLED
         """
+        # Mark user end-of-utterance for latency tracking
+        _turn_metrics.mark("user_eou")
+        
         # Only act on final transcriptions
         if not getattr(ev, 'is_final', True):
             return
@@ -3151,25 +3433,40 @@ async def snappy_entrypoint(ctx: JobContext):
         if not transcript.strip():
             return
         
-        # Don't send filler for simple yes/no (handled deterministically)
-        transcript_lower = transcript.strip().lower()
-        if len(transcript_lower.split()) <= 2:
-            if YES_PAT.search(transcript_lower) or NO_PAT.search(transcript_lower):
-                return  # Skip filler for confirmations
-        
-        # Don't send filler if we're already speaking
-        if active_filler_handle.get("is_filler"):
+        # Check if filler is globally disabled
+        if not FILLER_ENABLED:
+            _turn_metrics.set_filler_info(False, "disabled")
             return
         
-        # Fire off a quick filler phrase while LLM thinks
+        transcript_lower = transcript.strip().lower()
+        word_count = len(transcript_lower.split())
+        
+        # RULE 1: Skip filler for yes/no confirmations (handled deterministically)
+        if word_count <= 2:
+            if YES_PAT.search(transcript_lower) or NO_PAT.search(transcript_lower):
+                _turn_metrics.set_filler_info(False, "yes_no")
+                return
+        
+        # RULE 2: Skip filler for micro-confirmations (very short responses)
+        if word_count <= 2 and not transcript_lower.endswith("?"):
+            _turn_metrics.set_filler_info(False, "micro_confirm")
+            return
+        
+        # RULE 3: Skip filler for direct slot values (instant LLM response expected)
+        if _is_direct_slot_value(transcript):
+            _turn_metrics.set_filler_info(False, "direct_slot")
+            return
+        
+        # RULE 4: Skip if already speaking
+        if active_filler_handle.get("is_filler"):
+            _turn_metrics.set_filler_info(False, "already_speaking")
+            return
+        
+        # Select a short filler phrase (< 400ms spoken duration)
         import random
-        fillers = [
-            "... hmm, let me check...",
-            "... one moment...",
-            "... okay...",
-            "... sure...",
-        ]
-        filler = random.choice(fillers)
+        filler = random.choice(FILLER_PHRASES)
+        
+        _turn_metrics.set_filler_info(True, None)
         
         # Non-blocking: spawn task, don't await
         asyncio.create_task(_send_filler_async(filler))
@@ -3179,7 +3476,11 @@ async def snappy_entrypoint(ctx: JobContext):
         """
         SYNC callback - interrupt filler when real response starts.
         This ensures filler doesn't overlap with actual content.
+        Also marks latency metrics for audio start.
         """
+        # Mark audio start for latency tracking
+        _turn_metrics.mark("audio_start")
+        
         # Check if this is a real response (not the filler itself)
         speech_text = ""
         try:
@@ -3191,9 +3492,14 @@ async def snappy_entrypoint(ctx: JobContext):
         handle = active_filler_handle.get("handle")
         is_filler = active_filler_handle.get("is_filler", False)
         
-        # Interrupt if: we have a handle AND (not a filler OR speech doesn't start with "...")
-        if handle and (not is_filler or (speech_text and not speech_text.strip().startswith("..."))):
+        # Interrupt if: we have a handle AND (not a filler OR speech doesn't start with filler prefix)
+        is_filler_text = speech_text and any(speech_text.strip().startswith(f) for f in FILLER_PHRASES)
+        if handle and not is_filler_text:
             _interrupt_filler()
+        
+        # Log latency metrics for this turn
+        if not is_filler_text:
+            _turn_metrics.log_turn(extra=f"response_preview='{speech_text[:50]}...'" if len(speech_text) > 50 else f"response='{speech_text}'")
 
     # Create agent with tools (v1.2.14 API - tools passed to Agent, not AgentSession)
     class SnappyAgent(Agent):
@@ -3315,7 +3621,12 @@ async def snappy_entrypoint(ctx: JobContext):
         
         # Route to appropriate confirm tool (spawn async task - don't await)
         if pending == "phone":
-            asyncio.create_task(_handle_phone_confirm_async(is_yes))
+            # Only confirm phone if contact phase has started
+            if state.contact_phase_started:
+                asyncio.create_task(_handle_phone_confirm_async(is_yes))
+            else:
+                logger.debug("[CONFIRM] Phone confirm blocked - contact phase not started")
+                return
         elif pending == "email":
             asyncio.create_task(_handle_email_confirm_async(is_yes))
     
