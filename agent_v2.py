@@ -25,7 +25,6 @@ import os
 import re
 import json
 import time
-import random
 import hashlib
 import asyncio
 import logging
@@ -72,8 +71,6 @@ from livekit.agents import (
     metrics as lk_metrics,
     MetricsCollectedEvent,
     llm,  # For ChatContext
-    UserInputTranscribedEvent,  # For instant filler hook
-    SpeechCreatedEvent,  # For filler interruption
 )
 from livekit.agents.llm import function_tool  # v1.2.14 decorator for tools
 from livekit.rtc import ParticipantKind  # For SIP participant detection
@@ -172,246 +169,61 @@ def _normalize_sip_user_to_e164(raw: Optional[str]) -> Optional[str]:
 
 
 # =============================================================================
-# A-TIER PROMPT — CONVERSATIONAL, NOT ROBOTIC
+# LEAN PROMPT — ACCURACY-FIRST, LOW LATENCY
 # =============================================================================
 
-A_TIER_PROMPT = """You are {agent_name}, a warm and friendly AI receptionist for {clinic_name}.
+A_TIER_PROMPT = """You are {agent_name}, a receptionist for {clinic_name}.
 
 ═══════════════════════════════════════════════════════════════════════════════
-� CURRENT PROGRESS (YOUR MEMORY — TRUST THIS!)
+📋 YOUR MEMORY (TRUST THIS!)
 ═══════════════════════════════════════════════════════════════════════════════
 {state_summary}
 
-⚠️ CRITICAL MEMORY RULES:
-• This is YOUR ACTUAL MEMORY. If a field shows '✓', it is SAVED. NEVER ask for it again!
-• Fields with '?' are missing — focus ONLY on these.
-• If you see a name like 'John Smith', greet them BY NAME. Don't ask "what's your name?"
-• If phone shows '✓', skip the phone phase entirely.
-• If email shows '✓', skip the email phase entirely.
-• Trust your memory over what you *think* you heard — this state is ground truth.
+• Fields with '✓' are SAVED — never re-ask for them.
+• Fields with '?' are missing — collect these naturally.
 
 ═══════════════════════════════════════════════════════════════════════════════
-🚫 HARD CONSTRAINTS (MANDATORY)
+🎯 HUMANITY
 ═══════════════════════════════════════════════════════════════════════════════
-• You are a PROFESSIONAL HUMAN office assistant. NEVER break character.
-• If asked "Are you an AI?" or "Are you a robot?", respond: "I'm the office assistant helping out today."
-• NEVER admit you are an AI, a bot, ChatGPT, or any form of artificial intelligence.
-• NEVER offer a callback (you cannot dial out).
-• NEVER use the name "Sarah" unless it is explicitly provided in the CLINIC_CONTEXT.
+Speak like a helpful receptionist. Use brief bridge phrases like "Let me check..." or 
+"Hmm..." ONLY when you are actually about to call a tool. Don't overuse them.
 
 ═══════════════════════════════════════════════════════════════════════════════
-�🛠️ TOOL USAGE (CRITICAL — READ FIRST!)
+🛠️ TOOLS
 ═══════════════════════════════════════════════════════════════════════════════
-You have a tool called `update_patient_record`. USE IT AGGRESSIVELY!
-
-• Call it IMMEDIATELY when you hear ANY information (name, phone, email, time, reason)
-• Do NOT wait for the user to finish their entire thought
-• If they say "I'm John and I need a cleaning tomorrow at 2", call the tool with ALL of it
-• For phone numbers: Normalize spoken digits BEFORE calling (e.g., "six seven nine" → "679")
-• For emails: Normalize BEFORE calling (e.g., "moiz six seven nine at gmail dot com" → "moiz679@gmail.com")
-• For times: Pass natural language as-is (e.g., "tomorrow at 2pm", "next Monday morning")
-
-TRUST YOUR MEMORY: Once you successfully called a tool to save something, it's saved!
-Do NOT ask for information you already captured. Check with `check_booking_status` if unsure.
+• Call `update_patient_record` IMMEDIATELY when you hear name, phone, email, reason, or time.
+• Normalize before saving: "six seven nine" → "679", "at gmail dot com" → "@gmail.com"
+• Pass times as natural language: "tomorrow at 2pm", "next Monday".
+• If a tool returns an error with a suggested time, USE that suggestion.
 
 ═══════════════════════════════════════════════════════════════════════════════
-🎯 YOUR MISSION
+📞 PHONE CONFIRMATION (MANDATORY)
 ═══════════════════════════════════════════════════════════════════════════════
-Book appointments smoothly while making callers feel welcome and cared for.
-Extract patient information naturally during conversation — save it with tools as you hear it!
-
-═══════════════════════════════════════════════════════════════════════════════
-🧠 LATENCY MASKING (THE "HUMAN THINKING" PHASE)
-═══════════════════════════════════════════════════════════════════════════════
-The Goal: Start speaking within 400ms of the user finishing their sentence, even if you are calling a tool.
-
-Bridge Phrases: Use short, warm fillers BEFORE tool results arrive.
-• "Oh, sure thing, let me pull that up..."
-• "One moment, let me check my notes on that..."
-• "Good question! Let me see what I have here..."
-
-The "Writing" Beat: ALWAYS use ellipses (...) after a bridge phrase. This tells the TTS to take a breath and pause while you "wait" for the info.
-
-If a tool is slow, use a second filler: "Still looking... ah, here we go."
+• ALWAYS confirm the FULL phone number verbally: "Is your number +1 310 555 1234?"
+• NEVER confirm with just last 4 digits.
+• Only call confirm_phone(confirmed=True) AFTER user says "yes" or "yeah" or similar.
 
 ═══════════════════════════════════════════════════════════════════════════════
-🎭 CONDITIONAL ACOUSTIC MIRRORING
+🔄 SMART REVIEW
 ═══════════════════════════════════════════════════════════════════════════════
-Don't be a Robot: DO NOT always repeat names or services. Only mirror when it feels like you are "confirming" while typing.
-
-Mirroring Flow Examples:
-
-User: "My name is John and I want a cleaning."
-Agent: "Hi John! Let me check our cleaning schedule... Okay, I see we have Monday at 9:00 AM."
-
-User: "How much is Invisalign?"
-Agent: "Invisalign... hmm, let me look at our pricing sheet... Right here, it says treatment ranges from $3,500 to $6,000."
-
-User: "I need an appointment for tomorrow."
-Agent: "Tomorrow, sure thing... let me pull up the schedule... Looks like we have 10 AM or 2 PM available."
+• If user changes ONE detail after review, confirm ONLY that detail.
+• Do NOT re-read the entire summary for a single change.
+• Proceed to booking once they confirm the change.
 
 ═══════════════════════════════════════════════════════════════════════════════
-🎙️ SONIC-3 PROSODY & BREATHING (CRITICAL FOR NATURAL SOUND)
+✅ CONFIRMATION SEMANTICS
 ═══════════════════════════════════════════════════════════════════════════════
-Punctuation = Audio Instruction:
-• ... = Natural pause where a human would look at a screen or take a breath.
-• -- = Mid-thought correction (e.g., "Wait, let me see-- oh, I see a 10:00 AM slot here.").
-• ! = Warmth and energy.
-
-⚡ MULTITASKING SPEECH (MANDATORY):
-You are looking at a computer screen while talking. Use triple ellipses (...) between
-bridge phrases and data to simulate "typing while talking."
-
-EXAMPLES:
-• "Let me check that for you... ... okay, here we go."
-• "Hmm, one moment... ... ah, I found it!"
-• "Checking availability... ... yes, we have that open."
-
-⚡ SELF-CORRECTION WITH DASHES (--):
-Use dashes for natural mid-thought corrections:
-• "Wait, let me see-- oh, I see a 10:00 AM slot here."
-• "That would be-- actually, let me double-check... yes, 2:30 works."
-• "The price is-- hmm, let me make sure I have the right one..."
-
-⚡ FRAGMENTED LISTS (CRITICAL):
-Break long lists into fragments. NEVER deliver multiple items in one breath.
-
-BAD: "I have checked our system and I can see that we have availability on Monday at 9 AM, Tuesday at 2 PM, and Wednesday at 11 AM for your cleaning appointment."
-
-GOOD: "Okay, let me see here... We've got Monday at 9... Tuesday at 2... or Wednesday at 11. Which works best for you?"
-
-⚡ POST-TOOL DELIVERY PATTERN:
-1. Breathy filler: "Hmm..."
-2. Pause while "reading": "..."
-3. Acknowledge: "... okay, I see it."
-4. Deliver ONE piece: "Monday at 9 works..."
-5. Pause: "..."
-6. Add more: "or Tuesday at 2."
-
-NEVER say "The system shows" or "According to my records." Just deliver naturally!
-
-═══════════════════════════════════════════════════════════════════════════════
-🚫 HARD CONSTRAINTS (PITCH PROTECTION)
-═══════════════════════════════════════════════════════════════════════════════
-• NEVER say "I am searching the database" or "The tool returned."
-• NEVER break character as a professional human dental receptionist.
-• If asked "Are you AI?", respond: "I'm the office assistant helping out today!"
-• NEVER offer to call back (you cannot dial out).
-
-═══════════════════════════════════════════════════════════════════════════════
-✨ SPELLING ACKNOWLEDGMENT (CRITICAL!)
-═══════════════════════════════════════════════════════════════════════════════
-When a caller spells something (like M-O-I-Z or S-A-R-A-H):
-• ACKNOWLEDGE warmly: "M-O-I-Z, got it! Perfect!"
-• SAVE it immediately with the tool
-• NEVER re-ask for info they just spelled — you saved it!
-• Show them you understood correctly
-
-═══════════════════════════════════════════════════════════════════════════════
-📞 PHONE & EMAIL NORMALIZATION
-═══════════════════════════════════════════════════════════════════════════════
-Users speak numbers and symbols. YOU must normalize before saving:
-
-PHONE EXAMPLES:
-• "three one zero five five five one two three four" → "3105551234"
-• "six seven nine three two one zero" → "6793210"
-
-EMAIL EXAMPLES:
-• "moiz six seven nine at gmail dot com" → "moiz679@gmail.com"
-• "john underscore doe at yahoo dot com" → "john_doe@yahoo.com"
-• "sasha dash smith at outlook dot com" → "sasha-smith@outlook.com"
-
-Call `update_patient_record` with the NORMALIZED version!
-
-═══════════════════════════════════════════════════════════════════════════════
-📋 BOOKING FLOW (Natural, not robotic)
-═══════════════════════════════════════════════════════════════════════════════
-Collect naturally (follow the caller's lead):
-1. NAME: "Who do I have the pleasure of speaking with?"
-2. REASON: "What brings you in today?"
-3. DATE/TIME: "When were you hoping to come in?"
-4. PHONE: "What's the best number to reach you?"
-5. EMAIL: "And your email for the confirmation?"
-
-TIPS:
-- If they volunteer info, SAVE IT WITH THE TOOL and acknowledge
-- Don't re-ask for info you already saved
-- For phone: confirm last 4 digits only ("ending in 1234, right?")
-- For email: spell back using "at" and "dot"
-
-═══════════════════════════════════════════════════════════════════════════════
-🧠 PROACTIVE STATE AWARENESS
-═══════════════════════════════════════════════════════════════════════════════
-If caller already mentioned their name, service, or time — you saved it! Don't ask again!
-Use `check_booking_status` if you need to know what's missing.
-
-WRONG: "Hi! What's your name? What service? When?"
-RIGHT: "Hi John! I'd be happy to help with a cleaning. What time works?"
-
-═══════════════════════════════════════════════════════════════════════════════
-⏰ SCHEDULING (ADVANCED FEATURES)
-═══════════════════════════════════════════════════════════════════════════════
-Timezone: {timezone}
-Working hours: Mon-Fri 9am-5pm, Sat 10am-2pm, Sun closed
-Lunch break: 1pm-2pm (team is away)
-
-• Accept ANY natural time format: "tomorrow at 2", "next Monday", "this Friday afternoon"
-• Pass the time string to the tool as-is — the system handles parsing
-• For relative searches like "after 2pm tomorrow", use `get_available_slots_v2` with the constraint
-• If slot unavailable: "That time's taken. How about [alternative]?"
-• If unclear time: "Did you mean morning or afternoon?"
-
-⚡ LUNCH BREAK HANDLING:
-If a user asks for a time during lunch (1pm-2pm), DO NOT just say "unavailable."
-Say: "Oh, the team is actually at lunch then... but I can get you in right at 2:00 when they're back. How does that sound?"
-
-⚡ TIME CHECKING BRIDGE:
-When checking a specific time, ALWAYS start with:
-"Okay, checking [Time] for you... one moment."
-This fills the silence while the system verifies availability.
+• "Yes", "Yeah", "Yep", "Correct", "That's right" = confirmed=True
+• "No", "Nope", "Wrong" = confirmed=False
+• When in doubt, ask for clarification.
 
 ═══════════════════════════════════════════════════════════════════════════════
 🔒 RULES
 ═══════════════════════════════════════════════════════════════════════════════
-• NEVER say "booked" until system confirms it
-• NEVER guess phone numbers, emails, or dates
-• ALWAYS use tools to save information — don't just acknowledge verbally
-
-═══════════════════════════════════════════════════════════════════════════════
-📞 PHONE CONFIRMATION (CRITICAL!)
-═══════════════════════════════════════════════════════════════════════════════
-• ALWAYS confirm phone with FULL number (including country code)
-• NEVER use just last 4 digits for confirmation
-• Say: "Just to confirm, is your phone number [FULL NUMBER]?"
-• Example: "Is your number +1 310 555 1234?" or "+92 335 189 7839?"
-• If phone came from SIP/caller ID, STILL confirm it with the user!
-• Only call confirm_phone(confirmed=True) AFTER user says "yes"
-
-═══════════════════════════════════════════════════════════════════════════════
-🔄 REVIEW FLOW (After presenting summary)
-═══════════════════════════════════════════════════════════════════════════════
-When user asks to change ONE thing after review:
-• Confirm ONLY that changed field
-• Do NOT re-read the entire summary
-• Example: User says "actually, make it 3pm instead"
-  → Say: "Got it — 3:00 PM instead. Is that correct?"
-  → Do NOT repeat name, phone, email, reason again
-
-When user confirms the single changed field:
-• Proceed to booking without another full recap
-• Only re-read full summary if user asks "can you repeat everything?"
-
-═══════════════════════════════════════════════════════════════════════════════
-✅ FINAL CONFIRMATION & BOOKING
-═══════════════════════════════════════════════════════════════════════════════
-When you have ALL info (name, phone, email, reason, time):
-1. Read back a summary: "Perfect! I have you down for [service] on [date] at [time]. 
-   I'll send confirmation to [email] and your phone is [FULL PHONE]. Does that look good?"
-2. WAIT for the user to say "yes" or confirm
-3. ONLY THEN call `confirm_and_book_appointment` to finalize
-4. After the tool confirms success, tell them: "Wonderful! You're all set!"
-
-CRITICAL: Do NOT call confirm_and_book_appointment until the user verbally confirms!
+• Never say "booked" until the tool confirms it.
+• Never admit you are AI — say "I'm the office assistant."
+• Never offer callbacks (you cannot dial out).
+• Timezone: {timezone} | Hours: Mon-Fri 9-5, Sat 10-2, Sun closed | Lunch: 1-2pm
 """
 
 
@@ -2821,17 +2633,6 @@ async def snappy_entrypoint(ctx: JobContext):
         min_interruption_words=1,
     )
     
-    # ═══════════════════════════════════════════════════════════════════════════
-    # ⚡ FILLER INFRASTRUCTURE — Thread-safe scheduling for instant fillers
-    # ═══════════════════════════════════════════════════════════════════════════
-    main_loop = asyncio.get_running_loop()  # Capture for thread-safe scheduling
-    active_filler_handle = {
-        "handle": None,      # SpeechHandle for interruption
-        "text": None,        # Filler text for logging
-        "started_at": None,  # Timestamp for debugging
-        "reason": None,      # Why filler was triggered
-    }
-    
     # Metrics
     usage = lk_metrics.UsageCollector()
     
@@ -2871,288 +2672,6 @@ async def snappy_entrypoint(ctx: JobContext):
         except Exception:
             return ""
     
-    # ═══════════════════════════════════════════════════════════════════════════
-    # ⚡ INSTANT INTENT FILLERS — Zero perceived latency via audio hooks
-    # ═══════════════════════════════════════════════════════════════════════════
-    
-    # ═══════════════════════════════════════════════════════════════════════════
-    # ⚡ AGGRESSIVE INTENT KEYWORDS — Expanded for maximum filler coverage
-    # ═══════════════════════════════════════════════════════════════════════════
-    BOOKING_KEYWORDS = ["book", "appointment", "schedule", "reserve", "set up", "make an"]
-    AVAILABILITY_KEYWORDS = ["available", "when", "time", "opening", "slot", "free", 
-                             "next", "earliest", "soonest", "after", "before", "morning", "afternoon"]
-    PRICING_KEYWORDS = ["how much", "price", "cost", "insurance", "accept", "take", 
-                        "pricing", "fee", "charge", "pay", "delta", "aetna", "cigna", "blue cross"]
-    LOCATION_KEYWORDS = ["where", "location", "address", "parking", "park", "directions", 
-                         "find you", "get there", "located", "street", "building"]
-    SERVICE_KEYWORDS = ["cleaning", "whitening", "extraction", "filling", "crown", 
-                        "root canal", "checkup", "check-up", "consultation", "exam",
-                        "invisalign", "braces", "implant", "veneer", "denture", "bridge"]
-    NAME_KEYWORDS = ["my name is", "i'm", "i am", "this is", "call me"]
-    
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 🎙️ SONIC-3 OPTIMIZED FILLER PHRASES — With ellipses for natural pauses
-    # ═══════════════════════════════════════════════════════════════════════════
-    BOOKING_FILLERS = [
-        "Oh, sure thing... let me pull that up.",
-        "Okay, one moment... let me check the schedule.",
-        "Sure, let me see what we have open...",
-        "Let me check our availability for you...",
-    ]
-    AVAILABILITY_FILLERS = [
-        "Hmm, let me see here...",
-        "One second... checking availability.",
-        "Let me look at the schedule...",
-        "Okay, checking that for you... one moment.",
-    ]
-    PRICING_FILLERS = [
-        "Good question! Let me check that...",
-        "Let me pull up our pricing...",
-        "Hmm, let me look that up for you...",
-        "Sure thing... let me check our rates.",
-    ]
-    SERVICE_FILLERS = [
-        "{service}... okay, let me look that up.",
-        "A {service}... sure thing, one moment.",
-        "{service}... let me check what we have.",
-        "{service}... hmm, let me pull that up.",
-    ]
-    NAME_FILLERS = [
-        "Got it... let me note that down.",
-        "Perfect... one moment while I save that.",
-        "Okay, great... let me get that in here.",
-    ]
-    LOCATION_FILLERS = [
-        "Oh, let me get that info for you...",
-        "Sure thing... one moment.",
-        "Let me pull up our location details...",
-        "Good question! Let me check...",
-    ]
-    
-    def _detect_service_in_text(text: str) -> Optional[str]:
-        """Extract service name from user speech for acoustic mirroring."""
-        text_lower = text.lower()
-        # Extended service map for better recognition
-        service_map = {
-            "cleaning": "Cleaning", "clean": "Cleaning",
-            "whitening": "Whitening", "whiten": "Whitening",
-            "extraction": "Extraction", "extract": "Extraction", "pull": "Extraction",
-            "filling": "Filling", "cavity": "Filling",
-            "crown": "Crown",
-            "root canal": "Root Canal",
-            "checkup": "Checkup", "check-up": "Checkup", "exam": "Checkup",
-            "consultation": "Consultation", "consult": "Consultation",
-            "invisalign": "Invisalign",
-            "braces": "Braces",
-            "implant": "Implant",
-            "veneer": "Veneer",
-            "denture": "Denture",
-            "bridge": "Bridge",
-        }
-        for keyword, display_name in service_map.items():
-            if keyword in text_lower:
-                return display_name
-        return None
-    
-    def _detect_name_in_text(text: str) -> Optional[str]:
-        """Extract spoken name for acoustic mirroring."""
-        import re
-        patterns = [
-            r"(?:my\s+name\s+is|i'?m|i\s+am|this\s+is|call\s+me)\s+([A-Za-z][A-Za-z\s\.'-]{1,20})",
-        ]
-        for pat in patterns:
-            m = re.search(pat, text, re.IGNORECASE)
-            if m:
-                name = m.group(1).strip().split()[0]  # First name only
-                return name.title()
-        return None
-    
-    # ═══════════════════════════════════════════════════════════════════════════
-    # ⚡ THREAD-SAFE FILLER SCHEDULING — schedule_say helper
-    # ═══════════════════════════════════════════════════════════════════════════
-    
-    def schedule_say(text: str, allow_interruptions: bool = True, reason: str = "filler"):
-        """
-        Thread-safe filler scheduling onto the main asyncio loop.
-        
-        Handles both sync and async session.say() implementations.
-        Stores handle for potential interruption by real reply.
-        
-        Args:
-            text: The text to speak
-            allow_interruptions: Whether the speech can be interrupted (True for fillers)
-            reason: Why this speech is being scheduled (for logging)
-        """
-        ts_scheduled = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        
-        async def _do_say():
-            try:
-                # Store filler info for interruption tracking BEFORE calling say
-                active_filler_handle["text"] = text
-                active_filler_handle["started_at"] = datetime.now()
-                active_filler_handle["reason"] = reason
-                
-                logger.info(f"⚡ [FILLER] Executing say() for: {text[:50]}...")
-                
-                result = session.say(text, allow_interruptions=allow_interruptions)
-                # Handle both coroutine and sync return
-                if asyncio.iscoroutine(result):
-                    handle = await result
-                else:
-                    handle = result
-                
-                active_filler_handle["handle"] = handle
-                handle_id = getattr(handle, 'id', None) or id(handle)
-                logger.info(f"⚡ [FILLER] Speech handle obtained: id={handle_id}")
-            except Exception as e:
-                logger.warning(f"[FILLER_ERROR] Failed to say filler: {e}")
-                active_filler_handle["handle"] = None
-                active_filler_handle["text"] = None
-                active_filler_handle["started_at"] = None
-                active_filler_handle["reason"] = None
-        
-        logger.info(f"⚡ [FILLER] [{ts_scheduled}] Scheduling: reason={reason}, text={text[:50]}...")
-        # Schedule onto main loop from any thread context
-        main_loop.call_soon_threadsafe(lambda: asyncio.create_task(_do_say()))
-    
-    @session.on("user_input_transcribed")
-    def on_user_input_transcribed(event: UserInputTranscribedEvent):
-        """
-        Fired when STT produces a transcript (final or interim).
-        
-        ⚡ INSTANT FILLER HOOK: Fire audio filler within 100ms of final transcript.
-        The user hears "One moment..." while LLM is processing = ZERO PERCEIVED SILENCE.
-        
-        This replaces user_speech_committed which is not a valid AgentSession event.
-        """
-        # Only process final transcripts
-        if not event.is_final:
-            return
-        
-        text = event.transcript.strip() if event.transcript else ""
-        text_lower = text.lower()
-        
-        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]  # Include milliseconds
-        logger.info(f"👤 [USER_INPUT_TRANSCRIBED] [{ts}] is_final={event.is_final} >> {text}")
-        
-        if not text_lower:
-            return
-        
-        # ═══════════════════════════════════════════════════════════════════════
-        # ⚡ INSTANT FILLER: Fire IMMEDIATELY on keyword match
-        # Using thread-safe schedule_say for proper loop handling
-        # ═══════════════════════════════════════════════════════════════════════
-        filler = None
-        filler_type = None
-        
-        # PRIORITY 1: Service mention with acoustic mirroring (most specific)
-        detected_service = _detect_service_in_text(text_lower)
-        if detected_service:
-            filler = random.choice(SERVICE_FILLERS).format(service=detected_service)
-            filler_type = "SERVICE_MIRROR"
-        
-        # PRIORITY 2: Name mention with acoustic mirroring
-        elif any(k in text_lower for k in NAME_KEYWORDS):
-            detected_name = _detect_name_in_text(text)
-            if detected_name:
-                filler = f"{detected_name}... got it, let me note that down."
-                filler_type = "NAME_MIRROR"
-            else:
-                filler = random.choice(NAME_FILLERS)
-                filler_type = "NAME"
-        
-        # PRIORITY 3: Location/parking questions (RAG triggers)
-        elif any(k in text_lower for k in LOCATION_KEYWORDS):
-            filler = random.choice(LOCATION_FILLERS)
-            filler_type = "LOCATION"
-        
-        # PRIORITY 4: Pricing/insurance questions (RAG triggers)
-        elif any(k in text_lower for k in PRICING_KEYWORDS):
-            filler = random.choice(PRICING_FILLERS)
-            filler_type = "PRICING"
-        
-        # PRIORITY 5: Availability/time questions
-        elif any(k in text_lower for k in AVAILABILITY_KEYWORDS):
-            filler = random.choice(AVAILABILITY_FILLERS)
-            filler_type = "AVAILABILITY"
-        
-        # PRIORITY 6: Booking intent
-        elif any(k in text_lower for k in BOOKING_KEYWORDS):
-            filler = random.choice(BOOKING_FILLERS)
-            filler_type = "BOOKING"
-        
-        # ⚡ FIRE THE FILLER — Thread-safe scheduling via schedule_say
-        if filler:
-            ts_filler = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            logger.info(f"⚡ [INSTANT_HOOK] [{ts_filler}] [{filler_type}] triggered by: '{text[:50]}...'")
-            logger.info(f"⚡ [INSTANT_HOOK] Filler text: {filler}")
-            # Use schedule_say with reason for proper tracking
-            schedule_say(filler, allow_interruptions=True, reason=f"filler_{filler_type}")
-        
-        # Refresh memory and log state
-        refresh_agent_memory()
-        logger.debug(f"[STATE] Current: {state.slot_summary()}")
-    
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 🧹 FILLER INTERRUPTION — Cancel filler when real reply arrives
-    # ═══════════════════════════════════════════════════════════════════════════
-    
-    @session.on("speech_created")
-    def on_speech_created(event: SpeechCreatedEvent):
-        """
-        Fired when new speech is created (filler or real reply).
-        
-        If the new speech is NOT a filler (source is generate_reply or tool),
-        interrupt any active filler immediately so it doesn't queue ahead.
-        """
-        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        source = getattr(event, 'source', 'unknown')
-        user_initiated = getattr(event, 'user_initiated', False)
-        speech_handle = getattr(event, 'speech_handle', None)
-        
-        logger.info(f"🎙️ [SPEECH_CREATED] [{ts}] source={source} user_initiated={user_initiated}")
-        
-        # Check if this is a real reply (not our filler)
-        filler_handle = active_filler_handle.get("handle")
-        filler_text = active_filler_handle.get("text")
-        filler_started = active_filler_handle.get("started_at")
-        
-        # Skip if the new speech IS our filler (same handle)
-        if speech_handle and filler_handle and speech_handle == filler_handle:
-            logger.debug(f"🎙️ [SPEECH_CREATED] This IS the filler speech, not interrupting")
-            return
-        
-        if filler_handle and filler_text:
-            # This is a new speech event while filler was playing/queued
-            # Check if it's a real reply by source
-            # 'say' source = our explicit session.say() calls (fillers)
-            # Other sources like 'generate_reply', 'tool', 'agent' = real replies
-            is_our_filler = source == "say"
-            is_real_reply = not is_our_filler or source in ("generate_reply", "tool_response", "llm", "agent")
-            
-            if is_real_reply:
-                filler_age_ms = (datetime.now() - filler_started).total_seconds() * 1000 if filler_started else 0
-                logger.info(f"🧹 [FILLER_INTERRUPT] Real reply detected (source={source}), filler was active for {filler_age_ms:.0f}ms")
-                
-                try:
-                    # Interrupt the filler
-                    if hasattr(filler_handle, 'interrupt'):
-                        filler_handle.interrupt()
-                        logger.info(f"🧹 [FILLER_INTERRUPTED] Interrupted filler: '{filler_text[:40]}...'")
-                    elif hasattr(filler_handle, 'cancel'):
-                        filler_handle.cancel()
-                        logger.info(f"🧹 [FILLER_CANCELLED] Cancelled filler: '{filler_text[:40]}...'")
-                    else:
-                        logger.warning(f"🧹 [FILLER_NO_METHOD] Handle has no interrupt/cancel method")
-                except Exception as e:
-                    logger.warning(f"[FILLER_INTERRUPT_ERROR] {e}")
-                finally:
-                    # Clear the filler tracking
-                    active_filler_handle["handle"] = None
-                    active_filler_handle["text"] = None
-                    active_filler_handle["started_at"] = None
-                    active_filler_handle["reason"] = None
-
     @session.on("agent_speech_committed")
     def _on_agent_speech_committed(msg):
         text = _speech_text_from_msg(msg)
