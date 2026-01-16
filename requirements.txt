@@ -2,7 +2,7 @@
 # PRODUCTION Requirements — Moiz Dental AI Agent
 # =============================================================================
 
-# Core Framework (Updated to allow the latest compatible 1.3.x versions)
+# Core Framework (Updated to satisfy plugin requirements)
 livekit-agents[silero]>=1.3.11
 
 # AI Plugins (Loosened to allow the resolver to find matching versions)

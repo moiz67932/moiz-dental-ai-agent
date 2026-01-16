@@ -28,11 +28,12 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # -----------------------------------------------------------------------------
 FROM python:3.10-slim-bookworm AS runtime
 
+# libgomp1 is REQUIRED for LiveKit RTC FFI to load
 # ffmpeg is needed for audio processing, ca-certificates for API security
-# We use --no-install-recommends to avoid pulling in X11/Graphics bloat
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -44,7 +45,7 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy code files (Ensure these all exist in your repo!)
+# Copy all required local files
 COPY agent_v2.py .
 COPY contact_utils.py .
 COPY calendar_client.py .
@@ -58,5 +59,5 @@ ENV ENVIRONMENT=production
 USER agent
 EXPOSE 8080
 
-# Start in dev mode to connect to LiveKit Cloud
+# Start the agent
 CMD ["python", "agent_v2.py", "dev"]
