@@ -375,15 +375,38 @@ This fills the silence while the system verifies availability.
 ═══════════════════════════════════════════════════════════════════════════════
 • NEVER say "booked" until system confirms it
 • NEVER guess phone numbers, emails, or dates
-• NEVER repeat full phone numbers (privacy!)
 • ALWAYS use tools to save information — don't just acknowledge verbally
+
+═══════════════════════════════════════════════════════════════════════════════
+📞 PHONE CONFIRMATION (CRITICAL!)
+═══════════════════════════════════════════════════════════════════════════════
+• ALWAYS confirm phone with FULL number (including country code)
+• NEVER use just last 4 digits for confirmation
+• Say: "Just to confirm, is your phone number [FULL NUMBER]?"
+• Example: "Is your number +1 310 555 1234?" or "+92 335 189 7839?"
+• If phone came from SIP/caller ID, STILL confirm it with the user!
+• Only call confirm_phone(confirmed=True) AFTER user says "yes"
+
+═══════════════════════════════════════════════════════════════════════════════
+🔄 REVIEW FLOW (After presenting summary)
+═══════════════════════════════════════════════════════════════════════════════
+When user asks to change ONE thing after review:
+• Confirm ONLY that changed field
+• Do NOT re-read the entire summary
+• Example: User says "actually, make it 3pm instead"
+  → Say: "Got it — 3:00 PM instead. Is that correct?"
+  → Do NOT repeat name, phone, email, reason again
+
+When user confirms the single changed field:
+• Proceed to booking without another full recap
+• Only re-read full summary if user asks "can you repeat everything?"
 
 ═══════════════════════════════════════════════════════════════════════════════
 ✅ FINAL CONFIRMATION & BOOKING
 ═══════════════════════════════════════════════════════════════════════════════
 When you have ALL info (name, phone, email, reason, time):
 1. Read back a summary: "Perfect! I have you down for [service] on [date] at [time]. 
-   Your phone ends in [last4] and I'll send confirmation to [email]. Does that look good?"
+   I'll send confirmation to [email] and your phone is [FULL PHONE]. Does that look good?"
 2. WAIT for the user to say "yes" or confirm
 3. ONLY THEN call `confirm_and_book_appointment` to finalize
 4. After the tool confirms success, tell them: "Wonderful! You're all set!"
@@ -477,9 +500,12 @@ async def update_patient_record(
         if len(clean_phone) >= 10:
             state.phone_e164 = clean_phone if clean_phone.startswith("+") else f"+{clean_phone}"
             state.phone_last4 = clean_phone[-4:]
-            state.phone_confirmed = True
-            updates.append(f"phone=***{state.phone_last4}")
-            logger.info(f"[TOOL] ✓ Phone captured: ***{state.phone_last4}")
+            # NEVER auto-confirm phone - always require explicit user confirmation
+            state.phone_confirmed = False
+            state.phone_source = "user_spoken"
+            state.pending_confirm = "phone"
+            updates.append(f"phone={state.phone_e164} (NEEDS CONFIRMATION)")
+            logger.info(f"[TOOL] ⏳ Phone captured (needs confirmation): {state.phone_e164}")
     
     # === EMAIL ===
     if email and not state.email:
@@ -1082,18 +1108,48 @@ async def find_relative_slots(
 
 
 @function_tool(description="""
-Confirm the phone number with the patient. Call this after reading back the last 4 digits.
+Confirm the phone number with the patient. Call this ONLY after reading back the FULL phone number.
+NEVER confirm based on just last 4 digits - always speak the complete number including country code.
+Example: "Just to confirm, is your number +1 310 555 1234?"
 """)
-async def confirm_phone(confirmed: bool) -> str:
-    """Mark phone as confirmed or rejected."""
+async def confirm_phone(confirmed: bool, new_phone: str = None) -> str:
+    """
+    Mark phone as confirmed or update with correction.
+    
+    Args:
+        confirmed: True if user confirmed the phone is correct
+        new_phone: Optional new phone number if user provided a correction
+    """
     global _GLOBAL_STATE
     state = _GLOBAL_STATE
     if not state:
         return "State not initialized."
     
+    if new_phone:
+        # User provided a correction
+        clean_phone = re.sub(r"[^\d+]", "", new_phone)
+        if len(clean_phone) >= 10:
+            state.phone_e164 = clean_phone if clean_phone.startswith("+") else f"+{clean_phone}"
+            state.phone_last4 = clean_phone[-4:]
+            state.phone_confirmed = False
+            state.phone_source = "user_spoken"
+            state.pending_confirm = "phone"
+            logger.info(f"[TOOL] ⏳ Phone updated to {state.phone_e164}, needs re-confirmation")
+            # Trigger memory refresh
+            if _REFRESH_AGENT_MEMORY:
+                try:
+                    _REFRESH_AGENT_MEMORY()
+                except Exception:
+                    pass
+            return f"Phone updated to {state.phone_e164}. Please confirm the FULL number with the patient."
+    
     if confirmed:
+        if not state.phone_e164:
+            return "No phone number to confirm. Ask for phone number first."
         state.phone_confirmed = True
-        logger.info("[TOOL] ✓ Phone confirmed")
+        state.pending_confirm = None if state.pending_confirm == "phone" else state.pending_confirm
+        state.pending_confirm_field = None if state.pending_confirm_field == "phone" else state.pending_confirm_field
+        logger.info(f"[TOOL] ✓ Phone confirmed: {state.phone_e164}")
         # Trigger memory refresh
         if _REFRESH_AGENT_MEMORY:
             try:
@@ -1105,6 +1161,8 @@ async def confirm_phone(confirmed: bool) -> str:
         state.phone_e164 = None
         state.phone_last4 = None
         state.phone_confirmed = False
+        state.phone_source = None
+        state.pending_confirm = None if state.pending_confirm == "phone" else state.pending_confirm
         logger.info("[TOOL] ✗ Phone rejected, cleared")
         # Trigger memory refresh
         if _REFRESH_AGENT_MEMORY:
@@ -1112,7 +1170,7 @@ async def confirm_phone(confirmed: bool) -> str:
                 _REFRESH_AGENT_MEMORY()
             except Exception:
                 pass
-        return "Phone cleared. Ask for the correct number."
+        return "Phone cleared. Ask for the correct FULL phone number."
 
 
 @function_tool(description="""
@@ -1433,6 +1491,16 @@ class PatientState:
     email_confirmed: bool = False
     pending_confirm: Optional[str] = None  # "phone" or "email"
     
+    # Phone source tracking (for confirmation UX)
+    phone_source: Optional[str] = None  # "sip", "user_spoken", "extracted"
+    
+    # Review flow tracking
+    review_presented: bool = False  # True after review summary shown
+    review_snapshot: Optional[Dict[str, Any]] = None  # Snapshot at review time
+    changed_fields: Optional[set] = field(default_factory=set)  # Fields changed after review
+    pending_confirm_field: Optional[str] = None  # Single field needing confirmation
+    partial_confirm_complete: bool = False  # True after confirming changed field
+    
     # Booking state
     booking_attempted: bool = False
     booking_confirmed: bool = False
@@ -1497,11 +1565,13 @@ class PatientState:
         else:
             lines.append("• NAME: ? — Still needed. Ask naturally.")
         
-        # Phone
+        # Phone - always show full number for confirmation prompt
         if self.phone_e164 and self.phone_confirmed:
-            lines.append(f"• PHONE: ✓ (ends in {self.phone_last4}) — CONFIRMED. Do NOT ask again.")
+            lines.append(f"• PHONE: ✓ {self.phone_e164} — CONFIRMED. Do NOT ask again.")
         elif self.phone_e164:
-            lines.append(f"• PHONE: ⏳ (ends in {self.phone_last4}) — Captured but needs confirmation.")
+            source_note = f" (from {self.phone_source})" if self.phone_source else ""
+            lines.append(f"• PHONE: ⏳ {self.phone_e164}{source_note} — MUST CONFIRM FULL NUMBER with user!")
+            lines.append(f"  → Ask: 'Just to confirm, is your phone number {self.phone_e164}?'")
         else:
             lines.append("• PHONE: ? — Still needed. Ask naturally.")
         
@@ -2534,14 +2604,17 @@ async def snappy_entrypoint(ctx: JobContext):
         logger.info(f"📞 [SIP] Caller (from): {caller_phone}")
         logger.info(f"📞 [SIP] Called (to): {called_num}")
         
-        # Pre-fill caller's phone immediately — agent won't ask for it!
+        # Pre-fill caller's phone from SIP - but NEVER auto-confirm!
+        # Agent MUST confirm full phone number with user before booking
         if caller_phone:
-            clean_phone = normalize_phone(caller_phone, DEFAULT_PHONE_REGION)
+            clean_phone, last4 = normalize_phone(caller_phone, DEFAULT_PHONE_REGION)
             if clean_phone:
                 state.phone_e164 = clean_phone
-                state.phone_last4 = clean_phone[-4:]
-                state.phone_confirmed = True  # Auto-confirmed from SIP
-                logger.info(f"📞 [SIP] ✓ Caller phone pre-filled: ***{state.phone_last4}")
+                state.phone_last4 = last4
+                state.phone_confirmed = False  # NEVER auto-confirm - always ask user
+                state.phone_source = "sip"  # Track source for confirmation logic
+                state.pending_confirm = "phone"  # Flag that phone needs confirmation
+                logger.info(f"📞 [SIP] ⏳ Caller phone pre-filled (needs confirmation): {clean_phone}")
     
     # PRIORITY 2: Room name regex — flexible US phone number extraction
     # Matches +1XXXXXXXXXX anywhere in room name (e.g., call_+13103410536_abc123)
@@ -2752,7 +2825,12 @@ async def snappy_entrypoint(ctx: JobContext):
     # ⚡ FILLER INFRASTRUCTURE — Thread-safe scheduling for instant fillers
     # ═══════════════════════════════════════════════════════════════════════════
     main_loop = asyncio.get_running_loop()  # Capture for thread-safe scheduling
-    active_filler_handle = {"handle": None, "text": None}  # Track active filler for interruption
+    active_filler_handle = {
+        "handle": None,      # SpeechHandle for interruption
+        "text": None,        # Filler text for logging
+        "started_at": None,  # Timestamp for debugging
+        "reason": None,      # Why filler was triggered
+    }
     
     # Metrics
     usage = lk_metrics.UsageCollector()
@@ -2893,17 +2971,28 @@ async def snappy_entrypoint(ctx: JobContext):
     # ⚡ THREAD-SAFE FILLER SCHEDULING — schedule_say helper
     # ═══════════════════════════════════════════════════════════════════════════
     
-    def schedule_say(text: str, allow_interruptions: bool = True):
+    def schedule_say(text: str, allow_interruptions: bool = True, reason: str = "filler"):
         """
         Thread-safe filler scheduling onto the main asyncio loop.
         
         Handles both sync and async session.say() implementations.
         Stores handle for potential interruption by real reply.
+        
+        Args:
+            text: The text to speak
+            allow_interruptions: Whether the speech can be interrupted (True for fillers)
+            reason: Why this speech is being scheduled (for logging)
         """
+        ts_scheduled = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        
         async def _do_say():
             try:
-                # Store filler info for interruption tracking
+                # Store filler info for interruption tracking BEFORE calling say
                 active_filler_handle["text"] = text
+                active_filler_handle["started_at"] = datetime.now()
+                active_filler_handle["reason"] = reason
+                
+                logger.info(f"⚡ [FILLER] Executing say() for: {text[:50]}...")
                 
                 result = session.say(text, allow_interruptions=allow_interruptions)
                 # Handle both coroutine and sync return
@@ -2913,12 +3002,16 @@ async def snappy_entrypoint(ctx: JobContext):
                     handle = result
                 
                 active_filler_handle["handle"] = handle
-                logger.debug(f"⚡ [FILLER_PLAYING] >> {text}")
+                handle_id = getattr(handle, 'id', None) or id(handle)
+                logger.info(f"⚡ [FILLER] Speech handle obtained: id={handle_id}")
             except Exception as e:
                 logger.warning(f"[FILLER_ERROR] Failed to say filler: {e}")
                 active_filler_handle["handle"] = None
                 active_filler_handle["text"] = None
+                active_filler_handle["started_at"] = None
+                active_filler_handle["reason"] = None
         
+        logger.info(f"⚡ [FILLER] [{ts_scheduled}] Scheduling: reason={reason}, text={text[:50]}...")
         # Schedule onto main loop from any thread context
         main_loop.call_soon_threadsafe(lambda: asyncio.create_task(_do_say()))
     
@@ -2988,11 +3081,13 @@ async def snappy_entrypoint(ctx: JobContext):
             filler = random.choice(BOOKING_FILLERS)
             filler_type = "BOOKING"
         
-        # ⚡ FIRE THE FILLER — Thread-safe scheduling
+        # ⚡ FIRE THE FILLER — Thread-safe scheduling via schedule_say
         if filler:
             ts_filler = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            logger.info(f"⚡ [INSTANT_HOOK] [{ts_filler}] [{filler_type}] >> {filler}")
-            schedule_say(filler, allow_interruptions=True)
+            logger.info(f"⚡ [INSTANT_HOOK] [{ts_filler}] [{filler_type}] triggered by: '{text[:50]}...'")
+            logger.info(f"⚡ [INSTANT_HOOK] Filler text: {filler}")
+            # Use schedule_say with reason for proper tracking
+            schedule_say(filler, allow_interruptions=True, reason=f"filler_{filler_type}")
         
         # Refresh memory and log state
         refresh_agent_memory()
@@ -3013,33 +3108,50 @@ async def snappy_entrypoint(ctx: JobContext):
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         source = getattr(event, 'source', 'unknown')
         user_initiated = getattr(event, 'user_initiated', False)
+        speech_handle = getattr(event, 'speech_handle', None)
         
-        logger.debug(f"🎙️ [SPEECH_CREATED] [{ts}] source={source} user_initiated={user_initiated}")
+        logger.info(f"🎙️ [SPEECH_CREATED] [{ts}] source={source} user_initiated={user_initiated}")
         
         # Check if this is a real reply (not our filler)
         filler_handle = active_filler_handle.get("handle")
         filler_text = active_filler_handle.get("text")
+        filler_started = active_filler_handle.get("started_at")
+        
+        # Skip if the new speech IS our filler (same handle)
+        if speech_handle and filler_handle and speech_handle == filler_handle:
+            logger.debug(f"🎙️ [SPEECH_CREATED] This IS the filler speech, not interrupting")
+            return
         
         if filler_handle and filler_text:
-            # This is a new speech event while filler was playing
-            # Check if it's a real reply by comparing source or checking if it's LLM-generated
-            is_real_reply = source in ("generate_reply", "tool_response", "llm") or user_initiated
+            # This is a new speech event while filler was playing/queued
+            # Check if it's a real reply by source
+            # 'say' source = our explicit session.say() calls (fillers)
+            # Other sources like 'generate_reply', 'tool', 'agent' = real replies
+            is_our_filler = source == "say"
+            is_real_reply = not is_our_filler or source in ("generate_reply", "tool_response", "llm", "agent")
             
             if is_real_reply:
+                filler_age_ms = (datetime.now() - filler_started).total_seconds() * 1000 if filler_started else 0
+                logger.info(f"🧹 [FILLER_INTERRUPT] Real reply detected (source={source}), filler was active for {filler_age_ms:.0f}ms")
+                
                 try:
                     # Interrupt the filler
                     if hasattr(filler_handle, 'interrupt'):
                         filler_handle.interrupt()
-                        logger.info(f"🧹 [FILLER_INTERRUPTED] Real reply arrived, interrupted filler: {filler_text[:30]}...")
+                        logger.info(f"🧹 [FILLER_INTERRUPTED] Interrupted filler: '{filler_text[:40]}...'")
                     elif hasattr(filler_handle, 'cancel'):
                         filler_handle.cancel()
-                        logger.info(f"🧹 [FILLER_CANCELLED] Real reply arrived, cancelled filler: {filler_text[:30]}...")
+                        logger.info(f"🧹 [FILLER_CANCELLED] Cancelled filler: '{filler_text[:40]}...'")
+                    else:
+                        logger.warning(f"🧹 [FILLER_NO_METHOD] Handle has no interrupt/cancel method")
                 except Exception as e:
                     logger.warning(f"[FILLER_INTERRUPT_ERROR] {e}")
                 finally:
                     # Clear the filler tracking
                     active_filler_handle["handle"] = None
                     active_filler_handle["text"] = None
+                    active_filler_handle["started_at"] = None
+                    active_filler_handle["reason"] = None
 
     @session.on("agent_speech_committed")
     def _on_agent_speech_committed(msg):
