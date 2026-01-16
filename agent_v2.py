@@ -168,16 +168,85 @@ def _normalize_sip_user_to_e164(raw: Optional[str]) -> Optional[str]:
     return s
 
 
+def speakable_phone(e164: Optional[str]) -> str:
+    """
+    Convert E.164 phone number to speech-friendly format for verbal confirmation.
+    
+    Examples:
+        +923351897839 -> "+92 335 189 7839"
+        +13105551234  -> "+1 310 555 1234"
+    
+    Used when agent reads back phone number for confirmation.
+    ALWAYS use full number, never just last 4 digits.
+    """
+    if not e164:
+        return "unknown"
+    
+    s = str(e164).strip()
+    if not s.startswith("+"):
+        s = "+" + re.sub(r"\D", "", s)
+    
+    digits = re.sub(r"\D", "", s)
+    
+    # Format based on country code length
+    if digits.startswith("1") and len(digits) == 11:  # US/Canada: +1 XXX XXX XXXX
+        return f"+1 {digits[1:4]} {digits[4:7]} {digits[7:]}"
+    elif digits.startswith("92") and len(digits) >= 11:  # Pakistan: +92 XXX XXX XXXX
+        return f"+92 {digits[2:5]} {digits[5:8]} {digits[8:]}"
+    elif digits.startswith("44") and len(digits) >= 11:  # UK: +44 XXXX XXXXXX
+        return f"+44 {digits[2:6]} {digits[6:]}"
+    else:
+        # Generic: group in 3-4 digit chunks
+        parts = []
+        if s.startswith("+"):
+            # Keep country code separate (1-3 digits)
+            cc_len = 1 if digits[0] == "1" else (2 if len(digits) <= 12 else 3)
+            parts.append(f"+{digits[:cc_len]}")
+            remaining = digits[cc_len:]
+        else:
+            remaining = digits
+        
+        # Split remaining into 3-4 digit groups
+        while remaining:
+            chunk_size = 4 if len(remaining) > 6 else 3
+            parts.append(remaining[:chunk_size])
+            remaining = remaining[chunk_size:]
+        
+        return " ".join(parts)
+
+
+def _ensure_phone_is_string(state: "PatientState") -> None:
+    """
+    Safety guard: Ensure state.phone_e164 is always a string, not a tuple.
+    Call this after any phone assignment to catch tuple bugs.
+    """
+    if state.phone_e164 is not None and isinstance(state.phone_e164, tuple):
+        logger.error(f"[PHONE BUG] state.phone_e164 was tuple: {state.phone_e164}. Extracting first element.")
+        state.phone_e164 = state.phone_e164[0] if state.phone_e164 else None
+
+
 def _normalize_phone_preserve_plus(raw: Optional[str], default_region: str) -> Tuple[Optional[str], str]:
     """Normalize phone while preserving explicit international '+' prefix.
     
     Returns: Tuple[Optional[str], str] - (e164_phone, last4_digits)
     IMPORTANT: Always unpack result as: clean_phone, last4 = _normalize_phone_preserve_plus(...)
+    CRITICAL: This ALWAYS returns a tuple (str|None, str). Never store the raw return value.
     """
     if not raw:
         return None, ""
 
     s = str(raw).strip()
+    
+    # Handle local Pakistani formats (e.g., 0335xxxxxxx -> +92335xxxxxxx)
+    # Must be done BEFORE the E.164 check since local formats don't start with +
+    if default_region == "PK" and s.startswith("0") and len(s) >= 10:
+        # Pakistani local format: 0335xxxxxxx -> +92335xxxxxxx
+        local_digits = re.sub(r"\D", "", s)
+        if len(local_digits) >= 10 and local_digits.startswith("0"):
+            s = "+92" + local_digits[1:]  # Remove leading 0, add +92
+            logger.debug(f"[PHONE] Converted PK local {raw} -> {s}")
+    
+    # If already E.164 format with +
     if s.startswith("+"):
         digits = re.sub(r"\D", "", s)
         # Support international numbers (8+ digits covers Pakistani numbers like +923...)
@@ -188,10 +257,18 @@ def _normalize_phone_preserve_plus(raw: Optional[str], default_region: str) -> T
     # Fallback to normalize_phone which also returns a tuple
     result = normalize_phone(s, default_region)
     if isinstance(result, tuple):
-        return result
+        e164_val, last4_val = result
+        # Ensure e164_val is a string, not a tuple (safety guard)
+        if isinstance(e164_val, tuple):
+            logger.error(f"[PHONE] BUG: normalize_phone returned nested tuple for '{raw}'")
+            e164_val = e164_val[0] if e164_val else None
+        return e164_val, last4_val
     # Safety: if normalize_phone returns just a string (shouldn't happen), wrap it
     if result:
-        return result, result[-4:] if len(result) >= 4 else ""
+        if isinstance(result, str):
+            return result, result[-4:] if len(result) >= 4 else ""
+        # If result is somehow still a tuple at this point
+        logger.error(f"[PHONE] BUG: Unexpected type from normalize_phone: {type(result)}")
     return None, ""
 
 
@@ -348,17 +425,35 @@ async def update_patient_record(
     
     # === PHONE ===
     if phone and not state.phone_e164:
-        clean_phone = re.sub(r"[^\d+]", "", phone)
-        digits_len = len(re.sub(r"\D", "", clean_phone))
-        if digits_len >= 8:
-            state.phone_e164 = clean_phone if clean_phone.startswith("+") else f"+{clean_phone}"
-            state.phone_last4 = re.sub(r"\D", "", clean_phone)[-4:]
+        # Use proper normalization with region awareness
+        clinic_region = (_GLOBAL_CLINIC_INFO or {}).get("default_phone_region", DEFAULT_PHONE_REGION)
+        clean_phone, last4 = _normalize_phone_preserve_plus(phone, clinic_region)
+        
+        if clean_phone:
+            state.phone_e164 = clean_phone  # Always a string from tuple unpacking
+            state.phone_last4 = last4
+            # Safety guard: ensure no tuple was stored
+            _ensure_phone_is_string(state)
             # NEVER auto-confirm phone - always require explicit user confirmation
             state.phone_confirmed = False
             state.phone_source = "user_spoken"
             state.pending_confirm = "phone"
+            state.pending_confirm_field = "phone"  # Also set this for deterministic routing
+            
+            # Return message prompting agent to confirm FULL number
+            speakable = speakable_phone(state.phone_e164)
             updates.append(f"phone={state.phone_e164} (NEEDS CONFIRMATION)")
             logger.info(f"[TOOL] ⏳ Phone captured (needs confirmation): {state.phone_e164}")
+            
+            # Trigger memory refresh so LLM sees the pending confirmation
+            if _REFRESH_AGENT_MEMORY:
+                try:
+                    _REFRESH_AGENT_MEMORY()
+                except Exception:
+                    pass
+            
+            # Return explicit instruction to confirm full number
+            return f"Phone captured as {speakable}. ASK USER TO CONFIRM THE FULL NUMBER: 'Just to confirm, is your phone number {speakable}?'"
     
     # === EMAIL ===
     if email and not state.email:
@@ -414,41 +509,47 @@ async def update_patient_record(
                         slot_free = await is_slot_free_supabase(clinic_id, parsed, slot_end)
                         
                         if not slot_free:
-                            # Slot is taken - find nearby alternatives bidirectionally
+                            # Slot is taken - find nearby alternatives AROUND THE REQUESTED TIME
+                            # NOT from "now" - this is the key fix for the scheduling bug
                             state.time_status = "invalid"
                             state.time_error = "That slot is already taken"
                             state.dt_local = None
                             
-                            logger.info(f"[TOOL] ✗ {time_spoken} is booked, searching for nearby alternatives")
+                            logger.info(f"[TOOL] ✗ {time_spoken} on {parsed.strftime('%b %d')} is booked, searching for nearby alternatives")
                             
-                            # Find alternatives around the requested time (±60 min window)
-                            alternatives = await get_alternatives_around_datetime(
+                            # Use suggest_slots_around for comprehensive ±4 hour search around requested time
+                            alternatives = await suggest_slots_around(
                                 clinic_id=clinic_id,
-                                target_dt=parsed,
+                                requested_start_dt=parsed,  # Search around THIS time, not now
                                 duration_minutes=state.duration_minutes,
                                 schedule=schedule,
                                 tz_str=_GLOBAL_CLINIC_TZ,
-                                window_minutes=60,
-                                num_slots=2,
+                                count=3,
+                                window_hours=4,  # ±4 hours around requested time
+                                step_min=15,
                             )
                             
+                            logger.info(f"[TOOL] Found {len(alternatives)} nearby alternatives around {parsed.strftime('%H:%M')}")
+                            
                             if alternatives:
-                                # Format alternatives for speech
-                                alt_times = []
+                                # Format alternatives for speech - include date if different from requested
+                                alt_descriptions = []
                                 for alt in alternatives:
                                     alt_time_str = alt.strftime("%I:%M %p").lstrip("0")
                                     if alt.date() == parsed.date():
-                                        alt_times.append(alt_time_str)
+                                        alt_descriptions.append(alt_time_str)
                                     else:
-                                        alt_times.append(f"{alt.strftime('%A')} at {alt_time_str}")
+                                        alt_descriptions.append(f"{alt.strftime('%A')} at {alt_time_str}")
                                 
-                                if len(alt_times) == 1:
-                                    return f"... I'm sorry, {time_spoken} is booked. I can do {alt_times[0]} that same day. Would that work?"
+                                if len(alt_descriptions) == 1:
+                                    return f"... I'm sorry, {time_spoken} is booked on {day_spoken}. The closest I have is {alt_descriptions[0]}. Would that work?"
+                                elif len(alt_descriptions) == 2:
+                                    return f"... I'm sorry, {time_spoken} is booked on {day_spoken}. I can do {alt_descriptions[0]} or {alt_descriptions[1]}. Which works for you?"
                                 else:
-                                    return f"... I'm sorry, {time_spoken} is booked. I can do {alt_times[0]} or {alt_times[1]} that same day. Which works for you?"
+                                    return f"... I'm sorry, {time_spoken} is booked on {day_spoken}. I can do {alt_descriptions[0]}, {alt_descriptions[1]}, or {alt_descriptions[2]}. Which works for you?"
                             else:
                                 # No nearby alternatives, suggest checking another time
-                                return f"... hmm, {time_spoken} is booked and I don't see openings nearby. Would you like a different day?"
+                                return f"... hmm, {time_spoken} on {day_spoken} is booked and I don't see openings nearby. Would you like to try a different day?"
                     
                     # ✅ Time is VALID and AVAILABLE
                     state.dt_local = parsed
@@ -676,7 +777,11 @@ async def get_available_slots_v2(
             )
             current = current.replace(hour=9, minute=0)  # Start at 9am
         
-        end_search = now + timedelta(days=14)  # Extended 14-day search window
+        # FIX: Anchor end_search to SEARCH_START, not just now
+        # This ensures future date requests (e.g., Jan 20) are within search window
+        end_search = max(now + timedelta(days=14), search_start + timedelta(days=14))
+        
+        logger.info(f"[SLOTS_V2] Search anchored: start={search_start.date()}, end={end_search.date()}, target_day={preferred_day or 'any'}")
         
         # Fetch existing appointments
         existing_appointments = []
@@ -891,13 +996,15 @@ async def find_relative_slots(
             current = datetime.combine(target_date, datetime.min.time(), tzinfo=tz)
             current = current.replace(hour=9, minute=0)
         
-        # Search window: limit to target_date if specified, otherwise 3 days
+        # Search window: limit to target_date if specified, otherwise search from anchor point
+        # FIX: Anchor end_search to search_start, not just now
         if target_date:
             end_search = datetime.combine(target_date, datetime.max.time(), tzinfo=tz)
         else:
-            end_search = now + timedelta(days=14)
+            # Ensure future date requests are within search window
+            end_search = max(now + timedelta(days=14), search_start + timedelta(days=14))
 
-        logger.info(f"🔍 [SLOTS] Searching window: {now.date()} to {end_search.date()}")
+        logger.info(f"🔍 [SLOTS] Searching window: search_start={search_start.date()}, end={end_search.date()}, target_date={target_date or 'any'}")
         
         # Fetch existing appointments
         existing_appointments = []
@@ -994,7 +1101,10 @@ async def find_relative_slots(
 @function_tool(description="""
 Confirm the phone number with the patient. Call this ONLY after reading back the FULL phone number.
 NEVER confirm based on just last 4 digits - always speak the complete number including country code.
-Example: "Just to confirm, is your number +1 310 555 1234?"
+Example: "Just to confirm, is your number +92 335 189 7839?"
+
+IMPORTANT: When user says "yes", "yeah", "correct" etc., call confirm_phone(confirmed=True).
+When user says "no", "wrong", "incorrect", call confirm_phone(confirmed=False).
 """)
 async def confirm_phone(confirmed: bool, new_phone: str = None) -> str:
     """
@@ -1010,15 +1120,22 @@ async def confirm_phone(confirmed: bool, new_phone: str = None) -> str:
         return "State not initialized."
     
     if new_phone:
-        # User provided a correction
-        clean_phone = re.sub(r"[^\d+]", "", new_phone)
-        digits_len = len(re.sub(r"\D", "", clean_phone))
-        if digits_len >= 8:
-            state.phone_e164 = clean_phone if clean_phone.startswith("+") else f"+{clean_phone}"
-            state.phone_last4 = re.sub(r"\D", "", clean_phone)[-4:]
+        # User provided a correction - use proper normalization
+        clinic_region = (_GLOBAL_CLINIC_INFO or {}).get("default_phone_region", DEFAULT_PHONE_REGION)
+        clean_phone, last4 = _normalize_phone_preserve_plus(new_phone, clinic_region)
+        
+        if clean_phone:
+            state.phone_e164 = clean_phone
+            state.phone_last4 = last4
+            # Safety guard
+            _ensure_phone_is_string(state)
+            # NEVER auto-confirm - even with correction
             state.phone_confirmed = False
             state.phone_source = "user_spoken"
             state.pending_confirm = "phone"
+            state.pending_confirm_field = "phone"
+            
+            speakable = speakable_phone(state.phone_e164)
             logger.info(f"[TOOL] ⏳ Phone updated to {state.phone_e164}, needs re-confirmation")
             # Trigger memory refresh
             if _REFRESH_AGENT_MEMORY:
@@ -1026,36 +1143,43 @@ async def confirm_phone(confirmed: bool, new_phone: str = None) -> str:
                     _REFRESH_AGENT_MEMORY()
                 except Exception:
                     pass
-            return f"Phone updated to {state.phone_e164}. Please confirm the FULL number with the patient."
+            return f"Phone updated to {speakable}. Please confirm the FULL number: 'Is your number {speakable}?'"
+        else:
+            return f"Could not parse phone number '{new_phone}'. Ask user to repeat clearly."
     
     if confirmed:
         if not state.phone_e164:
             return "No phone number to confirm. Ask for phone number first."
+        # Safety guard before confirming
+        _ensure_phone_is_string(state)
         state.phone_confirmed = True
         state.pending_confirm = None if state.pending_confirm == "phone" else state.pending_confirm
         state.pending_confirm_field = None if state.pending_confirm_field == "phone" else state.pending_confirm_field
-        logger.info(f"[TOOL] ✓ Phone confirmed: {state.phone_e164}")
+        logger.info(f"[TOOL] ✓ Phone CONFIRMED: {state.phone_e164}")
         # Trigger memory refresh
         if _REFRESH_AGENT_MEMORY:
             try:
                 _REFRESH_AGENT_MEMORY()
             except Exception:
                 pass
-        return "Phone confirmed. Continue with next missing info."
+        return "Phone confirmed! Continue gathering remaining info."
     else:
+        # User said "no" - clear and re-ask
+        old_phone = state.phone_e164
         state.phone_e164 = None
         state.phone_last4 = None
         state.phone_confirmed = False
         state.phone_source = None
         state.pending_confirm = None if state.pending_confirm == "phone" else state.pending_confirm
-        logger.info("[TOOL] ✗ Phone rejected, cleared")
+        state.pending_confirm_field = None if state.pending_confirm_field == "phone" else state.pending_confirm_field
+        logger.info(f"[TOOL] ✗ Phone REJECTED (was {old_phone}), cleared")
         # Trigger memory refresh
         if _REFRESH_AGENT_MEMORY:
             try:
                 _REFRESH_AGENT_MEMORY()
             except Exception:
                 pass
-        return "Phone cleared. Ask for the correct FULL phone number."
+        return "Phone cleared. Ask user: 'Could you please give me your phone number again?'"
 
 
 @function_tool(description="""
@@ -1451,12 +1575,21 @@ class PatientState:
             lines.append("• NAME: ? — Still needed. Ask naturally.")
         
         # Phone - always show full number for confirmation prompt
-        if self.phone_e164 and self.phone_confirmed:
-            lines.append(f"• PHONE: ✓ {self.phone_e164} — CONFIRMED. Do NOT ask again.")
-        elif self.phone_e164:
+        # Safety: ensure phone_e164 is string not tuple
+        phone_display = self.phone_e164
+        if isinstance(phone_display, tuple):
+            phone_display = phone_display[0] if phone_display else None
+        
+        if phone_display and self.phone_confirmed:
+            speakable = speakable_phone(phone_display)
+            lines.append(f"• PHONE: ✓ {speakable} — CONFIRMED. Do NOT ask again.")
+        elif phone_display:
+            speakable = speakable_phone(phone_display)
             source_note = f" (from {self.phone_source})" if self.phone_source else ""
-            lines.append(f"• PHONE: ⏳ {self.phone_e164}{source_note} — MUST CONFIRM FULL NUMBER with user!")
-            lines.append(f"  → Ask: 'Just to confirm, is your phone number {self.phone_e164}?'")
+            lines.append(f"• PHONE: ⏳ {speakable}{source_note} — MUST CONFIRM FULL NUMBER with user!")
+            lines.append(f"  → SAY: 'Just to confirm, is your phone number {speakable}?'")
+            lines.append(f"  → If user says YES: call confirm_phone(confirmed=True)")
+            lines.append(f"  → If user says NO: call confirm_phone(confirmed=False)")
         else:
             lines.append("• PHONE: ? — Still needed. Ask naturally.")
         
@@ -1843,6 +1976,113 @@ def get_duration_for_service(service: str, schedule: Dict[str, Any]) -> int:
     return 60  # Default duration
 
 
+async def suggest_slots_around(
+    clinic_id: str,
+    requested_start_dt: datetime,
+    duration_minutes: int,
+    schedule: Dict[str, Any],
+    tz_str: str,
+    count: int = 3,
+    window_hours: int = 4,
+    step_min: int = 15,
+) -> List[datetime]:
+    """
+    Deterministic slot suggestion around a requested time.
+    
+    Used when a requested slot is BOOKED - returns 2-3 closest alternatives
+    AROUND the requested time (not from "now").
+    
+    Algorithm:
+    1. Generate candidate start times within [requested - window, requested + window]
+    2. Prefer same-day candidates first
+    3. Filter candidates: within working hours, no overlap with existing appointments
+    4. Return up to count best candidates sorted by absolute time difference from requested
+    
+    Args:
+        clinic_id: Clinic UUID for appointment lookup
+        requested_start_dt: The exact datetime user requested (that was unavailable)
+        duration_minutes: Appointment duration
+        schedule: Working hours config  
+        tz_str: Timezone string
+        count: Max alternatives to return (default 3)
+        window_hours: How many hours before/after to search (default 4)
+        step_min: Slot step in minutes (default 15)
+    
+    Returns:
+        List of available datetime slots, sorted by proximity to requested_start_dt
+    """
+    tz = ZoneInfo(tz_str)
+    requested_date = requested_start_dt.date()
+    
+    logger.info(f"[SUGGEST_SLOTS] Searching around {requested_start_dt.strftime('%Y-%m-%d %H:%M')} (±{window_hours}h)")
+    
+    # Fetch existing appointments for the target date (and adjacent days for edge cases)
+    day_start = requested_start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=2)  # Include next day for afternoon requests
+    
+    existing_appointments = []
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table("appointments")
+            .select("start_time, end_time")
+            .eq("clinic_id", clinic_id)
+            .gte("start_time", day_start.isoformat())
+            .lt("start_time", day_end.isoformat())
+            .in_("status", BOOKED_STATUSES)
+            .execute()
+        )
+        for appt in (result.data or []):
+            try:
+                appt_start = datetime.fromisoformat(appt["start_time"].replace("Z", "+00:00"))
+                appt_end = datetime.fromisoformat(appt["end_time"].replace("Z", "+00:00"))
+                existing_appointments.append((appt_start, appt_end))
+            except Exception:
+                pass
+        logger.debug(f"[SUGGEST_SLOTS] Found {len(existing_appointments)} existing appointments")
+    except Exception as e:
+        logger.warning(f"[SUGGEST_SLOTS] Failed to fetch appointments: {e}")
+    
+    def is_slot_free(check_dt: datetime) -> bool:
+        """Check if a slot is free (working hours + no conflicts)."""
+        is_valid, _ = is_within_working_hours(check_dt, schedule, duration_minutes)
+        if not is_valid:
+            return False
+        
+        slot_end = check_dt + timedelta(minutes=duration_minutes + APPOINTMENT_BUFFER_MINUTES)
+        for appt_start, appt_end in existing_appointments:
+            buffered_end = appt_end + timedelta(minutes=APPOINTMENT_BUFFER_MINUTES)
+            if check_dt < buffered_end and slot_end > appt_start:
+                return False
+        return True
+    
+    # Generate candidates: start from (requested - window_hours) to (requested + window_hours)
+    candidates = []
+    window_delta = timedelta(hours=window_hours)
+    search_start = requested_start_dt - window_delta
+    search_end = requested_start_dt + window_delta
+    
+    current = search_start.replace(second=0, microsecond=0)
+    # Round to step boundary
+    current = current.replace(minute=(current.minute // step_min) * step_min)
+    
+    while current <= search_end and len(candidates) < count * 3:  # Gather more than needed, filter later
+        # Skip the exact requested time (we know it's taken)
+        time_diff_minutes = abs((current - requested_start_dt).total_seconds() / 60)
+        if time_diff_minutes >= step_min:  # Not the exact requested slot
+            if is_slot_free(current):
+                candidates.append((current, time_diff_minutes, current.date() == requested_date))
+        current += timedelta(minutes=step_min)
+    
+    # Sort by: same-day first, then by proximity to requested time
+    candidates.sort(key=lambda x: (not x[2], x[1]))  # (not same_day, time_diff)
+    
+    # Take top 'count' results
+    result_slots = [c[0] for c in candidates[:count]]
+    
+    logger.info(f"[SUGGEST_SLOTS] Found {len(result_slots)} alternatives: {[s.strftime('%H:%M') for s in result_slots]}")
+    return result_slots
+
+
 async def get_alternatives_around_datetime(
     clinic_id: str,
     target_dt: datetime,
@@ -1855,9 +2095,12 @@ async def get_alternatives_around_datetime(
     """
     Bidirectional slot search: Find available slots BEFORE and AFTER the requested time.
     
-    This implements the "Nearby Slots" logic requested by ChatGPT:
+    This implements the "Nearby Slots" logic:
     - If user asks for 10 AM and it's taken, search 30-60 mins before AND after
     - Returns up to num_slots alternatives (e.g., 9:00 AM and 11:30 AM)
+    
+    NOTE: For more comprehensive searches, use suggest_slots_around() instead.
+    This function is optimized for quick ±60min searches.
     
     Algorithm:
     1. Search backwards from target_dt (within window_minutes)
@@ -2603,14 +2846,18 @@ async def snappy_entrypoint(ctx: JobContext):
         # Pre-fill caller's phone from SIP - but NEVER auto-confirm!
         # Agent MUST confirm full phone number with user before booking
         if caller_phone:
-            clean_phone, last4 = _normalize_phone_preserve_plus(caller_phone, DEFAULT_PHONE_REGION)
+            clean_phone, last4 = _normalize_phone_preserve_plus(caller_phone, clinic_region)
             if clean_phone:
                 state.phone_e164 = clean_phone
                 state.phone_last4 = last4
+                # Safety guard: ensure no tuple was stored
+                _ensure_phone_is_string(state)
                 state.phone_confirmed = False  # NEVER auto-confirm - always ask user
                 state.phone_source = "sip"  # Track source for confirmation logic
                 state.pending_confirm = "phone"  # Flag that phone needs confirmation
-                logger.info(f"📞 [SIP] ⏳ Caller phone pre-filled (needs confirmation): {clean_phone}")
+                state.pending_confirm_field = "phone"  # For deterministic yes/no routing
+                speakable = speakable_phone(clean_phone)
+                logger.info(f"📞 [SIP] ⏳ Caller phone pre-filled (needs confirmation): {speakable}")
     
     # PRIORITY 2: Room name regex — flexible US phone number extraction
     # Matches +1XXXXXXXXXX anywhere in room name (e.g., call_+13103410536_abc123)
@@ -2867,6 +3114,92 @@ async def snappy_entrypoint(ctx: JobContext):
             logger.debug(f"[CONVO] [{ts}] AGENT: {text}")
     
     # ═══════════════════════════════════════════════════════════════════════════
+    # 🎯 DETERMINISTIC YES/NO ROUTING — Handle confirmations without LLM
+    # ═══════════════════════════════════════════════════════════════════════════
+    # This intercepts clear yes/no responses during pending confirmations
+    # and routes them directly to confirm_phone/confirm_email tools
+    # instead of relying on LLM which can misfire (e.g., confirm_email on "yes")
+    
+    @session.on("user_input_transcribed")
+    def _on_user_input(ev):
+        """
+        Deterministic routing for yes/no confirmations.
+        
+        When pending_confirm_field is set (e.g., "phone"), intercept
+        clear yes/no responses and call the appropriate confirm tool directly.
+        This avoids LLM misfires like calling confirm_email(False) on "Yes".
+        """
+        # Only act on final transcriptions
+        if not getattr(ev, 'is_final', True):
+            return
+        
+        transcript = getattr(ev, 'transcript', '') or getattr(ev, 'text', '') or ''
+        transcript = transcript.strip().lower()
+        
+        if not transcript:
+            return
+        
+        # Log user speech
+        ts = datetime.now().strftime("%H:%M:%S")
+        logger.info(f"👤 [USER INPUT] [{ts}] << {transcript}")
+        
+        # Check if we have a pending confirmation
+        pending = state.pending_confirm_field or state.pending_confirm
+        if not pending:
+            return  # No pending confirmation, let LLM handle
+        
+        # Check for clear yes/no patterns
+        is_yes = YES_PAT.search(transcript) is not None
+        is_no = NO_PAT.search(transcript) is not None
+        
+        # Only route if it's clearly yes OR clearly no (not both, not neither)
+        if is_yes == is_no:
+            logger.debug(f"[CONFIRM] Ambiguous response '{transcript}' - letting LLM handle")
+            return  # Ambiguous or neither - let LLM handle
+        
+        logger.info(f"[CONFIRM] Deterministic routing: pending='{pending}', is_yes={is_yes}")
+        
+        # Route to appropriate confirm tool
+        if pending == "phone":
+            # Handle phone confirmation deterministically
+            async def _handle_phone_confirm():
+                try:
+                    if is_yes:
+                        result = await confirm_phone(confirmed=True)
+                        logger.info(f"[CONFIRM] Phone confirmed via deterministic routing")
+                        # Let agent continue naturally
+                        await session.generate_reply()
+                    else:
+                        result = await confirm_phone(confirmed=False)
+                        logger.info(f"[CONFIRM] Phone rejected via deterministic routing")
+                        # Ask for phone again
+                        await session.say("No problem! Could you please give me your phone number again?")
+                except Exception as e:
+                    logger.error(f"[CONFIRM] Phone confirm error: {e}")
+            
+            # Fire and forget - don't block
+            asyncio.create_task(_handle_phone_confirm())
+            # Note: We don't prevent LLM from also responding - they may overlap
+            # This is a tradeoff for simpler implementation
+        
+        elif pending == "email":
+            # Handle email confirmation deterministically  
+            async def _handle_email_confirm():
+                try:
+                    if is_yes:
+                        result = await confirm_email(confirmed=True)
+                        logger.info(f"[CONFIRM] Email confirmed via deterministic routing")
+                        await session.generate_reply()
+                    else:
+                        result = await confirm_email(confirmed=False)
+                        logger.info(f"[CONFIRM] Email rejected via deterministic routing")
+                        await session.say("No problem! What's your email address?")
+                except Exception as e:
+                    logger.error(f"[CONFIRM] Email confirm error: {e}")
+            
+            asyncio.create_task(_handle_email_confirm())
+    
+    # ═══════════════════════════════════════════════════════════════════════════
     # 📞 SIP PARTICIPANT EVENT — Handle late-joining SIP participants
     # ═══════════════════════════════════════════════════════════════════════════
     
@@ -2886,14 +3219,18 @@ async def snappy_entrypoint(ctx: JobContext):
             
             # Pre-fill phone if not already captured
             if caller_phone and not state.phone_e164:
-                clean_phone, last4 = _normalize_phone_preserve_plus(caller_phone, DEFAULT_PHONE_REGION)
+                clean_phone, last4 = _normalize_phone_preserve_plus(caller_phone, clinic_region)
                 if clean_phone:
                     state.phone_e164 = clean_phone
                     state.phone_last4 = last4
+                    # Safety guard
+                    _ensure_phone_is_string(state)
                     state.phone_confirmed = False  # NEVER auto-confirm - always ask user
                     state.phone_source = "sip"
                     state.pending_confirm = "phone"
-                    logger.info(f"📞 [SIP EVENT] ⏳ Phone pre-filled (needs confirmation): {clean_phone}")
+                    state.pending_confirm_field = "phone"
+                    speakable = speakable_phone(clean_phone)
+                    logger.info(f"📞 [SIP EVENT] ⏳ Phone pre-filled (needs confirmation): {speakable}")
                     # Refresh agent memory so it knows phone needs confirmation
                     refresh_agent_memory()
 
@@ -3042,15 +3379,79 @@ def prewarm(proc: agents.JobProcess):
 
 
 # =============================================================================
+# DEBUG TESTS — Phone normalization and slot suggestion verification
+# =============================================================================
+
+def _run_debug_tests():
+    """
+    Run inline tests for phone normalization and slot suggestion logic.
+    Call this via: python agent_v2.py --test
+    """
+    print("\n" + "="*60)
+    print(" PHONE NORMALIZATION TESTS")
+    print("="*60)
+    
+    test_cases = [
+        # (input, region, expected_e164_prefix, description)
+        ("+923351897839", "PK", "+923351897839", "Already E.164 Pakistani"),
+        ("0335-1897839", "PK", "+92335", "Pakistani local format 0335..."),
+        ("03351897839", "PK", "+92335", "Pakistani local without dashes"),
+        ("+13105551234", "US", "+13105551234", "Already E.164 US"),
+        ("310-555-1234", "US", "+1310", "US local format"),
+        ("+442071234567", "GB", "+44207", "UK E.164"),
+    ]
+    
+    for raw, region, expected_prefix, desc in test_cases:
+        result = _normalize_phone_preserve_plus(raw, region)
+        e164, last4 = result
+        
+        # Verify result is tuple with string or None
+        assert isinstance(result, tuple), f"FAIL: {desc} - result not tuple"
+        assert e164 is None or isinstance(e164, str), f"FAIL: {desc} - e164 not string: {type(e164)}"
+        assert isinstance(last4, str), f"FAIL: {desc} - last4 not string: {type(last4)}"
+        
+        if e164 and not e164.startswith(expected_prefix):
+            print(f"WARN: {desc}")
+            print(f"       Input: {raw} (region={region})")
+            print(f"       Got: {e164}, expected prefix: {expected_prefix}")
+        else:
+            print(f"✓ {desc}: {raw} -> {e164} (last4={last4})")
+    
+    print("\n" + "="*60)
+    print(" SPEAKABLE PHONE TESTS")
+    print("="*60)
+    
+    speakable_tests = [
+        ("+923351897839", "+92 335 189 7839"),
+        ("+13105551234", "+1 310 555 1234"),
+        ("+442071234567", "+44 2071 2345 67"),
+        (None, "unknown"),
+    ]
+    
+    for e164, expected in speakable_tests:
+        result = speakable_phone(e164)
+        status = "✓" if result == expected else "✗"
+        print(f"{status} speakable_phone({e164!r}) = {result!r} (expected: {expected!r})")
+    
+    print("\n" + "="*60)
+    print(" ALL TESTS COMPLETE")
+    print("="*60 + "\n")
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
 if __name__ == "__main__":
-    agents.cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=snappy_entrypoint,
-            prewarm_fnc=prewarm,
-            agent_name=LIVEKIT_AGENT_NAME,  # Must match SIP trunk dispatch rules
-            load_threshold=1.0,  # Prioritize this agent for incoming telephony calls
+    import sys
+    if "--test" in sys.argv:
+        _run_debug_tests()
+    else:
+        agents.cli.run_app(
+            WorkerOptions(
+                entrypoint_fnc=snappy_entrypoint,
+                prewarm_fnc=prewarm,
+                agent_name=LIVEKIT_AGENT_NAME,  # Must match SIP trunk dispatch rules
+                load_threshold=1.0,  # Prioritize this agent for incoming telephony calls
+            )
         )
-    )
