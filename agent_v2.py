@@ -304,8 +304,8 @@ Speak like a helpful receptionist. Use brief bridge phrases like "Let me check..
 ═══════════════════════════════════════════════════════════════════════════════
 📞 PHONE CONFIRMATION (MANDATORY - READ CAREFULLY!)
 ═══════════════════════════════════════════════════════════════════════════════
-• ALWAYS confirm the FULL phone number verbally: "Is your phone number +92 335 1897839?"
-• NEVER confirm with just last 4 digits.
+• ALWAYS speak the FULL phone number for confirmation: "Is your number +92 335 189 7839?"
+• NEVER confirm with just last 4 digits — always say the complete number with country code.
 • ⚡ CRITICAL: If state shows "PHONE: ⏳ [Number]" and user says "yes", "yeah", "correct", 
   you MUST call confirm_phone(confirmed=True) IMMEDIATELY!
 • Only mark confirmed AFTER user explicitly confirms with affirmative response.
@@ -317,10 +317,10 @@ Speak like a helpful receptionist. Use brief bridge phrases like "Let me check..
 ═══════════════════════════════════════════════════════════════════════════════
 🔄 SMART REVIEW (SINGLE-CHANGE OPTIMIZATION)
 ═══════════════════════════════════════════════════════════════════════════════
-• If user changes ONE detail after review, confirm ONLY that changed detail.
+• If user changes ONE detail after review, ONLY confirm that changed detail.
 • Do NOT re-read the entire summary for a single change — that's annoying!
 • Example: User says "Actually, make it 3pm" → Say "Got it, changed to 3pm. Ready to book?"
-• Proceed to booking immediately once they confirm the single change.
+• Once they confirm the single change, proceed to booking immediately.
 
 ═══════════════════════════════════════════════════════════════════════════════
 ✅ CONFIRMATION SEMANTICS
@@ -430,8 +430,8 @@ async def update_patient_record(
         clean_phone, last4 = _normalize_phone_preserve_plus(phone, clinic_region)
         
         if clean_phone:
-            state.phone_e164 = clean_phone  # Always a string from tuple unpacking
-            state.phone_last4 = last4
+            state.phone_e164 = str(clean_phone)  # Enforce string type
+            state.phone_last4 = str(last4) if last4 else ""
             # Safety guard: ensure no tuple was stored
             _ensure_phone_is_string(state)
             # NEVER auto-confirm phone - always require explicit user confirmation
@@ -1125,8 +1125,8 @@ async def confirm_phone(confirmed: bool, new_phone: str = None) -> str:
         clean_phone, last4 = _normalize_phone_preserve_plus(new_phone, clinic_region)
         
         if clean_phone:
-            state.phone_e164 = clean_phone
-            state.phone_last4 = last4
+            state.phone_e164 = str(clean_phone)  # Enforce string type
+            state.phone_last4 = str(last4) if last4 else ""
             # Safety guard
             _ensure_phone_is_string(state)
             # NEVER auto-confirm - even with correction
@@ -2861,15 +2861,15 @@ async def snappy_entrypoint(ctx: JobContext):
         if caller_phone:
             clean_phone, last4 = _normalize_phone_preserve_plus(caller_phone, clinic_region)
             if clean_phone:
-                state.phone_e164 = clean_phone
-                state.phone_last4 = last4
+                state.phone_e164 = str(clean_phone)  # Enforce string type
+                state.phone_last4 = str(last4) if last4 else ""
                 # Safety guard: ensure no tuple was stored
                 _ensure_phone_is_string(state)
                 state.phone_confirmed = False  # NEVER auto-confirm - always ask user
                 state.phone_source = "sip"  # Track source for confirmation logic
                 state.pending_confirm = "phone"  # Flag that phone needs confirmation
                 state.pending_confirm_field = "phone"  # For deterministic yes/no routing
-                speakable = speakable_phone(clean_phone)
+                speakable = speakable_phone(state.phone_e164)
                 logger.info(f"📞 [SIP] ⏳ Caller phone pre-filled (needs confirmation): {speakable}")
     
     # PRIORITY 2: Room name regex — flexible US phone number extraction
@@ -2911,16 +2911,21 @@ async def snappy_entrypoint(ctx: JobContext):
         context_task = asyncio.create_task(fetch_clinic_context_optimized(called_num))
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 🏥 IDENTITY-FIRST: Wait up to 2s for DB context (better silence than wrong name)
+    # 🏥 IDENTITY-FIRST: Wait up to 5s for DB context (better silence than wrong name)
     # ═══════════════════════════════════════════════════════════════════════════
     if context_task:
         try:
             clinic_info, agent_info, settings, agent_name = await asyncio.wait_for(
-                asyncio.shield(context_task), timeout=2.0
+                asyncio.shield(context_task), timeout=5.0
             )
-            logger.info(f"[DB] ✓ Context loaded in <2s: clinic={clinic_info.get('name') if clinic_info else 'None'}")
+            logger.info(f"[DB] ✓ Context loaded in <5s: clinic={clinic_info.get('name') if clinic_info else 'None'}")
         except asyncio.TimeoutError:
-            logger.warning("[DB] ⚠️ Context fetch exceeded 2s timeout — using defaults")
+            logger.warning("[DB] ⚠️ Context fetch exceeded 5s timeout — using defaults")
+
+    # Safety net: Force-load demo clinic if context still None
+    if clinic_info is None:
+        logger.warning("[DB] ⚠️ clinic_info is None — force-loading demo fallback")
+        clinic_info = {"id": DEMO_CLINIC_ID, "name": "Moiz Dental Clinic Islamabad"}
 
     # Apply whatever context we have at this point
     _GLOBAL_CLINIC_INFO = clinic_info
@@ -3075,6 +3080,75 @@ async def snappy_entrypoint(ctx: JobContext):
         lk_metrics.log_metrics(ev.metrics)
         usage.collect(ev.metrics)
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ⚡ INSTANT FILLER & INTERRUPTION — Sub-second perceived latency
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Track active filler speech handle for interruption when real response arrives
+    active_filler_handle = {"handle": None}
+    
+    @session.on("user_input_transcribed")
+    async def _on_user_transcribed_filler(ev):
+        """
+        Instant filler phrase on user speech to reduce perceived latency.
+        Filler is interrupted when the real LLM response arrives.
+        """
+        # Only act on final transcriptions
+        if not getattr(ev, 'is_final', True):
+            return
+        
+        transcript = getattr(ev, 'transcript', '') or getattr(ev, 'text', '') or ''
+        if not transcript.strip():
+            return
+        
+        # Don't send filler for simple yes/no (handled deterministically)
+        transcript_lower = transcript.strip().lower()
+        if len(transcript_lower.split()) <= 2:
+            if YES_PAT.search(transcript_lower) or NO_PAT.search(transcript_lower):
+                return  # Skip filler for confirmations
+        
+        # Fire off a quick filler phrase while LLM thinks
+        # Use varied fillers for natural conversation
+        import random
+        fillers = [
+            "... hmm, let me check...",
+            "... one moment...",
+            "... okay...",
+            "... sure...",
+        ]
+        filler = random.choice(fillers)
+        
+        try:
+            # Store handle so we can interrupt it later
+            handle = await session.say(filler, allow_interruptions=True)
+            active_filler_handle["handle"] = handle
+            logger.debug(f"[FILLER] Sent filler: {filler}")
+        except Exception as e:
+            logger.debug(f"[FILLER] Could not send filler: {e}")
+    
+    @session.on("agent_speech_started")
+    def _on_speech_started(ev):
+        """
+        Interrupt active filler when real response starts.
+        This ensures filler doesn't overlap with actual content.
+        """
+        # Check if this is a real response (not the filler itself)
+        speech_text = ""
+        try:
+            speech_text = getattr(ev, 'text', '') or getattr(ev, 'content', '') or ''
+        except:
+            pass
+        
+        # If we have an active filler and this is NOT a filler phrase, interrupt it
+        handle = active_filler_handle.get("handle")
+        if handle and speech_text and "..." not in speech_text[:20]:
+            try:
+                handle.interrupt()
+                logger.debug("[FILLER] Interrupted filler for real response")
+            except Exception as e:
+                logger.debug(f"[FILLER] Could not interrupt filler: {e}")
+            finally:
+                active_filler_handle["handle"] = None
+
     # Create agent with tools (v1.2.14 API - tools passed to Agent, not AgentSession)
     class SnappyAgent(Agent):
         def __init__(self, instructions: str):
@@ -3224,15 +3298,15 @@ async def snappy_entrypoint(ctx: JobContext):
             if caller_phone and not state.phone_e164:
                 clean_phone, last4 = _normalize_phone_preserve_plus(caller_phone, clinic_region)
                 if clean_phone:
-                    state.phone_e164 = clean_phone
-                    state.phone_last4 = last4
+                    state.phone_e164 = str(clean_phone)  # Enforce string type
+                    state.phone_last4 = str(last4) if last4 else ""
                     # Safety guard
                     _ensure_phone_is_string(state)
                     state.phone_confirmed = False  # NEVER auto-confirm - always ask user
                     state.phone_source = "sip"
                     state.pending_confirm = "phone"
                     state.pending_confirm_field = "phone"
-                    speakable = speakable_phone(clean_phone)
+                    speakable = speakable_phone(state.phone_e164)
                     logger.info(f"📞 [SIP EVENT] ⏳ Phone pre-filled (needs confirmation): {speakable}")
                     # Refresh agent memory so it knows phone needs confirmation
                     refresh_agent_memory()
