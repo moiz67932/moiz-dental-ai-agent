@@ -2814,6 +2814,19 @@ async def snappy_entrypoint(ctx: JobContext):
     
     state = PatientState()
     _GLOBAL_STATE = state  # Set global reference for tools
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 🔧 DEFAULTS INITIALIZATION — Must be set BEFORE SIP block uses clinic_region
+    # ═══════════════════════════════════════════════════════════════════════════
+    clinic_info = None
+    agent_info = None
+    settings = None
+    agent_name = "Office Assistant"
+    clinic_name = "our clinic"
+    clinic_tz = DEFAULT_TZ
+    clinic_region = DEFAULT_PHONE_REGION
+    agent_lang = "en-US"
+    
     call_started = time.time()
     
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
@@ -2896,16 +2909,6 @@ async def snappy_entrypoint(ctx: JobContext):
     context_task: Optional[asyncio.Task] = None
     if called_num:
         context_task = asyncio.create_task(fetch_clinic_context_optimized(called_num))
-
-    # Defaults (used if DB context isn't ready yet)
-    clinic_info = None
-    agent_info = None
-    settings = None
-    agent_name = "Office Assistant"
-    clinic_name = "our clinic"
-    clinic_tz = DEFAULT_TZ
-    clinic_region = DEFAULT_PHONE_REGION
-    agent_lang = "en-US"
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 🏥 IDENTITY-FIRST: Wait up to 2s for DB context (better silence than wrong name)
