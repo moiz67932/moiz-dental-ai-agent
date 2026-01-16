@@ -72,6 +72,8 @@ from livekit.agents import (
     metrics as lk_metrics,
     MetricsCollectedEvent,
     llm,  # For ChatContext
+    UserInputTranscribedEvent,  # For instant filler hook
+    SpeechCreatedEvent,  # For filler interruption
 )
 from livekit.agents.llm import function_tool  # v1.2.14 decorator for tools
 from livekit.rtc import ParticipantKind  # For SIP participant detection
@@ -505,12 +507,13 @@ async def update_patient_record(
         logger.info(f"[TOOL] ⏰ Checking time: {time_suggestion}...")
         
         try:
-            from dateutil import parser as dtparser
-            parsed = dtparser.parse(time_suggestion, fuzzy=True)
+            # Use parse_datetime_natural for robust relative date handling
+            # Handles "tomorrow at 3:30 PM", "next Monday", etc. correctly
+            parsed = parse_datetime_natural(time_suggestion, tz_hint=_GLOBAL_CLINIC_TZ)
             
             if parsed:
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=ZoneInfo(_GLOBAL_CLINIC_TZ))
+                # parse_datetime_natural already applies timezone
+                logger.info(f"[TOOL] ⏰ Parsed '{time_suggestion}' → {parsed.isoformat()}")
                 
                 # Format for speech
                 time_spoken = parsed.strftime("%I:%M %p").lstrip("0")
@@ -717,19 +720,12 @@ async def get_available_slots_v2(
     search_start = now
     if after_datetime:
         try:
-            from dateutil import parser as dtparser
-            from dateutil.relativedelta import relativedelta
-            
-            # Handle natural language
-            parsed = dtparser.parse(after_datetime, fuzzy=True)
+            # Use parse_datetime_natural for robust relative date handling
+            # Handles "tomorrow at 2pm", "next Monday morning", etc. correctly
+            parsed = parse_datetime_natural(after_datetime, tz_hint=_GLOBAL_CLINIC_TZ)
             if parsed:
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=tz)
-                # If parsed time is in the past today, assume they mean tomorrow
-                if parsed < now:
-                    parsed = parsed + timedelta(days=1)
                 search_start = parsed
-                logger.info(f"[TOOL] get_available_slots_v2: searching after {search_start.isoformat()}")
+                logger.info(f"[TOOL] get_available_slots_v2: parsed '{after_datetime}' → searching after {search_start.isoformat()}")
         except Exception as e:
             logger.warning(f"[TOOL] Could not parse after_datetime '{after_datetime}': {e}")
     
@@ -943,17 +939,13 @@ async def find_relative_slots(
     
     if start_search_time:
         try:
-            from dateutil import parser as dtparser
-            parsed = dtparser.parse(start_search_time, fuzzy=True)
+            # Use parse_datetime_natural for robust relative date handling
+            # Handles "tomorrow at 2pm", "after 3pm", etc. correctly
+            parsed = parse_datetime_natural(start_search_time, tz_hint=_GLOBAL_CLINIC_TZ)
             if parsed:
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=tz)
-                # If parsed time is in the past today, assume they mean tomorrow
-                if parsed < now:
-                    parsed = parsed + timedelta(days=1)
                 search_start = parsed
                 target_date = parsed.date()
-                logger.info(f"[TOOL] find_relative_slots: searching after {search_start.isoformat()}")
+                logger.info(f"[TOOL] find_relative_slots: parsed '{start_search_time}' → searching after {search_start.isoformat()}")
         except Exception as e:
             logger.warning(f"[TOOL] Could not parse start_search_time '{start_search_time}': {e}")
     
@@ -2749,12 +2741,18 @@ async def snappy_entrypoint(ctx: JobContext):
         llm=llm_instance,
         tts=tts_instance,
         vad=vad_instance,
-        min_endpointing_delay=1.5,  # ⚡ 1.5s for natural, patient turn-taking
-        max_endpointing_delay=2.0,
+        min_endpointing_delay=0.5,  # ⚡ 0.5s for snappy turn-taking (was 1.5s)
+        max_endpointing_delay=1.5,  # Reduced from 2.0 for faster response
         allow_interruptions=True,
         min_interruption_duration=0.5,
         min_interruption_words=1,
     )
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ⚡ FILLER INFRASTRUCTURE — Thread-safe scheduling for instant fillers
+    # ═══════════════════════════════════════════════════════════════════════════
+    main_loop = asyncio.get_running_loop()  # Capture for thread-safe scheduling
+    active_filler_handle = {"handle": None, "text": None}  # Track active filler for interruption
     
     # Metrics
     usage = lk_metrics.UsageCollector()
@@ -2891,37 +2889,65 @@ async def snappy_entrypoint(ctx: JobContext):
                 return name.title()
         return None
     
-    @session.on("user_speech_committed")
-    def _on_user_speech_committed(msg):
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ⚡ THREAD-SAFE FILLER SCHEDULING — schedule_say helper
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def schedule_say(text: str, allow_interruptions: bool = True):
         """
-        Fired after user finishes speaking and before LLM generates response.
+        Thread-safe filler scheduling onto the main asyncio loop.
         
-        ⚡ ZERO-LATENCY INSTANT HOOK: Fire audio filler within 100ms of speech end.
+        Handles both sync and async session.say() implementations.
+        Stores handle for potential interruption by real reply.
+        """
+        async def _do_say():
+            try:
+                # Store filler info for interruption tracking
+                active_filler_handle["text"] = text
+                
+                result = session.say(text, allow_interruptions=allow_interruptions)
+                # Handle both coroutine and sync return
+                if asyncio.iscoroutine(result):
+                    handle = await result
+                else:
+                    handle = result
+                
+                active_filler_handle["handle"] = handle
+                logger.debug(f"⚡ [FILLER_PLAYING] >> {text}")
+            except Exception as e:
+                logger.warning(f"[FILLER_ERROR] Failed to say filler: {e}")
+                active_filler_handle["handle"] = None
+                active_filler_handle["text"] = None
+        
+        # Schedule onto main loop from any thread context
+        main_loop.call_soon_threadsafe(lambda: asyncio.create_task(_do_say()))
+    
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(event: UserInputTranscribedEvent):
+        """
+        Fired when STT produces a transcript (final or interim).
+        
+        ⚡ INSTANT FILLER HOOK: Fire audio filler within 100ms of final transcript.
         The user hears "One moment..." while LLM is processing = ZERO PERCEIVED SILENCE.
         
-        ARCHITECTURAL FIX: Use asyncio.ensure_future() for IMMEDIATE, UNBLOCKED execution.
-        This ensures the filler fires BEFORE any other processing begins.
-        
-        RULES:
-        1. ANY keyword match = immediate filler (no complex conditions)
-        2. Service/name detection = acoustic mirroring (repeat back slowly)
-        3. Multiple intents = pick the most specific one
-        4. Location/parking = RAG filler
+        This replaces user_speech_committed which is not a valid AgentSession event.
         """
-        text = _speech_text_from_msg(msg)
-        text_lower = text.lower() if text else ""
+        # Only process final transcripts
+        if not event.is_final:
+            return
         
-        if text:
-            ts = datetime.now().strftime("%H:%M:%S")
-            # HIGH-VISIBILITY user speech logging
-            logger.info(f"👤 [USER SPEECH] [{ts}] >> {text}")
+        text = event.transcript.strip() if event.transcript else ""
+        text_lower = text.lower()
+        
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]  # Include milliseconds
+        logger.info(f"👤 [USER_INPUT_TRANSCRIBED] [{ts}] is_final={event.is_final} >> {text}")
         
         if not text_lower:
             return
         
         # ═══════════════════════════════════════════════════════════════════════
-        # ⚡ ZERO-LATENCY HOOK: Fire filler IMMEDIATELY on ANY keyword match
-        # Using ensure_future for unblocked, high-priority execution
+        # ⚡ INSTANT FILLER: Fire IMMEDIATELY on keyword match
+        # Using thread-safe schedule_say for proper loop handling
         # ═══════════════════════════════════════════════════════════════════════
         filler = None
         filler_type = None
@@ -2962,15 +2988,58 @@ async def snappy_entrypoint(ctx: JobContext):
             filler = random.choice(BOOKING_FILLERS)
             filler_type = "BOOKING"
         
-        # ⚡ FIRE THE FILLER IMMEDIATELY — Use ensure_future for zero blocking
+        # ⚡ FIRE THE FILLER — Thread-safe scheduling
         if filler:
-            # ensure_future schedules the coroutine with HIGHEST priority
-            asyncio.ensure_future(session.say(filler))
-            logger.info(f"⚡ [INSTANT_HOOK] [{filler_type}] >> {filler}")
+            ts_filler = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            logger.info(f"⚡ [INSTANT_HOOK] [{ts_filler}] [{filler_type}] >> {filler}")
+            schedule_say(filler, allow_interruptions=True)
         
-        # Refresh memory and log state (after filler is already queued)
+        # Refresh memory and log state
         refresh_agent_memory()
         logger.debug(f"[STATE] Current: {state.slot_summary()}")
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 🧹 FILLER INTERRUPTION — Cancel filler when real reply arrives
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    @session.on("speech_created")
+    def on_speech_created(event: SpeechCreatedEvent):
+        """
+        Fired when new speech is created (filler or real reply).
+        
+        If the new speech is NOT a filler (source is generate_reply or tool),
+        interrupt any active filler immediately so it doesn't queue ahead.
+        """
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        source = getattr(event, 'source', 'unknown')
+        user_initiated = getattr(event, 'user_initiated', False)
+        
+        logger.debug(f"🎙️ [SPEECH_CREATED] [{ts}] source={source} user_initiated={user_initiated}")
+        
+        # Check if this is a real reply (not our filler)
+        filler_handle = active_filler_handle.get("handle")
+        filler_text = active_filler_handle.get("text")
+        
+        if filler_handle and filler_text:
+            # This is a new speech event while filler was playing
+            # Check if it's a real reply by comparing source or checking if it's LLM-generated
+            is_real_reply = source in ("generate_reply", "tool_response", "llm") or user_initiated
+            
+            if is_real_reply:
+                try:
+                    # Interrupt the filler
+                    if hasattr(filler_handle, 'interrupt'):
+                        filler_handle.interrupt()
+                        logger.info(f"🧹 [FILLER_INTERRUPTED] Real reply arrived, interrupted filler: {filler_text[:30]}...")
+                    elif hasattr(filler_handle, 'cancel'):
+                        filler_handle.cancel()
+                        logger.info(f"🧹 [FILLER_CANCELLED] Real reply arrived, cancelled filler: {filler_text[:30]}...")
+                except Exception as e:
+                    logger.warning(f"[FILLER_INTERRUPT_ERROR] {e}")
+                finally:
+                    # Clear the filler tracking
+                    active_filler_handle["handle"] = None
+                    active_filler_handle["text"] = None
 
     @session.on("agent_speech_committed")
     def _on_agent_speech_committed(msg):
