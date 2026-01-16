@@ -3,11 +3,10 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Stage 1: Builder (Stable Bookworm)
+# Stage 1: Builder
 # -----------------------------------------------------------------------------
 FROM python:3.10-slim-bookworm AS builder
 
-# Install only the absolute necessities for building wheels
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gcc \
@@ -18,18 +17,19 @@ WORKDIR /app
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install Python dependencies
 COPY requirements.txt .
+
+# FIX: Force binary-only install for livekit to ensure the .so is included
 RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir --only-binary=:all: livekit==1.0.23 && \
     pip install --no-cache-dir -r requirements.txt
 
 # -----------------------------------------------------------------------------
-# Stage 2: Production Runtime (Stable Bookworm)
+# Stage 2: Production Runtime
 # -----------------------------------------------------------------------------
 FROM python:3.10-slim-bookworm AS runtime
 
-# libgomp1 is REQUIRED for LiveKit RTC FFI to load
-# ffmpeg is needed for audio processing, ca-certificates for API security
+# FIX: libgomp1 is REQUIRED for the LiveKit binary (.so) to load
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
@@ -37,11 +37,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Create a non-root user for security
 RUN useradd -m agent
 WORKDIR /app
 
-# Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
@@ -51,7 +49,6 @@ COPY contact_utils.py .
 COPY calendar_client.py .
 COPY supabase_calendar_store.py .
 
-# Environment config
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV ENVIRONMENT=production
@@ -59,5 +56,4 @@ ENV ENVIRONMENT=production
 USER agent
 EXPOSE 8080
 
-# Start the agent
 CMD ["python", "agent_v2.py", "dev"]
