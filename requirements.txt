@@ -13,6 +13,7 @@ livekit-plugins-deepgram>=0.7.0
 livekit-plugins-assemblyai>=0.3.0
 livekit-plugins-cartesia>=0.4.0
 livekit-plugins-noise-cancellation>=0.2.5
+livekit-rtc>=1.0.23
 
 # =============================================================================
 # OpenAI (GPT-4o-mini & Embeddings)
