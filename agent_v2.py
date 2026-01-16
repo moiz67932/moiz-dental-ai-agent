@@ -253,16 +253,26 @@ Agent: "Tomorrow, sure thing... let me pull up the schedule... Looks like we hav
 ═══════════════════════════════════════════════════════════════════════════════
 Punctuation = Audio Instruction:
 • ... = Natural pause where a human would look at a screen or take a breath.
-• -- = Mid-thought correction (e.g., "Wait, let me see-- ah, here it is").
+• -- = Mid-thought correction (e.g., "Wait, let me see-- oh, I see a 10:00 AM slot here.").
 • ! = Warmth and energy.
 
-⚡ STUTTER-STEPPING (MANDATORY):
-When you receive tool data, do NOT deliver it in a block! Start with a breathy filler.
-• "... ah, okay, I found it..."
-• "... let's see here-- yes, we have that open."
-• "Hmm... right here, I see..."
+⚡ MULTITASKING SPEECH (MANDATORY):
+You are looking at a computer screen while talking. Use triple ellipses (...) between
+bridge phrases and data to simulate "typing while talking."
 
-Fragmented Speech: Humans don't speak in long paragraphs. Use short, punchy sentences.
+EXAMPLES:
+• "Let me check that for you... ... okay, here we go."
+• "Hmm, one moment... ... ah, I found it!"
+• "Checking availability... ... yes, we have that open."
+
+⚡ SELF-CORRECTION WITH DASHES (--):
+Use dashes for natural mid-thought corrections:
+• "Wait, let me see-- oh, I see a 10:00 AM slot here."
+• "That would be-- actually, let me double-check... yes, 2:30 works."
+• "The price is-- hmm, let me make sure I have the right one..."
+
+⚡ FRAGMENTED LISTS (CRITICAL):
+Break long lists into fragments. NEVER deliver multiple items in one breath.
 
 BAD: "I have checked our system and I can see that we have availability on Monday at 9 AM, Tuesday at 2 PM, and Wednesday at 11 AM for your cleaning appointment."
 
@@ -270,10 +280,11 @@ GOOD: "Okay, let me see here... We've got Monday at 9... Tuesday at 2... or Wedn
 
 ⚡ POST-TOOL DELIVERY PATTERN:
 1. Breathy filler: "Hmm..."
-2. Acknowledge: "... okay, I see it."
-3. Deliver ONE piece: "Monday at 9 works..."
-4. Pause: "..."
-5. Add more: "or Tuesday at 2."
+2. Pause while "reading": "..."
+3. Acknowledge: "... okay, I see it."
+4. Deliver ONE piece: "Monday at 9 works..."
+5. Pause: "..."
+6. Add more: "or Tuesday at 2."
 
 NEVER say "The system shows" or "According to my records." Just deliver naturally!
 
@@ -884,6 +895,201 @@ async def get_available_slots_v2(
 
 
 @function_tool(description="""
+Find the next available slot after a specific time, or the last slot on a specific day.
+Use this when:
+- User asks for "next available after [time]" or "last slot on [day]"
+- User says "anything after 2pm" or "late afternoon slots"
+- You need to search within a specific time window
+
+⚡ BRIDGE PHRASE: Say "Okay, checking for slots after [time]... one moment." before calling.
+
+Parameters:
+- start_search_time: ISO string or natural language (e.g., "tomorrow at 2pm", "after 3pm")
+- limit_to_day: Optional day constraint (e.g., "Monday", "tomorrow", "today")
+- find_last: If true, finds the LAST available slot instead of the first (for "end of day" requests)
+
+Returns the best matching slot with Sonic-3 prosody formatting.
+""")
+async def find_relative_slots(
+    start_search_time: str = None,
+    limit_to_day: str = None,
+    find_last: bool = False,
+) -> str:
+    """
+    Advanced relative time slot finder.
+    
+    Handles:
+    - "next available after 2pm tomorrow"
+    - "last slot on Monday"
+    - "anything after lunch"
+    - "late afternoon opening"
+    """
+    global _GLOBAL_STATE, _GLOBAL_CLINIC_INFO, _GLOBAL_SCHEDULE, _GLOBAL_CLINIC_TZ
+    
+    state = _GLOBAL_STATE
+    clinic_info = _GLOBAL_CLINIC_INFO
+    schedule = _GLOBAL_SCHEDULE or {}
+    
+    if not clinic_info:
+        return "... hmm, I'm having trouble accessing the schedule. Let me try again."
+    
+    duration = state.duration_minutes if state else 60
+    tz = ZoneInfo(_GLOBAL_CLINIC_TZ)
+    now = datetime.now(tz)
+    
+    # Parse start_search_time
+    search_start = now
+    target_date = None
+    
+    if start_search_time:
+        try:
+            from dateutil import parser as dtparser
+            parsed = dtparser.parse(start_search_time, fuzzy=True)
+            if parsed:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=tz)
+                # If parsed time is in the past today, assume they mean tomorrow
+                if parsed < now:
+                    parsed = parsed + timedelta(days=1)
+                search_start = parsed
+                target_date = parsed.date()
+                logger.info(f"[TOOL] find_relative_slots: searching after {search_start.isoformat()}")
+        except Exception as e:
+            logger.warning(f"[TOOL] Could not parse start_search_time '{start_search_time}': {e}")
+    
+    # Parse limit_to_day constraint
+    if limit_to_day:
+        day_map = {
+            "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+            "friday": 4, "saturday": 5, "sunday": 6,
+            "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+        }
+        day_lower = limit_to_day.lower().strip()
+        
+        if day_lower == "today":
+            target_date = now.date()
+        elif day_lower == "tomorrow":
+            target_date = (now + timedelta(days=1)).date()
+        elif day_lower in day_map:
+            target_weekday = day_map[day_lower]
+            days_until = (target_weekday - now.weekday()) % 7
+            if days_until == 0 and now.hour >= 17:  # Past working hours
+                days_until = 7
+            target_date = (now + timedelta(days=days_until)).date()
+    
+    try:
+        slot_step = schedule.get("slot_step_minutes", 30)
+        
+        # Round up search_start to next slot boundary
+        minutes_to_add = slot_step - (search_start.minute % slot_step)
+        if minutes_to_add == slot_step:
+            minutes_to_add = 0
+        current = search_start.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_add)
+        
+        # If we have a target date, ensure we start on that day
+        if target_date and current.date() < target_date:
+            current = datetime.combine(target_date, datetime.min.time(), tzinfo=tz)
+            current = current.replace(hour=9, minute=0)
+        
+        # Search window: limit to target_date if specified, otherwise 3 days
+        if target_date:
+            end_search = datetime.combine(target_date, datetime.max.time(), tzinfo=tz)
+        else:
+            end_search = now + timedelta(days=3)
+        
+        # Fetch existing appointments
+        existing_appointments = []
+        try:
+            result = await asyncio.to_thread(
+                lambda: supabase.table("appointments")
+                .select("start_time, end_time")
+                .eq("clinic_id", clinic_info["id"])
+                .gte("start_time", now.isoformat())
+                .lte("start_time", end_search.isoformat())
+                .in_("status", BOOKED_STATUSES)
+                .execute()
+            )
+            for appt in (result.data or []):
+                try:
+                    appt_start = datetime.fromisoformat(appt["start_time"].replace("Z", "+00:00"))
+                    appt_end = datetime.fromisoformat(appt["end_time"].replace("Z", "+00:00"))
+                    existing_appointments.append((appt_start, appt_end))
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"[TOOL] find_relative_slots: Failed to fetch appointments: {e}")
+        
+        available_slots = []
+        lunch_skipped = False
+        
+        while current < end_search and len(available_slots) < (10 if find_last else 3):
+            # If target_date is set, only check that day
+            if target_date and current.date() != target_date:
+                break
+            
+            # Check if slot is valid (working hours, not lunch, not holiday)
+            is_valid, error_msg = is_within_working_hours(current, schedule, duration)
+            
+            if not is_valid and "lunch" in error_msg.lower():
+                lunch_skipped = True
+            
+            if is_valid:
+                # Check slot availability with buffer
+                slot_end = current + timedelta(minutes=duration + APPOINTMENT_BUFFER_MINUTES)
+                is_free = True
+                
+                for appt_start, appt_end in existing_appointments:
+                    buffered_end = appt_end + timedelta(minutes=APPOINTMENT_BUFFER_MINUTES)
+                    if current < buffered_end and slot_end > appt_start:
+                        is_free = False
+                        break
+                
+                if is_free:
+                    available_slots.append(current)
+            
+            # Move to next slot
+            current += timedelta(minutes=slot_step)
+        
+        if not available_slots:
+            time_desc = start_search_time or "that time"
+            return f"... hmm, I don't see any openings after {time_desc}. Would you like me to check a different day?"
+        
+        # If find_last, return the last slot found
+        if find_last:
+            best_slot = available_slots[-1]
+        else:
+            best_slot = available_slots[0]
+        
+        # Format for natural speech
+        time_str = best_slot.strftime("%I:%M %p").lstrip("0")
+        day_str = best_slot.strftime("%A")
+        
+        today = now.date()
+        if best_slot.date() == today:
+            day_desc = "today"
+        elif best_slot.date() == today + timedelta(days=1):
+            day_desc = "tomorrow"
+        else:
+            day_desc = day_str
+        
+        # Build response with Sonic-3 prosody
+        if lunch_skipped:
+            prefix = "... okay, skipping the lunch hour-- "
+        else:
+            prefix = "... ah, let me see-- "
+        
+        if find_last:
+            return f"{prefix}the last slot I have is {day_desc} at {time_str}. Does that work?"
+        else:
+            return f"{prefix}the next opening is {day_desc} at {time_str}. How does that sound?"
+            
+    except Exception as e:
+        logger.error(f"[TOOL] find_relative_slots error: {e}")
+        traceback.print_exc()
+        return "... hmm, I'm having trouble with the schedule. Let me try that again."
+
+
+@function_tool(description="""
 Confirm the phone number with the patient. Call this after reading back the last 4 digits.
 """)
 async def confirm_phone(confirmed: bool) -> str:
@@ -1181,7 +1387,8 @@ RECEPTIONIST_TOOLS = [
     update_patient_record,
     get_available_slots,
     get_available_slots_v2,  # ⚡ Advanced scheduling with relative time search
-    search_clinic_info,  # RAG knowledge base search
+    find_relative_slots,     # ⚡ "Next available after X" / "Last slot on Y"
+    search_clinic_info,      # RAG knowledge base search
     confirm_phone,
     confirm_email,
     check_booking_status,
@@ -2600,6 +2807,8 @@ async def snappy_entrypoint(ctx: JobContext):
                              "next", "earliest", "soonest", "after", "before", "morning", "afternoon"]
     PRICING_KEYWORDS = ["how much", "price", "cost", "insurance", "accept", "take", 
                         "pricing", "fee", "charge", "pay", "delta", "aetna", "cigna", "blue cross"]
+    LOCATION_KEYWORDS = ["where", "location", "address", "parking", "park", "directions", 
+                         "find you", "get there", "located", "street", "building"]
     SERVICE_KEYWORDS = ["cleaning", "whitening", "extraction", "filling", "crown", 
                         "root canal", "checkup", "check-up", "consultation", "exam",
                         "invisalign", "braces", "implant", "veneer", "denture", "bridge"]
@@ -2636,6 +2845,12 @@ async def snappy_entrypoint(ctx: JobContext):
         "Got it... let me note that down.",
         "Perfect... one moment while I save that.",
         "Okay, great... let me get that in here.",
+    ]
+    LOCATION_FILLERS = [
+        "Oh, let me get that info for you...",
+        "Sure thing... one moment.",
+        "Let me pull up our location details...",
+        "Good question! Let me check...",
     ]
     
     def _detect_service_in_text(text: str) -> Optional[str]:
@@ -2681,13 +2896,17 @@ async def snappy_entrypoint(ctx: JobContext):
         """
         Fired after user finishes speaking and before LLM generates response.
         
-        ⚡ AGGRESSIVE INSTANT HOOK: Fire audio filler within 100ms of speech end.
-        The user hears "One moment..." while LLM is processing = ZERO SILENCE.
+        ⚡ ZERO-LATENCY INSTANT HOOK: Fire audio filler within 100ms of speech end.
+        The user hears "One moment..." while LLM is processing = ZERO PERCEIVED SILENCE.
+        
+        ARCHITECTURAL FIX: Use asyncio.ensure_future() for IMMEDIATE, UNBLOCKED execution.
+        This ensures the filler fires BEFORE any other processing begins.
         
         RULES:
         1. ANY keyword match = immediate filler (no complex conditions)
         2. Service/name detection = acoustic mirroring (repeat back slowly)
         3. Multiple intents = pick the most specific one
+        4. Location/parking = RAG filler
         """
         text = _speech_text_from_msg(msg)
         text_lower = text.lower() if text else ""
@@ -2701,7 +2920,8 @@ async def snappy_entrypoint(ctx: JobContext):
             return
         
         # ═══════════════════════════════════════════════════════════════════════
-        # ⚡ AGGRESSIVE INSTANT HOOK: Fire filler immediately on ANY keyword match
+        # ⚡ ZERO-LATENCY HOOK: Fire filler IMMEDIATELY on ANY keyword match
+        # Using ensure_future for unblocked, high-priority execution
         # ═══════════════════════════════════════════════════════════════════════
         filler = None
         filler_type = None
@@ -2722,27 +2942,33 @@ async def snappy_entrypoint(ctx: JobContext):
                 filler = random.choice(NAME_FILLERS)
                 filler_type = "NAME"
         
-        # PRIORITY 3: Pricing/insurance questions (RAG triggers)
+        # PRIORITY 3: Location/parking questions (RAG triggers)
+        elif any(k in text_lower for k in LOCATION_KEYWORDS):
+            filler = random.choice(LOCATION_FILLERS)
+            filler_type = "LOCATION"
+        
+        # PRIORITY 4: Pricing/insurance questions (RAG triggers)
         elif any(k in text_lower for k in PRICING_KEYWORDS):
             filler = random.choice(PRICING_FILLERS)
             filler_type = "PRICING"
         
-        # PRIORITY 4: Availability/time questions
+        # PRIORITY 5: Availability/time questions
         elif any(k in text_lower for k in AVAILABILITY_KEYWORDS):
             filler = random.choice(AVAILABILITY_FILLERS)
             filler_type = "AVAILABILITY"
         
-        # PRIORITY 5: Booking intent
+        # PRIORITY 6: Booking intent
         elif any(k in text_lower for k in BOOKING_KEYWORDS):
             filler = random.choice(BOOKING_FILLERS)
             filler_type = "BOOKING"
         
-        # ⚡ FIRE THE FILLER IMMEDIATELY
+        # ⚡ FIRE THE FILLER IMMEDIATELY — Use ensure_future for zero blocking
         if filler:
-            asyncio.create_task(session.say(filler))
+            # ensure_future schedules the coroutine with HIGHEST priority
+            asyncio.ensure_future(session.say(filler))
             logger.info(f"⚡ [INSTANT_HOOK] [{filler_type}] >> {filler}")
         
-        # Refresh memory and log state
+        # Refresh memory and log state (after filler is already queued)
         refresh_agent_memory()
         logger.debug(f"[STATE] Current: {state.slot_summary()}")
 
