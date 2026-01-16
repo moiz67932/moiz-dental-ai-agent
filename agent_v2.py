@@ -337,10 +337,16 @@ Speak like a helpful receptionist. Use brief bridge phrases like "Let me check..
 • Never offer callbacks (you cannot dial out).
 • Timezone: {timezone} | Hours: Mon-Fri 9-5, Sat 10-2, Sun closed | Lunch: 1-2pm
 
-📅 BOOKING LOGIC (DATE-SPECIFIC)
+📅 BOOKING LOGIC (DATE-SPECIFIC - VERY IMPORTANT!)
 ═══════════════════════════════════════════════════════════════════════════════
-• If the user mentions a specific date (like January 20th), ALWAYS call find_relative_slots with that date.
-• Do NOT just tell them what is available today.
+• If user asks for a SPECIFIC date/time (e.g., "January 20 at 3pm"):
+  1. FIRST try to book that EXACT slot via update_patient_record(time_suggestion="...")
+  2. The tool will check availability and either confirm it OR return nearby alternatives
+  3. If alternatives are offered, ask the user to CHOOSE one (don't auto-pick next available)
+  
+• If user asks for "anytime" or "next available": ONLY THEN use get_available_slots()
+• NEVER force "next available Saturday" if user asked for a specific weekday date!
+• Always respect the user's date preference - offer alternatives NEAR that date.
 """
 
 
@@ -3012,14 +3018,26 @@ async def snappy_entrypoint(ctx: JobContext):
     # ═══════════════════════════════════════════════════════════════════════════
     # 🎙️ GREETING: Use DB greeting_text if context loaded, otherwise fallback
     # ═══════════════════════════════════════════════════════════════════════════
+    # Build greeting - if we have SIP phone prefilled, proactively confirm it
+    phone_confirm_addon = ""
+    if state.phone_e164 and state.phone_source == "sip" and not state.phone_confirmed:
+        # SIP call with prefilled phone - proactively ask to confirm FULL number
+        speakable = speakable_phone(state.phone_e164)
+        phone_confirm_addon = f" I see you're calling from {speakable}. Is this the best number to reach you on?"
+        logger.info(f"[GREETING] Will ask to confirm SIP caller phone: {speakable}")
+    
     if settings and settings.get("greeting_text"):
-        greeting = settings.get("greeting_text")
+        greeting = settings.get("greeting_text") + phone_confirm_addon
         logger.info(f"[GREETING] Using DB greeting: {greeting[:50]}...")
     elif clinic_info:
-        greeting = f"Hi, thanks for calling {clinic_name}! How can I help you today?"
+        base_greeting = f"Hi, thanks for calling {clinic_name}!"
+        if phone_confirm_addon:
+            greeting = base_greeting + phone_confirm_addon
+        else:
+            greeting = base_greeting + " How can I help you today?"
         logger.info(f"[GREETING] Using clinic-aware greeting for {clinic_name}")
     else:
-        greeting = "Hello! Thanks for calling. How can I help you today?"
+        greeting = "Hello! Thanks for calling." + (phone_confirm_addon or " How can I help you today?")
         logger.info("[GREETING] Using default greeting (DB context not loaded)")
     
     # ⚡ HIGH-PERFORMANCE LLM with function calling
@@ -3084,13 +3102,46 @@ async def snappy_entrypoint(ctx: JobContext):
     # ⚡ INSTANT FILLER & INTERRUPTION — Sub-second perceived latency
     # ═══════════════════════════════════════════════════════════════════════════
     # Track active filler speech handle for interruption when real response arrives
-    active_filler_handle = {"handle": None}
+    active_filler_handle = {"handle": None, "is_filler": False}
+    
+    def _interrupt_filler():
+        """Safely interrupt active filler speech."""
+        h = active_filler_handle.get("handle")
+        if not h:
+            return
+        try:
+            # Try various interrupt methods depending on SDK version
+            if hasattr(h, 'interrupt'):
+                h.interrupt()
+            elif hasattr(h, 'cancel'):
+                h.cancel()
+            elif hasattr(h, 'stop'):
+                h.stop()
+            logger.debug("[FILLER] ✓ Interrupted filler for real response")
+        except Exception as e:
+            logger.debug(f"[FILLER] Could not interrupt filler (non-critical): {e}")
+        finally:
+            active_filler_handle["handle"] = None
+            active_filler_handle["is_filler"] = False
+    
+    async def _send_filler_async(filler_text: str):
+        """Non-blocking filler speech - will be interrupted when real response arrives."""
+        try:
+            # Use session.say with allow_interruptions=True for non-blocking filler
+            # Store handle so we can interrupt it when real response arrives
+            active_filler_handle["is_filler"] = True
+            handle = await session.say(filler_text, allow_interruptions=True)
+            active_filler_handle["handle"] = handle
+            logger.debug(f"[FILLER] Sent filler: {filler_text}")
+        except Exception as e:
+            logger.debug(f"[FILLER] Could not send filler: {e}")
+            active_filler_handle["is_filler"] = False
     
     @session.on("user_input_transcribed")
-    async def _on_user_transcribed_filler(ev):
+    def _on_user_transcribed_filler(ev):
         """
-        Instant filler phrase on user speech to reduce perceived latency.
-        Filler is interrupted when the real LLM response arrives.
+        SYNC callback - spawns async task for filler.
+        LiveKit .on() requires sync callbacks; async work via create_task.
         """
         # Only act on final transcriptions
         if not getattr(ev, 'is_final', True):
@@ -3106,8 +3157,11 @@ async def snappy_entrypoint(ctx: JobContext):
             if YES_PAT.search(transcript_lower) or NO_PAT.search(transcript_lower):
                 return  # Skip filler for confirmations
         
+        # Don't send filler if we're already speaking
+        if active_filler_handle.get("is_filler"):
+            return
+        
         # Fire off a quick filler phrase while LLM thinks
-        # Use varied fillers for natural conversation
         import random
         fillers = [
             "... hmm, let me check...",
@@ -3117,18 +3171,13 @@ async def snappy_entrypoint(ctx: JobContext):
         ]
         filler = random.choice(fillers)
         
-        try:
-            # Store handle so we can interrupt it later
-            handle = await session.say(filler, allow_interruptions=True)
-            active_filler_handle["handle"] = handle
-            logger.debug(f"[FILLER] Sent filler: {filler}")
-        except Exception as e:
-            logger.debug(f"[FILLER] Could not send filler: {e}")
+        # Non-blocking: spawn task, don't await
+        asyncio.create_task(_send_filler_async(filler))
     
     @session.on("agent_speech_started")
     def _on_speech_started(ev):
         """
-        Interrupt active filler when real response starts.
+        SYNC callback - interrupt filler when real response starts.
         This ensures filler doesn't overlap with actual content.
         """
         # Check if this is a real response (not the filler itself)
@@ -3140,14 +3189,11 @@ async def snappy_entrypoint(ctx: JobContext):
         
         # If we have an active filler and this is NOT a filler phrase, interrupt it
         handle = active_filler_handle.get("handle")
-        if handle and speech_text and "..." not in speech_text[:20]:
-            try:
-                handle.interrupt()
-                logger.debug("[FILLER] Interrupted filler for real response")
-            except Exception as e:
-                logger.debug(f"[FILLER] Could not interrupt filler: {e}")
-            finally:
-                active_filler_handle["handle"] = None
+        is_filler = active_filler_handle.get("is_filler", False)
+        
+        # Interrupt if: we have a handle AND (not a filler OR speech doesn't start with "...")
+        if handle and (not is_filler or (speech_text and not speech_text.strip().startswith("..."))):
+            _interrupt_filler()
 
     # Create agent with tools (v1.2.14 API - tools passed to Agent, not AgentSession)
     class SnappyAgent(Agent):
@@ -3198,9 +3244,10 @@ async def snappy_entrypoint(ctx: JobContext):
     # instead of relying on LLM which can misfire (e.g., confirm_email on "yes")
     
     @session.on("user_input_transcribed")
-    def _on_user_input(ev):
+    def _on_user_input_confirmation(ev):
         """
-        Deterministic routing for yes/no confirmations.
+        SYNC callback - deterministic routing for yes/no confirmations.
+        Spawns async tasks via create_task (required by LiveKit EventEmitter).
         
         When pending_confirm_field is set (e.g., "phone"), intercept
         clear yes/no responses and call the appropriate confirm tool directly.
@@ -3236,45 +3283,41 @@ async def snappy_entrypoint(ctx: JobContext):
         
         logger.info(f"[CONFIRM] Deterministic routing: pending='{pending}', is_yes={is_yes}")
         
-        # Route to appropriate confirm tool
-        if pending == "phone":
-            # Handle phone confirmation deterministically
-            async def _handle_phone_confirm():
-                try:
-                    if is_yes:
-                        result = await confirm_phone(confirmed=True)
-                        logger.info(f"[CONFIRM] Phone confirmed via deterministic routing")
-                        # Let agent continue naturally
-                        await session.generate_reply()
-                    else:
-                        result = await confirm_phone(confirmed=False)
-                        logger.info(f"[CONFIRM] Phone rejected via deterministic routing")
-                        # Ask for phone again
-                        await session.say("No problem! Could you please give me your phone number again?")
-                except Exception as e:
-                    logger.error(f"[CONFIRM] Phone confirm error: {e}")
-            
-            # Fire and forget - don't block
-            asyncio.create_task(_handle_phone_confirm())
-            # Note: We don't prevent LLM from also responding - they may overlap
-            # This is a tradeoff for simpler implementation
+        # Async handler for phone confirmation
+        async def _handle_phone_confirm_async(confirmed: bool):
+            try:
+                if confirmed:
+                    result = await confirm_phone(confirmed=True)
+                    logger.info(f"[CONFIRM] Phone confirmed via deterministic routing")
+                    # Let agent continue naturally
+                    await session.generate_reply()
+                else:
+                    result = await confirm_phone(confirmed=False)
+                    logger.info(f"[CONFIRM] Phone rejected via deterministic routing")
+                    # Ask for phone again
+                    await session.say("No problem! Could you please give me your phone number again?")
+            except Exception as e:
+                logger.error(f"[CONFIRM] Phone confirm error: {e}")
         
+        # Async handler for email confirmation
+        async def _handle_email_confirm_async(confirmed: bool):
+            try:
+                if confirmed:
+                    result = await confirm_email(confirmed=True)
+                    logger.info(f"[CONFIRM] Email confirmed via deterministic routing")
+                    await session.generate_reply()
+                else:
+                    result = await confirm_email(confirmed=False)
+                    logger.info(f"[CONFIRM] Email rejected via deterministic routing")
+                    await session.say("No problem! What's your email address?")
+            except Exception as e:
+                logger.error(f"[CONFIRM] Email confirm error: {e}")
+        
+        # Route to appropriate confirm tool (spawn async task - don't await)
+        if pending == "phone":
+            asyncio.create_task(_handle_phone_confirm_async(is_yes))
         elif pending == "email":
-            # Handle email confirmation deterministically  
-            async def _handle_email_confirm():
-                try:
-                    if is_yes:
-                        result = await confirm_email(confirmed=True)
-                        logger.info(f"[CONFIRM] Email confirmed via deterministic routing")
-                        await session.generate_reply()
-                    else:
-                        result = await confirm_email(confirmed=False)
-                        logger.info(f"[CONFIRM] Email rejected via deterministic routing")
-                        await session.say("No problem! What's your email address?")
-                except Exception as e:
-                    logger.error(f"[CONFIRM] Email confirm error: {e}")
-            
-            asyncio.create_task(_handle_email_confirm())
+            asyncio.create_task(_handle_email_confirm_async(is_yes))
     
     # ═══════════════════════════════════════════════════════════════════════════
     # 📞 SIP PARTICIPANT EVENT — Handle late-joining SIP participants
