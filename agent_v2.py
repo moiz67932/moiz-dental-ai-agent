@@ -696,8 +696,8 @@ async def update_patient_record(
             state.email_confirmed = False  # NEVER auto-confirm - always require explicit confirmation
             updates.append(f"email_pending={state.email}")
             logger.info(f"[TOOL] ⏳ Email captured (pending confirmation): {state.email}")
-            # Only prompt confirmation if contact phase has started
-            if state.contact_phase_started:
+            # Only prompt confirmation if contact phase has started AND not already confirmed
+            if state.contact_phase_started and not state.email_confirmed:
                 state.pending_confirm = "email"
                 state.pending_confirm_field = "email"
                 return f"Email captured as {email_for_speech(state.email)}. Please confirm: 'Is your email {email_for_speech(state.email)}?'"
@@ -1481,6 +1481,16 @@ async def confirm_email(confirmed: bool) -> str:
     if not state:
         return "State not initialized."
     
+    # Idempotent guard: Do NOT re-confirm if already confirmed
+    if state.email_confirmed:
+        logger.debug("[TOOL] confirm_email skipped - already confirmed")
+        # Clear pending state to prevent re-triggering
+        if state.pending_confirm == "email":
+            state.pending_confirm = None
+        if state.pending_confirm_field == "email":
+            state.pending_confirm_field = None
+        return "Email already confirmed. Continue with next step."
+    
     # Gate: Do NOT confirm email if contact phase hasn't started
     if not contact_phase_allowed(state):
         logger.debug("[TOOL] confirm_email blocked - contact phase not started")
@@ -1488,6 +1498,11 @@ async def confirm_email(confirmed: bool) -> str:
     
     if confirmed:
         state.email_confirmed = True
+        # Clear pending confirmation to prevent re-triggering
+        if state.pending_confirm == "email":
+            state.pending_confirm = None
+        if state.pending_confirm_field == "email":
+            state.pending_confirm_field = None
         logger.info("[TOOL] ✓ Email confirmed")
         # Trigger memory refresh
         if _REFRESH_AGENT_MEMORY:
@@ -3805,6 +3820,12 @@ async def snappy_entrypoint(ctx: JobContext):
                 logger.debug("[CONFIRM] Phone confirm blocked - contact phase not started")
                 return
         elif pending == "email":
+            # Skip if email already confirmed (idempotent guard)
+            if state.email_confirmed:
+                logger.debug("[CONFIRM] Email confirm skipped - already confirmed")
+                state.pending_confirm = None
+                state.pending_confirm_field = None
+                return
             asyncio.create_task(_handle_email_confirm_async(is_yes))
     
     # ═══════════════════════════════════════════════════════════════════════════
