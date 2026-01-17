@@ -6,7 +6,7 @@ HIGH-PERFORMANCE VOICE AGENT with <1s response latency.
 
 ARCHITECTURAL CHANGES FROM V1:
 1. Single Supabase query with joins (4 queries → 1 query: 3.2s → 100ms)
-2. AgentSession with aggressive endpointing (min_endpointing_delay=0.5s)
+2. AgentSession with aggressive endpointing (min_endpointing_delay=0.6s)
 3. gpt-4o-mini for optimal speed/quality balance
 4. Streamlined extraction via inline deterministic extractors (no blocking NLU)
 5. Non-blocking booking via asyncio.create_task()
@@ -14,7 +14,7 @@ ARCHITECTURAL CHANGES FROM V1:
 
 CRITICAL PERFORMANCE OPTIMIZATIONS:
 - Supabase joins reduce 4 sequential queries to 1 round-trip
-- min_endpointing_delay=0.5s for snappy turn detection
+- min_endpointing_delay=0.6s for snappy turn detection
 - Temperature 0.7 for natural speech
 - Background booking doesn't block conversation
 """
@@ -47,7 +47,7 @@ LATENCY TUNING GUIDE:
 
 # Endpointing: How quickly agent detects user finished speaking
 # WARNING: Do NOT go below 0.3s unless in controlled low-noise environment
-MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.45"))  # 0.45s - less jumpy on natural pauses
+MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.6"))  # 0.45s - less jumpy on natural pauses
 MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "1.5"))   # 1.5s max wait
 
 # VAD (Voice Activity Detection) tuning
@@ -3125,7 +3125,7 @@ async def snappy_entrypoint(ctx: JobContext):
     
     Optimizations:
     1. Single Supabase query (3.2s → 100ms)
-    2. VoicePipelineAgent with min_endpointing_delay=0.5s
+    2. VoicePipelineAgent with min_endpointing_delay=0.6s
     3. gpt-4o-mini for speed + quality
     4. LLM Function Calling for real-time parallel extraction
     5. Non-blocking booking
@@ -3416,7 +3416,7 @@ async def snappy_entrypoint(ctx: JobContext):
         llm=llm_instance,
         tts=tts_instance,
         vad=vad_instance,
-        min_endpointing_delay=MIN_ENDPOINTING_DELAY,  # ⚡ 0.35s for snappy turn-taking (was 0.5)
+        min_endpointing_delay=MIN_ENDPOINTING_DELAY,  # ⚡ 0.6s for snappy turn-taking (was 0.5)
         max_endpointing_delay=MAX_ENDPOINTING_DELAY,  # 1.5s max wait
         allow_interruptions=True,
         min_interruption_duration=0.5,
