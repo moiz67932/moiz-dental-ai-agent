@@ -277,6 +277,31 @@ calendar_store = SupabaseCalendarStore(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 BOOKED_STATUSES = ["scheduled", "confirmed"]
 
+# Valid call_sessions.outcome enum values (from Supabase schema)
+VALID_CALL_OUTCOMES = {
+    "booked",
+    "info_only",
+    "missed",
+    "transferred",
+    "voicemail",
+}
+
+
+def map_call_outcome(raw_outcome: Optional[str], booking_made: bool) -> str:
+    """
+    Maps internal call results to DB-safe call_outcome enum values.
+    NEVER returns an invalid enum.
+    """
+    if booking_made:
+        return "booked"
+
+    if raw_outcome in VALID_CALL_OUTCOMES:
+        return raw_outcome
+
+    # Fallback: No booking and call ended normally → info_only
+    return "info_only"
+
+
 # Google Calendar Config
 GOOGLE_CALENDAR_AUTH_MODE = os.getenv("GOOGLE_CALENDAR_AUTH", "oauth")
 GOOGLE_OAUTH_TOKEN_PATH = os.getenv("GOOGLE_OAUTH_TOKEN", "./google_token.json")
@@ -3894,9 +3919,11 @@ async def snappy_entrypoint(ctx: JobContext):
         
         try:
             if clinic_info:
-                # FIX: Use "completed" as fallback (valid Supabase enum value)
-                # Previously "inquiry" caused database crashes
-                outcome = "appointment_booked" if state.booking_confirmed else "completed"
+                # Map to valid Supabase enum: booked, info_only, missed, transferred, voicemail
+                outcome = map_call_outcome(
+                    raw_outcome=None,
+                    booking_made=state.booking_confirmed,
+                )
                 
                 # Build call session payload with proper schema (no called_number column)
                 call_session_payload = {
