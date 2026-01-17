@@ -1413,7 +1413,7 @@ async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None) -> str
             return "No phone number to confirm. Ask for phone number first."
         # Safety guard before confirming
         _ensure_phone_is_string(state)
-        state.phone_e164 = state.phone_pending
+        state.phone_e164 = str(state.phone_pending)  # Enforce string type - prevents tuple DB/calendar errors
         state.phone_confirmed = True
         state.pending_confirm = None if state.pending_confirm == "phone" else state.pending_confirm
         state.pending_confirm_field = None if state.pending_confirm_field == "phone" else state.pending_confirm_field
