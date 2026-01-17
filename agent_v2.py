@@ -813,7 +813,8 @@ async def update_patient_record(
                             return f"... ah, perfect! {day_spoken} at {time_spoken} is open. I have a number ending in {state.phone_last4} — is that okay?"
 
                     # Sonic-3 prosody: breathy confirmation with ellipses
-                    return f"... ah, perfect! {day_spoken} at {time_spoken} is open. I've got that down."
+                    # CRITICAL: Phrase forces LLM to understand booking is NOT complete yet
+                    return f"... ah, perfect! {day_spoken} at {time_spoken} is open and I've noted that. I'll book it for you once we finish the rest of the details."
                 else:
                     # Time is invalid (lunch, after-hours, holiday)
                     state.time_status = "invalid"
@@ -1383,8 +1384,11 @@ Example: "I have a number ending in 7839 — is that okay?"
 
 IMPORTANT: When user says "yes", "yeah", "correct" etc., call confirm_phone(confirmed=True).
 When user says "no", "wrong", "incorrect", call confirm_phone(confirmed=False).
+
+SMART CAPTURE: You can also pass a phone_number to save it before confirming.
+Example: confirm_phone(confirmed=True, phone_number="+923351234567") saves AND confirms in one call.
 """)
-async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None) -> str:
+async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None, phone_number: Optional[str] = None) -> str:
     """
     Mark phone as confirmed or update with correction.
     
@@ -1402,7 +1406,8 @@ async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None) -> str
         logger.debug("[TOOL] confirm_phone blocked - contact phase not started")
         return "Continue the conversation. Confirm the appointment time first."
     
-    new_phone = _sanitize_tool_arg(new_phone)
+    # Smart capture: phone_number param takes priority over new_phone for backwards compat
+    new_phone = _sanitize_tool_arg(phone_number) or _sanitize_tool_arg(new_phone)
 
     if new_phone:
         # User provided a correction - use proper normalization
@@ -1473,13 +1478,22 @@ async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None) -> str
 
 @function_tool(description="""
 Confirm the email address with the patient. Call this after spelling it back.
+
+SMART CAPTURE: You can also pass an email_address to save it before confirming.
+Example: confirm_email(confirmed=True, email_address="patient@example.com") saves AND confirms in one call.
 """)
-async def confirm_email(confirmed: bool) -> str:
-    """Mark email as confirmed or rejected."""
+async def confirm_email(confirmed: bool, email_address: Optional[str] = None) -> str:
+    """Mark email as confirmed or rejected. Optionally saves email_address before confirming."""
     global _GLOBAL_STATE
     state = _GLOBAL_STATE
     if not state:
         return "State not initialized."
+    
+    # Smart capture: Save email_address if provided before confirming
+    email_address = _sanitize_tool_arg(email_address)
+    if email_address:
+        state.email = email_address.strip().lower()
+        logger.info(f"[TOOL] Email saved via smart capture: {state.email}")
     
     # Idempotent guard: Do NOT re-confirm if already confirmed
     if state.email_confirmed:
@@ -1597,9 +1611,14 @@ async def confirm_and_book_appointment() -> str:
     if not state:
         return "State not initialized."
     
-    if not state.is_complete():
+    # FIX 3: Enhanced logging visibility for debugging false bookings
+    is_complete = state.is_complete()
+    logger.info(f"[BOOKING] Tool triggered. State complete: {is_complete}")
+    
+    if not is_complete:
         missing = state.missing_slots()
-        return f"Cannot book yet. Missing: {', '.join(missing)}. Continue gathering info."
+        logger.warning(f"[BOOKING] Cannot book - missing slots: {missing}")
+        return f"Missing: {', '.join(missing)}. Continue gathering info before booking."
     
     # CRITICAL SAFETY GATE: Booking REQUIRES confirmed contact details
     if not state.phone_confirmed:
