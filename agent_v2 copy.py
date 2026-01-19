@@ -6,7 +6,7 @@ HIGH-PERFORMANCE VOICE AGENT with <1s response latency.
 
 ARCHITECTURAL CHANGES FROM V1:
 1. Single Supabase query with joins (4 queries → 1 query: 3.2s → 100ms)
-2. AgentSession with aggressive endpointing (min_endpointing_delay=0.6s)
+2. AgentSession with aggressive endpointing (min_endpointing_delay=0.5s)
 3. gpt-4o-mini for optimal speed/quality balance
 4. Streamlined extraction via inline deterministic extractors (no blocking NLU)
 5. Non-blocking booking via asyncio.create_task()
@@ -14,7 +14,7 @@ ARCHITECTURAL CHANGES FROM V1:
 
 CRITICAL PERFORMANCE OPTIMIZATIONS:
 - Supabase joins reduce 4 sequential queries to 1 round-trip
-- min_endpointing_delay=0.6s for snappy turn detection
+- min_endpointing_delay=0.5s for snappy turn detection
 - Temperature 0.7 for natural speech
 - Background booking doesn't block conversation
 """
@@ -31,43 +31,7 @@ import logging
 import traceback
 from datetime import datetime, timedelta, date
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, Any, List, Set, Callable, Sequence, cast
-from functools import lru_cache
-from pydantic import BaseModel
-
-# =============================================================================
-# 🚀 LATENCY OPTIMIZATION CONSTANTS — TUNING KNOBS FOR SNAPPY RESPONSES
-# =============================================================================
-"""
-LATENCY TUNING GUIDE:
-- These constants control responsiveness vs. conversation quality tradeoffs
-- Adjust based on production metrics; log analysis will show impact
-- Set LATENCY_DEBUG=1 env var to enable per-turn latency logging
-"""
-
-# Endpointing: How quickly agent detects user finished speaking
-# WARNING: Do NOT go below 0.3s unless in controlled low-noise environment
-MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.6"))  # 0.45s - less jumpy on natural pauses
-MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "1.2"))   # 1.5s max wait
-
-# VAD (Voice Activity Detection) tuning
-# WARNING: min_silence < 0.25s may cause premature cutoffs on pauses
-VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH", "0.1"))    # Keep at 0.1 (don't lower)
-VAD_MIN_SILENCE_DURATION = float(os.getenv("VAD_MIN_SILENCE", "0.25"))  # 0.25s (was 0.3)
-
-# Filler speech settings
-FILLER_ENABLED = os.getenv("FILLER_ENABLED", "1") == "1"
-FILLER_MAX_DURATION_MS = int(os.getenv("FILLER_MAX_MS", "700"))  # Hard cap on filler playback
-FILLER_PHRASES = ["Okay…", "One moment…", "Got it…", "Hmm…"]  # Short phrases < 400ms spoken
-
-# STT aggressive endpointing (Deepgram-specific)
-STT_AGGRESSIVE_ENDPOINTING = os.getenv("STT_AGGRESSIVE", "1") == "1"
-
-# Clinic context TTL cache (seconds) - DO NOT cache availability/schedule conflicts
-CLINIC_CONTEXT_CACHE_TTL = int(os.getenv("CLINIC_CACHE_TTL", "60"))  # 60s TTL
-
-# Latency debug mode - logs detailed timing per turn
-LATENCY_DEBUG = os.getenv("LATENCY_DEBUG", "0") == "1"
+from typing import Optional, Tuple, Dict, Any, List
 
 # Mute noisy transport debug logs (reduces log-bloat in production)
 logging.getLogger("hpack").setLevel(logging.WARNING)
@@ -92,114 +56,6 @@ if not logger.handlers:
 
 
 # =============================================================================
-# ⏱️ LATENCY METRICS HELPER — Structured timing for optimization verification
-# =============================================================================
-
-class LatencyMetrics:
-    """
-    Lightweight latency tracker for voice agent turns.
-    Logs structured timing data when LATENCY_DEBUG=1.
-    
-    Usage:
-        metrics = LatencyMetrics()
-        metrics.mark("user_eou")  # End of utterance
-        metrics.mark("llm_start")
-        metrics.mark("llm_first_token")
-        metrics.mark("tts_start")
-        metrics.mark("audio_start")
-        metrics.log_turn()  # Emits structured log line
-    """
-    
-    def __init__(self):
-        self.reset()
-    
-    def reset(self):
-        self._start = time.perf_counter()
-        self._marks: Dict[str, float] = {}
-        self._filler_info: Dict[str, Any] = {"played": False, "suppressed_reason": None}
-    
-    def mark(self, label: str):
-        """Record a timestamp for a labeled event."""
-        self._marks[label] = time.perf_counter() - self._start
-    
-    def set_filler_info(self, played: bool, reason: Optional[str] = None):
-        """Track whether filler was played or suppressed."""
-        self._filler_info = {"played": played, "suppressed_reason": reason}
-    
-    def get_elapsed(self, label: str) -> float:
-        """Get elapsed time in ms for a label."""
-        return self._marks.get(label, 0) * 1000
-    
-    def log_turn(self, extra: str = ""):
-        """Emit a single structured log line with all latency data."""
-        if not LATENCY_DEBUG:
-            return
-        
-        parts = []
-        ordered_labels = ["user_eou", "llm_start", "llm_first_token", "llm_done", "tts_start", "audio_start"]
-        for label in ordered_labels:
-            if label in self._marks:
-                parts.append(f"{label}={self._marks[label]*1000:.0f}ms")
-        
-        filler_str = "played" if self._filler_info["played"] else f"suppressed:{self._filler_info['suppressed_reason'] or 'none'}"
-        
-        log_line = f"[LATENCY] {' | '.join(parts)} | filler={filler_str}"
-        if extra:
-            log_line += f" | {extra}"
-        
-        logger.info(log_line)
-        self.reset()
-
-
-# Global latency tracker (reset per turn)
-_turn_metrics = LatencyMetrics()
-
-
-# =============================================================================
-# 🗄️ TTL CACHE FOR CLINIC CONTEXT — Avoid repeated DB fetches during call
-# =============================================================================
-
-class TTLCache:
-    """
-    Simple TTL-based cache for clinic context.
-    NEVER cache: availability, schedule conflicts, appointment slots.
-    ONLY cache: static clinic info, agent settings, greetings.
-    """
-    
-    def __init__(self, ttl_seconds: int = 60):
-        self._cache: Dict[str, Tuple[float, Any]] = {}
-        self._ttl = ttl_seconds
-    
-    def get(self, key: str) -> Optional[Any]:
-        """Get cached value if not expired."""
-        if key not in self._cache:
-            return None
-        timestamp, value = self._cache[key]
-        if time.time() - timestamp > self._ttl:
-            del self._cache[key]
-            return None
-        return value
-    
-    def set(self, key: str, value: Any):
-        """Cache a value with TTL."""
-        self._cache[key] = (time.time(), value)
-    
-    def invalidate(self, key: Optional[str] = None):
-        """Invalidate specific key or entire cache."""
-        if key:
-            self._cache.pop(key, None)
-        else:
-            self._cache.clear()
-    
-    def size(self) -> int:
-        return len(self._cache)
-
-
-# Global clinic context cache
-_clinic_cache = TTLCache(ttl_seconds=CLINIC_CONTEXT_CACHE_TTL)
-
-
-# =============================================================================
 # LiveKit Imports
 # =============================================================================
 
@@ -216,7 +72,6 @@ from livekit.agents import (
     MetricsCollectedEvent,
     llm,  # For ChatContext
 )
-from livekit.agents.pipeline import VoicePipelineAgent  # type: ignore[import-not-found]
 from livekit.agents.llm import function_tool  # v1.2.14 decorator for tools
 from livekit.rtc import ParticipantKind  # For SIP participant detection
 from livekit.plugins import (
@@ -277,31 +132,6 @@ openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 calendar_store = SupabaseCalendarStore(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 BOOKED_STATUSES = ["scheduled", "confirmed"]
-
-# Valid call_sessions.outcome enum values (from Supabase schema)
-VALID_CALL_OUTCOMES = {
-    "booked",
-    "info_only",
-    "missed",
-    "transferred",
-    "voicemail",
-}
-
-
-def map_call_outcome(raw_outcome: Optional[str], booking_made: bool) -> str:
-    """
-    Maps internal call results to DB-safe call_outcome enum values.
-    NEVER returns an invalid enum.
-    """
-    if booking_made:
-        return "booked"
-
-    if raw_outcome in VALID_CALL_OUTCOMES:
-        return raw_outcome
-
-    # Fallback: No booking and call ended normally → info_only
-    return "info_only"
-
 
 # Google Calendar Config
 GOOGLE_CALENDAR_AUTH_MODE = os.getenv("GOOGLE_CALENDAR_AUTH", "oauth")
@@ -385,74 +215,14 @@ def speakable_phone(e164: Optional[str]) -> str:
         return " ".join(parts)
 
 
-def format_phone_for_speech(phone: str) -> str:
-    if not phone:
-        return "unknown"
-
-    digits = [d for d in phone if d.isdigit()]
-
-    # US-style grouping for human pacing
-    if len(digits) == 10:
-        return (
-            f"{digits[0]} {digits[1]} {digits[2]}, "
-            f"{digits[3]} {digits[4]} {digits[5]}, "
-            f"{digits[6]} {digits[7]} {digits[8]} {digits[9]}"
-        )
-
-    # Fallback: spaced digits
-    return " ".join(digits)
-
-def build_spoken_confirmation(state: "PatientState") -> str:
-    """
-    Build a warm, human-sounding booking confirmation for TTS.
-    Pauses are created ONLY via the final join, not inline ellipses.
-    
-    Called by confirm_and_book_appointment to ensure consistent,
-    non-robotic confirmation speech.
-    """
-    parts = []
-    
-    if state.full_name:
-        parts.append(f"Alright {state.full_name}")
-    
-    if state.reason and state.dt_local:
-        day = state.dt_local.strftime('%B %d')
-        time_str = state.dt_local.strftime('%I:%M %p').lstrip('0')
-        parts.append(
-            f"I've officially booked you for {state.reason} "
-            f"on {day} at {time_str}."
-        )
-    
-    if state.phone_e164:
-        parts.append(
-            "I'll send the details to your phone number "
-            f"{format_phone_for_speech(state.phone_e164)}."
-        )
-    
-    if state.email:
-        # Spaces in the email string slow down the TTS for clarity
-        spaced_email = state.email.replace("@", " at ").replace(".", " dot ")
-        parts.append(f"And I've got your email as {spaced_email}.")
-    
-    parts.append("Is there anything else I can help you with today?")
-    
-    return " … ".join(parts)
-
-
 def _ensure_phone_is_string(state: "PatientState") -> None:
     """
-    Safety guard: Ensure phone fields are always strings, not tuples.
+    Safety guard: Ensure state.phone_e164 is always a string, not a tuple.
     Call this after any phone assignment to catch tuple bugs.
     """
     if state.phone_e164 is not None and isinstance(state.phone_e164, tuple):
         logger.error(f"[PHONE BUG] state.phone_e164 was tuple: {state.phone_e164}. Extracting first element.")
         state.phone_e164 = state.phone_e164[0] if state.phone_e164 else None
-    if state.phone_pending is not None and isinstance(state.phone_pending, tuple):
-        logger.error(f"[PHONE BUG] state.phone_pending was tuple: {state.phone_pending}. Extracting first element.")
-        state.phone_pending = state.phone_pending[0] if state.phone_pending else None
-    if state.detected_phone is not None and isinstance(state.detected_phone, tuple):
-        logger.error(f"[PHONE BUG] state.detected_phone was tuple: {state.detected_phone}. Extracting first element.")
-        state.detected_phone = state.detected_phone[0] if state.detected_phone else None
 
 
 def _normalize_phone_preserve_plus(raw: Optional[str], default_region: str) -> Tuple[Optional[str], str]:
@@ -518,14 +288,10 @@ A_TIER_PROMPT = """You are {agent_name}, a receptionist for {clinic_name}.
 • Fields with '⏳' NEED CONFIRMATION — ask the user to confirm!
 
 ═══════════════════════════════════════════════════════════════════════════════
-🎯 HUMANITY & SARAH'S TONE
+🎯 HUMANITY
 ═══════════════════════════════════════════════════════════════════════════════
 Speak like a helpful receptionist. Use brief bridge phrases like "Let me check..." or 
 "Hmm..." ONLY when you are actually about to call a tool. Don't overuse them.
-
-• Sarah's tone: Warm and professional. Use natural pauses. 
-• Never use headers like 'Name:', 'Reason:', or 'Phone:' in speech — that sounds robotic.
-• When confirm_and_book_appointment returns a summary, read it EXACTLY as provided. Do not summarize or rephrase it.
 
 ═══════════════════════════════════════════════════════════════════════════════
 🛠️ TOOLS
@@ -538,16 +304,15 @@ Speak like a helpful receptionist. Use brief bridge phrases like "Let me check..
 ═══════════════════════════════════════════════════════════════════════════════
 📞 PHONE CONFIRMATION (MANDATORY - READ CAREFULLY!)
 ═══════════════════════════════════════════════════════════════════════════════
-• ONLY confirm phone AFTER name AND time are captured (contact phase started).
-• Confirm using last 4 digits: "I have a number ending in 7839 — is that okay?"
-• ⚡ CRITICAL: If state shows "PHONE: ⏳ ***XXXX" and user says "yes", "yeah", "correct", 
+• ALWAYS speak the FULL phone number for confirmation: "Is your number +92 335 189 7839?"
+• NEVER confirm with just last 4 digits — always say the complete number with country code.
+• ⚡ CRITICAL: If state shows "PHONE: ⏳ [Number]" and user says "yes", "yeah", "correct", 
   you MUST call confirm_phone(confirmed=True) IMMEDIATELY!
-• If user says "no" or provides a new number, call confirm_phone(confirmed=False, new_phone="...").
-• NEVER mention phone in greeting or during time scheduling — wait for contact phase.
+• Only mark confirmed AFTER user explicitly confirms with affirmative response.
 
 📍 REGION AWARENESS (INTERNATIONAL PHONES)
 ═══════════════════════════════════════════════════════════════════════════════
-• Accept international phone numbers (e.g., +92 format). Do NOT force a 10-digit format.
+• Accept and confirm international phone numbers (e.g., +92 format). Do NOT force a 10-digit format.
 
 ═══════════════════════════════════════════════════════════════════════════════
 🔄 SMART REVIEW (SINGLE-CHANGE OPTIMIZATION)
@@ -594,7 +359,7 @@ _GLOBAL_STATE: Optional["PatientState"] = None
 _GLOBAL_CLINIC_TZ: str = DEFAULT_TZ
 _GLOBAL_CLINIC_INFO: Optional[dict] = None  # For booking tool access
 _GLOBAL_AGENT_SETTINGS: Optional[dict] = None  # For DB-backed OAuth token refresh
-_REFRESH_AGENT_MEMORY: Optional[Callable[[], None]] = None  # Callback to refresh LLM system prompt
+_REFRESH_AGENT_MEMORY: Optional[callable] = None  # Callback to refresh LLM system prompt
 _GLOBAL_SCHEDULE: Optional[Dict[str, Any]] = None  # Scheduling config (working hours, lunch, durations)
 
 # =============================================================================
@@ -622,145 +387,6 @@ DEFAULT_LUNCH_BREAK: Dict[str, str] = {"start": "13:00", "end": "14:00"}
 # STANDALONE FUNCTION TOOLS (v1.2.14 @function_tool decorator)
 # =============================================================================
 
-# =============================================================================
-# Pydantic Tool Argument Models (Optional[str] fields for null-safe calls)
-# =============================================================================
-
-class UpdatePatientRecordArgs(BaseModel):
-    name: Optional[str] = None
-    phone: Optional[str] = None
-    email: Optional[str] = None
-    reason: Optional[str] = None
-    time_suggestion: Optional[str] = None
-
-
-class GetAvailableSlotsV2Args(BaseModel):
-    after_datetime: Optional[str] = None
-    preferred_day: Optional[str] = None
-    num_slots: Optional[str] = None
-
-
-class FindRelativeSlotsArgs(BaseModel):
-    start_search_time: Optional[str] = None
-    limit_to_day: Optional[str] = None
-    find_last: Optional[str] = None
-
-
-class SearchClinicInfoArgs(BaseModel):
-    query: Optional[str] = None
-
-
-def _sanitize_tool_arg(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    value = value.strip()
-    return value if value.lower() != "null" else None
-
-
-# =============================================================================
-# CONTEXT-AWARE SLOT INTERPRETATION (Fix #3)
-# =============================================================================
-
-def is_valid_email_strict(text: str) -> bool:
-    """Robust email validation requiring domain parts."""
-    if not text or "@" not in text or "." not in text:
-        return False
-    # Basic check: contains @, dot, no spaces
-    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text.strip()))
-
-def is_valid_phone_strict(text: str) -> bool:
-    """Strict phone check: requires sufficient digits for a real number."""
-    digits = re.sub(r"\D", "", text)
-    # Allow 7 digits (local w/o area code) to 15 digits (E.164)
-    return 7 <= len(digits) <= 15
-
-def is_fragment_of(fragment: str, full_value: str, slot_type: str) -> bool:
-    """
-    Check if 'fragment' is a substring or digit-subset of 'full_value'.
-    Used to detect when user is SPELLING out a value rather than replacing it.
-    """
-    if not full_value:
-        return False
-        
-    frag_clean = fragment.strip().lower()
-    full_clean = full_value.strip().lower()
-
-    if slot_type == "phone":
-        # Phone: compare digit sequences
-        d_frag = re.sub(r"\D", "", frag_clean)
-        d_full = re.sub(r"\D", "", full_clean)
-        # If fragment digits appear in full phone, it's a verification
-        return (len(d_frag) >= 2 and d_frag in d_full)
-    
-    if slot_type == "email":
-        # Email: check string containment or username part
-        # Example: "moiz" in "moiz123@gmail.com"
-        if frag_clean in full_clean:
-            return True
-        # Check digit parts (user often reads out digits in email)
-        d_frag = re.sub(r"\D", "", frag_clean)
-        d_full = re.sub(r"\D", "", full_clean)
-        if len(d_frag) >= 3 and d_frag in d_full:
-            return True
-            
-    return False
-
-def interpret_followup_for_slot(
-    slot_type: str, 
-    current_value: str, 
-    new_input: str
-) -> Tuple[str, Optional[str]]:
-    """
-    Decide action when a new value arrives while awaiting confirmation.
-    
-    Returns: (Action, Reason/Message)
-    Actions: "CONFIRM", "FRAGMENT", "CORRECTION", "OTHER"
-    """
-    new_clean = new_input.strip().lower()
-    
-    # 1. Detection Confirmation Keywords (explicit)
-    if YES_PAT.search(new_clean):
-        return "CONFIRM", "User explicitly confirmed"
-
-    # 2. Detect Fragments (Verification)
-    if is_fragment_of(new_input, current_value, slot_type):
-        return "FRAGMENT", f"Input '{new_input}' is a fragment of '{current_value}'"
-
-    # 3. Detect Corrections vs Noise
-    if slot_type == "email":
-        if is_valid_email_strict(new_input):
-            return "CORRECTION", "Valid new email provided"
-        # Invalid email and not a fragment -> likely noise or partial capture
-        return "FRAGMENT", "Invalid email format during verification - treating as fragment/noise"
-        
-    if slot_type == "phone":
-        if is_valid_phone_strict(new_input):
-            return "CORRECTION", "Valid new phone provided"
-        # Short digits not matching current -> likely noise?
-        # But if it's "no, 555" (and 555 not in current), it might be a partial correction.
-        # Safest: Treat as OTHER or FRAGMENT to avoid overwrite.
-        return "FRAGMENT", "Partial/Invalid phone during verification - treating as fragment"
-
-    return "OTHER", "Unrelated input"
-
-
-def contact_phase_allowed(state: "PatientState") -> bool:
-    """
-    SINGLE SOURCE OF TRUTH: Contact details can only be collected/confirmed
-    AFTER a valid time slot has been confirmed AND is available.
-    
-    Returns True only when:
-    - A datetime has been set (state.dt_local exists)
-    - The time has been validated as available (state.time_status == "valid")
-    - The slot availability has been confirmed (state.slot_available == True)
-    """
-    return (
-        state.time_status == "valid"
-        and state.dt_local is not None
-        and getattr(state, "slot_available", False) is True
-    )
-
-
 @function_tool(description="""
 Update the patient record with any information heard during conversation.
 Call this IMMEDIATELY when you hear: name, phone, email, reason for visit, or preferred time.
@@ -773,11 +399,11 @@ NEARBY SLOTS: If the requested time is TAKEN, this tool automatically finds and 
 nearby alternatives (e.g., "9:00 AM or 11:30 AM"). Simply offer these to the patient!
 """)
 async def update_patient_record(
-    name: Optional[str] = None,
-    phone: Optional[str] = None,
-    email: Optional[str] = None,
-    reason: Optional[str] = None,
-    time_suggestion: Optional[str] = None,
+    name: str = None,
+    phone: str = None,
+    email: str = None,
+    reason: str = None,
+    time_suggestion: str = None,
 ) -> str:
     """
     Update the internal patient record with extracted information.
@@ -793,12 +419,6 @@ async def update_patient_record(
     if not state:
         return "State not initialized."
     
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 🔒 IDEMPOTENCY CHECK — Prevent double-execution in same turn
-    # ═══════════════════════════════════════════════════════════════════════════
-    if state.check_tool_lock("update_patient_record", locals()):
-        return "Information already noted."
-    
     schedule = _GLOBAL_SCHEDULE or {}
     updates = []
     errors = []
@@ -806,8 +426,18 @@ async def update_patient_record(
     # ═══════════════════════════════════════════════════════════════════════════
     # 🛡️ INPUT SANITIZATION — Gracefully handle None, empty, or "null" values
     # ═══════════════════════════════════════════════════════════════════════════
-    def _sanitize_input(value: Optional[str]) -> Optional[str]:
-        return _sanitize_tool_arg(value)
+    def _sanitize_input(value) -> str:
+        """Return sanitized string or None if value should be ignored."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            # Coerce to string if somehow not a string
+            value = str(value)
+        stripped = value.strip()
+        # Treat empty strings and literal "null"/"none" as None
+        if not stripped or stripped.lower() in ("null", "none", "undefined"):
+            return None
+        return stripped
     
     # Sanitize all inputs before processing
     name = _sanitize_input(name)
@@ -817,90 +447,54 @@ async def update_patient_record(
     time_suggestion = _sanitize_input(time_suggestion)
     
     # === NAME ===
-    if name and state.should_update_field("name", state.full_name, name):
+    if name and not state.full_name:
         state.full_name = name.strip().title()
         updates.append(f"name={state.full_name}")
         logger.info(f"[TOOL] ✓ Name captured: {state.full_name}")
     
     # === PHONE ===
-    # Only update if explicitly corrected or captured for the first time
-    if phone:
-        # CONTEXT-AWARE VERIFICATION CHECK (Fix #3)
-        # If we just captured phone, treat fragments/confirmations as verification, NOT new data
-        if state.awaiting_slot_confirmation and state.last_captured_slot == "phone" and state.last_captured_phone:
-            action, reason = interpret_followup_for_slot("phone", state.last_captured_phone, phone)
+    if phone and not state.phone_e164:
+        # Use proper normalization with region awareness
+        clinic_region = (_GLOBAL_CLINIC_INFO or {}).get("default_phone_region", DEFAULT_PHONE_REGION)
+        clean_phone, last4 = _normalize_phone_preserve_plus(phone, clinic_region)
+        
+        if clean_phone:
+            state.phone_e164 = str(clean_phone)  # Enforce string type
+            state.phone_last4 = str(last4) if last4 else ""
+            # Safety guard: ensure no tuple was stored
+            _ensure_phone_is_string(state)
+            # NEVER auto-confirm phone - always require explicit user confirmation
+            state.phone_confirmed = False
+            state.phone_source = "user_spoken"
+            state.pending_confirm = "phone"
+            state.pending_confirm_field = "phone"  # Also set this for deterministic routing
             
-            if action in ["FRAGMENT", "CONFIRM"]:
-                state.slot_confirm_turns_left = max(0, state.slot_confirm_turns_left - 1)
-                logger.info(f"[TOOL] 🛡️ Validating phone... Ignoring overwrite '{phone}' ({reason})")
-                state.phone_verification_buffer += f" | {phone}"
-                # If confirmed, we could mark confirmed=True, but let's let confirm_phone tool handle explicit logic if needed.
-                # However, usually we just want to NOT wipe the state.
-                return f"Got it. I have your number ending in {state.phone_last4 or '...'}. Is that right?"
-
-        if state.should_update_field("phone", state.phone_pending or state.phone_e164, phone):
+            # Return message prompting agent to confirm FULL number
+            speakable = speakable_phone(state.phone_e164)
+            updates.append(f"phone={state.phone_e164} (NEEDS CONFIRMATION)")
+            logger.info(f"[TOOL] ⏳ Phone captured (needs confirmation): {state.phone_e164}")
             
-            # Use proper normalization with region awareness
-            clinic_region = (_GLOBAL_CLINIC_INFO or {}).get("default_phone_region", DEFAULT_PHONE_REGION)
-            clean_phone, last4 = _normalize_phone_preserve_plus(phone, clinic_region)
+            # Trigger memory refresh so LLM sees the pending confirmation
+            if _REFRESH_AGENT_MEMORY:
+                try:
+                    _REFRESH_AGENT_MEMORY()
+                except Exception:
+                    pass
             
-            if clean_phone:
-                state.phone_pending = str(clean_phone)
-                state.phone_last4 = str(last4) if last4 else ""
-                # Safety guard: ensure no tuple was stored
-                _ensure_phone_is_string(state)
-                # NEVER auto-confirm phone - always require explicit user confirmation
-                state.phone_confirmed = False
-                state.phone_source = "user_spoken"
-                
-                # ENTER VERIFICATION MODE
-                state.awaiting_slot_confirmation = True
-                state.last_captured_slot = "phone"
-                state.last_captured_phone = state.phone_pending or state.phone_e164
-                state.slot_confirm_turns_left = 2
-                state.phone_verification_buffer = ""
-                logger.info(f"[SLOT_CONFIRM] 🏁 Entering PHONE verification mode (2 turns)")
-
-                updates.append(f"phone_pending=***{state.phone_last4}")
-                logger.info(f"[TOOL] ⏳ Phone captured (pending confirmation): ***{state.phone_last4}")
+            # Return explicit instruction to confirm full number
+            return f"Phone captured as {speakable}. ASK USER TO CONFIRM THE FULL NUMBER: 'Just to confirm, is your phone number {speakable}?'"
     
     # === EMAIL ===
-    if email:
-        # CONTEXT-AWARE VERIFICATION CHECK (Fix #3)
-        if state.awaiting_slot_confirmation and state.last_captured_slot == "email" and state.last_captured_email:
-            action, reason = interpret_followup_for_slot("email", state.last_captured_email, email)
-            
-            if action in ["FRAGMENT", "CONFIRM"]:
-                state.slot_confirm_turns_left = max(0, state.slot_confirm_turns_left - 1)
-                logger.info(f"[TOOL] 🛡️ Validating email... Ignoring overwrite '{email}' ({reason})")
-                state.email_verification_buffer += f" | {email}"
-                return f"Understood. I have your email as {email_for_speech(state.last_captured_email)}."
-
-        if state.should_update_field("email", state.email, email):
-            clean_email = email.replace(" ", "").lower()
-            if "@" in clean_email and "." in clean_email:
-                state.email = clean_email
-                state.email_confirmed = False  # NEVER auto-confirm - always require explicit confirmation
-                
-                # ENTER VERIFICATION MODE
-                state.awaiting_slot_confirmation = True
-                state.last_captured_slot = "email"
-                state.last_captured_email = state.email
-                state.slot_confirm_turns_left = 2
-                state.email_verification_buffer = ""
-                logger.info(f"[SLOT_CONFIRM] 🏁 Entering EMAIL verification mode (2 turns)")
-
-                updates.append(f"email_pending={state.email}")
-                logger.info(f"[TOOL] ⏳ Email captured (pending confirmation): {state.email}")
-                # Only prompt confirmation if contact phase has started AND not already confirmed
-                if state.contact_phase_started and not state.email_confirmed:
-                    state.pending_confirm = "email"
-                    state.pending_confirm_field = "email"
-                    return f"Email captured as {email_for_speech(state.email)}. Please confirm: 'Is your email {email_for_speech(state.email)}?'"
-            # Otherwise, silently store - will confirm later in contact phase
+    if email and not state.email:
+        clean_email = email.replace(" ", "").lower()
+        if "@" in clean_email and "." in clean_email:
+            state.email = clean_email
+            state.email_confirmed = True
+            updates.append(f"email={state.email}")
+            logger.info(f"[TOOL] ✓ Email captured: {state.email}")
     
     # === REASON (with duration lookup) ===
-    if reason and state.should_update_field("reason", state.reason, reason):
+    if reason and not state.reason:
         state.reason = reason.strip()
         # Lookup duration from treatment_durations config
         state.duration_minutes = get_duration_for_service(state.reason, schedule)
@@ -908,8 +502,7 @@ async def update_patient_record(
         logger.info(f"[TOOL] ✓ Reason captured: {state.reason}, duration: {state.duration_minutes}m")
     
     # === TIME (with validation and availability check) ===
-    if time_suggestion and state.should_update_field("time", state.dt_text or state.dt_local, time_suggestion):
-        # 1. Capture user intent first
+    if time_suggestion and not state.dt_local:
         state.dt_text = time_suggestion.strip()
         state.time_status = "validating"
         
@@ -917,82 +510,11 @@ async def update_patient_record(
         logger.info(f"[TOOL] ⏰ Checking time: {time_suggestion}...")
         
         try:
-            # FIX 4: Date Locking Rule
-            # Detect correction intent to allow overrides
-            is_correction = has_correction_intent(time_suggestion)
-            allow_date_override = not state.date_confirmed or is_correction
-
             # Use parse_datetime_natural for robust relative date handling
             # Handles "tomorrow at 3:30 PM", "next Monday", etc. correctly
             parsed = parse_datetime_natural(time_suggestion, tz_hint=_GLOBAL_CLINIC_TZ)
             
             if parsed:
-                # 2. REJECTION CHECK: If user is repeating a rejected time?
-                # Usually we trust the user if they insist, but let's log it.
-                if state.is_slot_rejected(parsed):
-                     logger.warning(f"[TOOL] User requested previously rejected slot: {parsed}")
-
-                # FIX 4: Date Logic
-                date_input = parsed.date()
-                time_input = parsed.time()
-                
-                # Heuristic: Did input contain a date?
-                # If parse_datetime_natural changed the date from TODAY/TOMORROW default, or user used date keywords
-                has_date_keywords = any(w in time_suggestion.lower() for w in [
-                    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
-                    "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
-                    "tomorrow", "today", "next week", "following", "date"
-                ])
-                # Also check digits like "23rd" or "1/23"
-                has_date_digits = bool(re.search(r"\d+(?:st|nd|rd|th)|/\d+", time_suggestion))
-                input_has_date = has_date_keywords or has_date_digits
-
-                # Heuristic: Did input contain a time?
-                input_has_time = bool(re.search(r"\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?|\b(?:noon|midnight|morning|afternoon|evening)\b", time_suggestion, re.IGNORECASE))
-
-                # If date is confirmed and NO correction intent, frame the parsed time on the confirmed date
-                if state.date_confirmed and not allow_date_override:
-                     # Check if parsed date implies a change (e.g. user said "tomorrow" but confirm date is "Jan 23")
-                     # If input DOES NOT have explicit date, we FORCE the confirmed date
-                     if not input_has_date:
-                         # Determine the date to use - prefer dt_local, then proposed_date, fallback to parsed date
-                         use_date = state.dt_local.date() if state.dt_local else (state.proposed_date or parsed.date())
-                         parsed = datetime.combine(use_date, time_input)
-                         parsed = parsed.replace(tzinfo=ZoneInfo(_GLOBAL_CLINIC_TZ))
-                         logger.info(f"[DATE] Override blocked (date_confirmed=True). Forcing date: {parsed.date()}")
-                     else:
-                         logger.info(f"[DATE] Date mentioned ({time_suggestion}) but date_confirmed=True. Allowing check.")
-                
-                # Update Candidate logic
-                if input_has_date and input_has_time:
-                    # Date + Time together -> Confirm Date
-                    state.proposed_date = parsed.date()
-                    state.date_confirmed = True
-                    state.date_source = "date_time_together"
-                    logger.info(f"[DATE] Date confirmed because date+time provided together: {state.proposed_date}")
-                
-                elif input_has_date and not input_has_time:
-                    # Date only -> Candidate
-                    if allow_date_override:
-                        state.proposed_date = parsed.date()
-                        state.date_confirmed = False
-                        state.date_source = "inferred"
-                        logger.info(f"[DATE] Candidate date set (not confirmed): {state.proposed_date}")
-                        # If date only, return confirmation question for date
-                        day_str = parsed.strftime("%A, %B %d")
-                        return f"Just to confirm, you want to come in on {day_str}?"
-                
-                elif not input_has_date and input_has_time:
-                    # Time only -> Use existing proposed/confirmed date
-                    if state.proposed_date:
-                        parsed = datetime.combine(state.proposed_date, time_input)
-                        parsed = parsed.replace(tzinfo=ZoneInfo(_GLOBAL_CLINIC_TZ))
-                        logger.info(f"[DATE] Using proposed date {state.proposed_date} with new time {time_input}")
-                    elif state.dt_local:
-                        # Use previous dt_local date
-                        parsed = datetime.combine(state.dt_local.date(), time_input)
-                        parsed = parsed.replace(tzinfo=ZoneInfo(_GLOBAL_CLINIC_TZ))
-
                 # parse_datetime_natural already applies timezone
                 logger.info(f"[TOOL] ⏰ Parsed '{time_suggestion}' → {parsed.isoformat()}")
 
@@ -1016,17 +538,11 @@ async def update_patient_record(
                         slot_free = await is_slot_free_supabase(clinic_id, parsed, slot_end)
                         
                         if not slot_free:
-
                             # Slot is taken - find nearby alternatives AROUND THE REQUESTED TIME
                             # NOT from "now" - this is the key fix for the scheduling bug
                             state.time_status = "invalid"
                             state.time_error = "That slot is already taken"
-                            # Add rejection to history
-                            state.add_rejected_slot(parsed, reason="slot_taken")
-                            
-                            # PROTECTIVE CLEAR: Clear dt_local but preserve everything else
                             state.dt_local = None
-                            state.assert_integrity("time_rejection_taken")
                             
                             logger.info(f"[TOOL] ✗ {time_spoken} on {parsed.strftime('%b %d')} is booked, searching for nearby alternatives")
                             
@@ -1042,18 +558,12 @@ async def update_patient_record(
                                 step_min=15,
                             )
                             
-                            # Filter out previously rejected slots from alternatives
-                            valid_alternatives = [a for a in alternatives if not state.is_slot_rejected(a)]
+                            logger.info(f"[TOOL] Found {len(alternatives)} nearby alternatives around {parsed.strftime('%H:%M')}")
                             
-                            if len(valid_alternatives) < len(alternatives):
-                                logger.info(f"[TOOL] Filtered out {len(alternatives) - len(valid_alternatives)} rejected alternatives")
-
-                            logger.info(f"[TOOL] Found {len(valid_alternatives)} valid alternatives around {parsed.strftime('%H:%M')}")
-                            
-                            if valid_alternatives:
+                            if alternatives:
                                 # Format alternatives for speech - include date if different from requested
                                 alt_descriptions = []
-                                for alt in valid_alternatives:
+                                for alt in alternatives:
                                     alt_time_str = alt.strftime("%I:%M %p").lstrip("0")
                                     if alt.date() == parsed.date():
                                         alt_descriptions.append(alt_time_str)
@@ -1074,27 +584,12 @@ async def update_patient_record(
                     state.dt_local = parsed
                     state.time_status = "valid"
                     state.time_error = None
-                    state.slot_available = True  # CRITICAL: Mark slot as confirmed available
                     time_formatted = parsed.strftime('%B %d at %I:%M %p')
                     updates.append(f"time={time_formatted} ({state.duration_minutes}m slot)")
                     logger.info(f"[TOOL] ✓ Time validated and available: {parsed.isoformat()}")
-
-                    # Start contact phase only after name + valid time + slot available
-                    if state.full_name and state.dt_local and state.slot_available:
-                        state.contact_phase_started = True
-
-                    # If we have a detected/pending phone now, ask for confirmation (last 4 only)
-                    if contact_phase_allowed(state) and not state.phone_confirmed:
-                        if not state.phone_pending and state.detected_phone:
-                            state.phone_pending = state.detected_phone
-                        if state.phone_pending and state.phone_last4:
-                            state.pending_confirm = "phone"
-                            state.pending_confirm_field = "phone"
-                            return f"... ah, perfect! {day_spoken} at {time_spoken} is open. I have a number ending in {state.phone_last4} — is that okay?"
-
+                    
                     # Sonic-3 prosody: breathy confirmation with ellipses
-                    # CRITICAL: Phrase forces LLM to understand booking is NOT complete yet
-                    return f"... ah, perfect! {day_spoken} at {time_spoken} is open and I've noted that. I'll book it for you once we finish the rest of the details."
+                    return f"... ah, perfect! {day_spoken} at {time_spoken} is open. I've got that down."
                 else:
                     # Time is invalid (lunch, after-hours, holiday)
                     state.time_status = "invalid"
@@ -1102,8 +597,6 @@ async def update_patient_record(
                     state.dt_local = None  # Don't save invalid time
                     
                     logger.warning(f"[TOOL] ✗ Time rejected: {error_msg}")
-                    # Assert integration to catch partial wipe bugs
-                    state.assert_integrity("time_invalid_logic")
                     
                     # Check if it's a lunch break - give a helpful response with Sonic-3 prosody
                     if "lunch" in error_msg.lower():
@@ -1120,7 +613,6 @@ async def update_patient_record(
                     
                     errors.append(error_msg)
             else:
-                # Parsing failed or None result (e.g. user said "No" or "Cancel")
                 state.time_status = "pending"
                 updates.append(f"time_text={time_suggestion}")
                 
@@ -1129,24 +621,6 @@ async def update_patient_record(
             state.time_status = "pending"
             updates.append(f"time_text={time_suggestion}")
     
-    # Start contact phase only after name + valid time + slot available
-    if state.full_name and state.dt_local and state.slot_available:
-        state.contact_phase_started = True
-
-    # If we have a detected/pending phone and contact phase is active, prompt confirmation (last 4 only)
-    if contact_phase_allowed(state) and not state.phone_confirmed:
-        if not state.phone_pending and state.detected_phone:
-            state.phone_pending = state.detected_phone
-        if state.phone_pending and state.phone_last4 and state.pending_confirm != "phone":
-            state.pending_confirm = "phone"
-            state.pending_confirm_field = "phone"
-            if _REFRESH_AGENT_MEMORY:
-                try:
-                    _REFRESH_AGENT_MEMORY()
-                except Exception:
-                    pass
-            return f"I have a number ending in {state.phone_last4} — is that okay?"
-
     # Trigger memory refresh so LLM sees updated state
     if _REFRESH_AGENT_MEMORY:
         try:
@@ -1181,11 +655,6 @@ async def get_available_slots() -> str:
     global _GLOBAL_STATE, _GLOBAL_CLINIC_INFO, _GLOBAL_SCHEDULE, _GLOBAL_CLINIC_TZ
     
     state = _GLOBAL_STATE
-    
-    # IDEMPOTENCY CHECK
-    if state and state.check_tool_lock("get_available_slots", locals()):
-        return "Checking..."
-        
     clinic_info = _GLOBAL_CLINIC_INFO
     schedule = _GLOBAL_SCHEDULE or {}
     
@@ -1259,8 +728,8 @@ Returns slots that match the constraints, respecting working hours and lunch bre
 Automatically skips lunch break (1pm-2pm) and provides helpful messaging.
 """)
 async def get_available_slots_v2(
-    after_datetime: Optional[str] = None,
-    preferred_day: Optional[str] = None,
+    after_datetime: str = None,
+    preferred_day: str = None,
     num_slots: int = 3,
 ) -> str:
     """
@@ -1275,11 +744,6 @@ async def get_available_slots_v2(
     global _GLOBAL_STATE, _GLOBAL_CLINIC_INFO, _GLOBAL_SCHEDULE, _GLOBAL_CLINIC_TZ
     
     state = _GLOBAL_STATE
-    
-    # IDEMPOTENCY CHECK
-    if state and state.check_tool_lock("get_available_slots_v2", locals()):
-        return "Checking constraints..."
-        
     clinic_info = _GLOBAL_CLINIC_INFO
     schedule = _GLOBAL_SCHEDULE or {}
     
@@ -1290,10 +754,6 @@ async def get_available_slots_v2(
     tz = ZoneInfo(_GLOBAL_CLINIC_TZ)
     now = datetime.now(tz)
     
-    # Sanitize optional args
-    after_datetime = _sanitize_tool_arg(after_datetime)
-    preferred_day = _sanitize_tool_arg(preferred_day)
-
     # Parse after_datetime constraint
     search_start = now
     if after_datetime:
@@ -1440,13 +900,6 @@ async def get_available_slots_v2(
                 constraint_desc += f" on {preferred_day}"
             return f"... hmm, I don't see any openings{constraint_desc} in the next week. Would you like me to check a different day?"
         
-        # FILTER: Exclude rejected slots
-        available_slots = [
-            s for s in available_slots if not (state and state.is_slot_rejected(s))
-        ]
-        if not available_slots:
-             return "... hmm, I don't see any other openings in that time window. Would you like to try a different day?"
-
         # Format slots for natural speech (Sonic-3 optimized)
         slot_strings = []
         for slot in available_slots:
@@ -1496,8 +949,8 @@ Parameters:
 Returns the best matching slot with Sonic-3 prosody formatting.
 """)
 async def find_relative_slots(
-    start_search_time: Optional[str] = None,
-    limit_to_day: Optional[str] = None,
+    start_search_time: str = None,
+    limit_to_day: str = None,
     find_last: bool = False,
 ) -> str:
     """
@@ -1512,11 +965,6 @@ async def find_relative_slots(
     global _GLOBAL_STATE, _GLOBAL_CLINIC_INFO, _GLOBAL_SCHEDULE, _GLOBAL_CLINIC_TZ
     
     state = _GLOBAL_STATE
-    
-    # IDEMPOTENCY CHECK
-    if state and state.check_tool_lock("find_relative_slots", locals()):
-        return "Searching..."
-        
     clinic_info = _GLOBAL_CLINIC_INFO
     schedule = _GLOBAL_SCHEDULE or {}
     
@@ -1527,10 +975,6 @@ async def find_relative_slots(
     tz = ZoneInfo(_GLOBAL_CLINIC_TZ)
     now = datetime.now(tz)
     
-    # Sanitize optional args
-    start_search_time = _sanitize_tool_arg(start_search_time)
-    limit_to_day = _sanitize_tool_arg(limit_to_day)
-
     # Parse start_search_time
     search_start = now
     target_date = None
@@ -1648,14 +1092,6 @@ async def find_relative_slots(
             time_desc = start_search_time or "that time"
             return f"... hmm, I don't see any openings after {time_desc} in the next 2 weeks. Would you like me to check a different day?"
         
-        # FILTER: Exclude rejected slots
-        original_count = len(available_slots)
-        available_slots = [
-            s for s in available_slots if not (state and state.is_slot_rejected(s))
-        ]
-        if not available_slots:
-             return "... hmm, I don't see any other times that typically work. Maybe try a different day?"
-
         # If find_last, return the last slot found
         if find_last:
             best_slot = available_slots[-1]
@@ -1692,16 +1128,14 @@ async def find_relative_slots(
 
 
 @function_tool(description="""
-Confirm the phone number with the patient. Call this ONLY after the contact phase is started.
-Example: "I have a number ending in 7839 — is that okay?"
+Confirm the phone number with the patient. Call this ONLY after reading back the FULL phone number.
+NEVER confirm based on just last 4 digits - always speak the complete number including country code.
+Example: "Just to confirm, is your number +92 335 189 7839?"
 
 IMPORTANT: When user says "yes", "yeah", "correct" etc., call confirm_phone(confirmed=True).
 When user says "no", "wrong", "incorrect", call confirm_phone(confirmed=False).
-
-SMART CAPTURE: You can also pass a phone_number to save it before confirming.
-Example: confirm_phone(confirmed=True, phone_number="+923351234567") saves AND confirms in one call.
 """)
-async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None, phone_number: Optional[str] = None) -> str:
+async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None) -> str:
     """
     Mark phone as confirmed or update with correction.
     
@@ -1713,26 +1147,14 @@ async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None, phone_
     state = _GLOBAL_STATE
     if not state:
         return "State not initialized."
-
-    # IDEMPOTENCY CHECK
-    if state.check_tool_lock("confirm_phone", locals()):
-        return "Phone confirmation noted."
     
-    # Gate: Do NOT confirm phone if contact phase hasn't started
-    if not contact_phase_allowed(state):
-        logger.debug("[TOOL] confirm_phone blocked - contact phase not started")
-        return "Continue the conversation. Confirm the appointment time first."
-    
-    # Smart capture: phone_number param takes priority over new_phone for backwards compat
-    new_phone = _sanitize_tool_arg(phone_number) or _sanitize_tool_arg(new_phone)
-
     if new_phone:
         # User provided a correction - use proper normalization
         clinic_region = (_GLOBAL_CLINIC_INFO or {}).get("default_phone_region", DEFAULT_PHONE_REGION)
         clean_phone, last4 = _normalize_phone_preserve_plus(new_phone, clinic_region)
         
         if clean_phone:
-            state.phone_pending = str(clean_phone)  # Enforce string type
+            state.phone_e164 = str(clean_phone)  # Enforce string type
             state.phone_last4 = str(last4) if last4 else ""
             # Safety guard
             _ensure_phone_is_string(state)
@@ -1742,43 +1164,26 @@ async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None, phone_
             state.pending_confirm = "phone"
             state.pending_confirm_field = "phone"
             
-            # ENTER VERIFICATION MODE (Fix #3)
-            state.awaiting_slot_confirmation = True
-            state.last_captured_slot = "phone"
-            state.last_captured_phone = state.phone_pending
-            state.slot_confirm_turns_left = 2
-            state.phone_verification_buffer = ""
-            logger.info(f"[SLOT_CONFIRM] 🏁 Entering PHONE verification mode (via confirm_phone correction)")
-            
-            logger.info(f"[TOOL] ⏳ Phone updated (pending) ***{state.phone_last4}")
+            speakable = speakable_phone(state.phone_e164)
+            logger.info(f"[TOOL] ⏳ Phone updated to {state.phone_e164}, needs re-confirmation")
             # Trigger memory refresh
             if _REFRESH_AGENT_MEMORY:
                 try:
                     _REFRESH_AGENT_MEMORY()
                 except Exception:
                     pass
-            return f"I have a number ending in {state.phone_last4} — is that okay?"
+            return f"Phone updated to {speakable}. Please confirm the FULL number: 'Is your number {speakable}?'"
         else:
             return f"Could not parse phone number '{new_phone}'. Ask user to repeat clearly."
     
     if confirmed:
-        if not state.phone_pending and state.detected_phone:
-            state.phone_pending = state.detected_phone
-        if not state.phone_pending:
+        if not state.phone_e164:
             return "No phone number to confirm. Ask for phone number first."
         # Safety guard before confirming
         _ensure_phone_is_string(state)
-        state.phone_e164 = str(state.phone_pending)  # Enforce string type - prevents tuple DB/calendar errors
         state.phone_confirmed = True
         state.pending_confirm = None if state.pending_confirm == "phone" else state.pending_confirm
         state.pending_confirm_field = None if state.pending_confirm_field == "phone" else state.pending_confirm_field
-        
-        # EXIT VERIFICATION MODE (Fix #3)
-        state.awaiting_slot_confirmation = False
-        state.last_captured_slot = None
-        state.slot_confirm_turns_left = 0
-        logger.info(f"[SLOT_CONFIRM] ✅ Phone CONFIRMED by tool - Exiting verification mode")
-        
         logger.info(f"[TOOL] ✓ Phone CONFIRMED: {state.phone_e164}")
         # Trigger memory refresh
         if _REFRESH_AGENT_MEMORY:
@@ -1789,21 +1194,13 @@ async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None, phone_
         return "Phone confirmed! Continue gathering remaining info."
     else:
         # User said "no" - clear and re-ask
-        old_phone = state.phone_pending or state.detected_phone or state.phone_e164
-        state.phone_pending = None
-        state.detected_phone = None
+        old_phone = state.phone_e164
         state.phone_e164 = None
         state.phone_last4 = None
         state.phone_confirmed = False
         state.phone_source = None
         state.pending_confirm = None if state.pending_confirm == "phone" else state.pending_confirm
         state.pending_confirm_field = None if state.pending_confirm_field == "phone" else state.pending_confirm_field
-        
-        # EXIT VERIFICATION MODE (Fix #3)
-        state.awaiting_slot_confirmation = False
-        state.last_captured_slot = None
-        logger.info(f"[SLOT_CONFIRM] ❌ Phone REJECTED by tool - Exiting verification mode")
-        
         logger.info(f"[TOOL] ✗ Phone REJECTED (was {old_phone}), cleared")
         # Trigger memory refresh
         if _REFRESH_AGENT_MEMORY:
@@ -1816,56 +1213,16 @@ async def confirm_phone(confirmed: bool, new_phone: Optional[str] = None, phone_
 
 @function_tool(description="""
 Confirm the email address with the patient. Call this after spelling it back.
-
-SMART CAPTURE: You can also pass an email_address to save it before confirming.
-Example: confirm_email(confirmed=True, email_address="patient@example.com") saves AND confirms in one call.
 """)
-async def confirm_email(confirmed: bool, email_address: Optional[str] = None) -> str:
-    """Mark email as confirmed or rejected. Optionally saves email_address before confirming."""
+async def confirm_email(confirmed: bool) -> str:
+    """Mark email as confirmed or rejected."""
     global _GLOBAL_STATE
     state = _GLOBAL_STATE
     if not state:
         return "State not initialized."
-
-    # IDEMPOTENCY CHECK
-    if state.check_tool_lock("confirm_email", locals()):
-        return "Email confirmation noted."
-    
-    # Smart capture: Save email_address if provided before confirming
-    email_address = _sanitize_tool_arg(email_address)
-    if email_address:
-        state.email = email_address.strip().lower()
-        logger.info(f"[TOOL] Email saved via smart capture: {state.email}")
-    
-    # Idempotent guard: Do NOT re-confirm if already confirmed
-    if state.email_confirmed:
-        logger.debug("[TOOL] confirm_email skipped - already confirmed")
-        # Clear pending state to prevent re-triggering
-        if state.pending_confirm == "email":
-            state.pending_confirm = None
-        if state.pending_confirm_field == "email":
-            state.pending_confirm_field = None
-        return "Email already confirmed. Continue with next step."
-    
-    # Gate: Do NOT confirm email if contact phase hasn't started
-    if not contact_phase_allowed(state):
-        logger.debug("[TOOL] confirm_email blocked - contact phase not started")
-        return "Continue the conversation. Confirm the appointment time first."
     
     if confirmed:
         state.email_confirmed = True
-        # Clear pending confirmation to prevent re-triggering
-        if state.pending_confirm == "email":
-            state.pending_confirm = None
-        if state.pending_confirm_field == "email":
-            state.pending_confirm_field = None
-            
-        # EXIT VERIFICATION MODE (Fix #3)
-        state.awaiting_slot_confirmation = False
-        state.last_captured_slot = None
-        state.slot_confirm_turns_left = 0
-        logger.info(f"[SLOT_CONFIRM] ✅ Email CONFIRMED by tool - Exiting verification mode")
-        
         logger.info("[TOOL] ✓ Email confirmed")
         # Trigger memory refresh
         if _REFRESH_AGENT_MEMORY:
@@ -1877,12 +1234,6 @@ async def confirm_email(confirmed: bool, email_address: Optional[str] = None) ->
     else:
         state.email = None
         state.email_confirmed = False
-        
-        # EXIT VERIFICATION MODE (Fix #3)
-        state.awaiting_slot_confirmation = False
-        state.last_captured_slot = None
-        logger.info(f"[SLOT_CONFIRM] ❌ Email REJECTED by tool - Exiting verification mode")
-        
         logger.info("[TOOL] ✗ Email rejected, cleared")
         # Trigger memory refresh
         if _REFRESH_AGENT_MEMORY:
@@ -1903,12 +1254,6 @@ async def check_booking_status() -> str:
     state = _GLOBAL_STATE
     if not state:
         return "State not initialized."
-
-    # IDEMPOTENCY CHECK
-    if state.check_tool_lock("check_booking_status", locals()):
-        # For status checks, duplicate reads are harmless but redundant.
-        # However, to reduce improved latency, skipping is fine if result won't change.
-        return "Status already checked."
     
     collected = []
     missing = []
@@ -1972,35 +1317,13 @@ async def confirm_and_book_appointment() -> str:
     if not state:
         return "State not initialized."
     
-    # IDEMPOTENCY CHECK
-    if state.check_tool_lock("confirm_and_book_appointment", locals()):
-        return "Booking request already processed."
-    
-    # FIX 3: Enhanced logging visibility for debugging false bookings
-    is_complete = state.is_complete()
-    logger.info(f"[BOOKING] Tool triggered. State complete: {is_complete}")
-    
-    if not is_complete:
+    if not state.is_complete():
         missing = state.missing_slots()
-        logger.warning(f"[BOOKING] Cannot book - missing slots: {missing}")
-        return f"Missing: {', '.join(missing)}. Continue gathering info before booking."
-    
-    # CRITICAL SAFETY GATE: Booking REQUIRES confirmed contact details
-    if not state.phone_confirmed:
-        return "Phone number not confirmed yet. Please confirm phone before booking."
-    if not state.email_confirmed:
-        return "Email not confirmed yet. Please confirm email before booking."
-    
-    # DOUBLE BOOKING GUARD
-    # Create unique booking key based on time + phone
-    booking_key = f"{state.dt_local.isoformat() if state.dt_local else 'None'}:{state.phone_e164}"
+        return f"Cannot book yet. Missing: {', '.join(missing)}. Continue gathering info."
     
     if state.booking_confirmed:
-        if state.last_booking_key == booking_key:
-             return "Appointment already booked! Tell the user their appointment is confirmed."
-        else:
-             return "An appointment is already confirmed. Ask if they want to book another."
-             
+        return "Appointment already booked! Tell the user their appointment is confirmed."
+    
     if state.booking_in_progress:
         return "Booking already in progress. Please wait."
     
@@ -2009,7 +1332,6 @@ async def confirm_and_book_appointment() -> str:
     
     # Mark booking in progress
     state.booking_in_progress = True
-    state.last_booking_key = booking_key
     
     try:
         # Get calendar auth with DB-first priority and refresh callback
@@ -2033,9 +1355,6 @@ async def confirm_and_book_appointment() -> str:
             return "Calendar unavailable. Tell the user to try again."
         
         start_dt = state.dt_local
-        if not start_dt:
-            state.booking_in_progress = False
-            return "No appointment time set. Please select a time first."
         end_dt = start_dt + timedelta(minutes=state.duration_minutes)  # Use service-specific duration
         
         # Check availability
@@ -2076,10 +1395,7 @@ async def confirm_and_book_appointment() -> str:
             asyncio.create_task(book_to_supabase(clinic_info, state, event.get("id")))
             
             logger.info(f"[BOOKING] ✓ SUCCESS! Event ID: {event.get('id')}")
-            
-            # Build warm, human-sounding confirmation for TTS
-            spoken_confirmation = build_spoken_confirmation(state)
-            return f"BOOKING CONFIRMED! Read this exactly to the user: {spoken_confirmation}"
+            return f"BOOKING CONFIRMED! Tell the user: Your appointment is confirmed for {start_dt.strftime('%A, %B %d at %I:%M %p')}. A confirmation email will be sent to {state.email}."
         else:
             state.booking_in_progress = False
             return "Booking failed. Ask the user to try again."
@@ -2098,23 +1414,13 @@ location, services, or any clinic-specific details. Call this IMMEDIATELY when t
 user asks about anything not related to booking (e.g., 'Where do I park?', 
 'Do you accept Delta Dental?', 'How much is a cleaning?').
 """)
-async def search_clinic_info(query: Optional[str] = None) -> str:
+async def search_clinic_info(query: str) -> str:
     """
     A-Tier RAG: Non-blocking semantic search against Supabase knowledge base.
     Uses text-embedding-3-small for <100ms embedding latency.
     """
-    global _GLOBAL_CLINIC_INFO, _GLOBAL_STATE
+    global _GLOBAL_CLINIC_INFO
     
-    # IDEMPOTENCY CHECK
-    # We allow repeated searches if query is different, but not same query in same turn
-    if _GLOBAL_STATE and _GLOBAL_STATE.check_tool_lock("search_clinic_info", locals()):
-        return "Searching..."
-        
-    query = _sanitize_tool_arg(query)
-
-    if not query:
-        return "What would you like to know about the clinic?"
-
     if not _GLOBAL_CLINIC_INFO:
         return "I'm sorry, I'm having trouble accessing the office records for this location."
     
@@ -2144,13 +1450,11 @@ async def search_clinic_info(query: Optional[str] = None) -> str:
             logger.info(f"[RAG] No matches for query: {query}")
             return "I don't have that specific info in my notes right now."
         
-        # Cast result.data to list for type safety
-        data_list = cast(List[Dict[str, Any]], result.data)
-        logger.info(f"[RAG] Search successful. Found {len(data_list)} articles.")
+        logger.info(f"[RAG] Search successful. Found {len(result.data)} articles.")
 
         # 3. Format results concisely for speech
         answers = []
-        for r in data_list:
+        for r in result.data:
             body = r.get("body", "").strip()
             if body:
                 answers.append(body)
@@ -2199,31 +1503,6 @@ EMERGENCY_PAT = re.compile(
     re.IGNORECASE,
 )
 
-# FIX 4: Correction Intent Helper
-def has_correction_intent(text: str) -> bool:
-    """Detect if user is trying to correct a previous value."""
-    if not text:
-        return False
-    # Common correction phrases
-    patterns = [
-        r"\bactually\b",
-        r"\bno\b",
-        r"\bnope\b",
-        r"\bnot\s+that\b",
-        r"\bsorry\b",
-        r"\bi\s+mean\b",
-        r"\bchange\s+it\b",
-        r"\binstead\b",
-        r"\bmake\s+it\b",
-        r"\brather\b",
-        r"\bdifferent\s+day\b",
-        r"\banother\s+day\b",
-        r"\bwrong\b",
-        r"\bmistake\b"
-    ]
-    regex = re.compile("|".join(patterns), re.IGNORECASE)
-    return bool(regex.search(text))
-
 
 # =============================================================================
 # SLOT STATE — Clean State Container
@@ -2233,51 +1512,17 @@ def has_correction_intent(text: str) -> bool:
 class PatientState:
     """Clean state container for patient booking info."""
     full_name: Optional[str] = None
-    phone_e164: Optional[str] = None  # Final confirmed phone
+    phone_e164: Optional[str] = None
     phone_last4: Optional[str] = None
     email: Optional[str] = None
     reason: Optional[str] = None
     dt_local: Optional[datetime] = None
     dt_text: Optional[str] = None  # Natural language time before parsing
     
-    # IDEMPOTENCY & LOCKING
-    # Tracks unique turn ID to prevent duplicate tool execution
-    turn_id: Optional[str] = None
-    turn_count: int = 0
-    last_user_text: Optional[str] = None
-    # executed_tools: Dict[turn_id, Set[tool_signature]]
-    executed_tools: Dict[str, Set[str]] = field(default_factory=dict)
-    # Booking lock to prevent duplicate bookings
-    last_booking_key: Optional[str] = None 
-    
-    # REJECTION HANDLING
-    rejected_slots: Set[str] = field(default_factory=set)  # Set of rejected time strings/keys
-    
-    # ═══════════════════════════════════════════════════════════════════════════
-    # CONTEXT-AWARE SLOT CONFIRMATION (Fix #3)
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Tracks short-term verification mode to prevent "67932" overwriting full email
-    awaiting_slot_confirmation: bool = False
-    last_captured_slot: Optional[str] = None  # "email" | "phone"
-    slot_confirm_turns_left: int = 0
-    
-    # Snapshots for reversion logic
-    last_captured_email: Optional[str] = None
-    last_captured_phone: Optional[str] = None
-    
-    # Buffers to hold fragments (logging only)
-    email_verification_buffer: str = ""
-    phone_verification_buffer: str = ""
-    
     # Duration tracking (from treatment_durations config)
     duration_minutes: int = 60  # Default 60 min, updated when reason is set
     time_status: str = "pending"  # "pending", "validating", "valid", "invalid"
     time_error: Optional[str] = None  # Error message if time is invalid
-    slot_available: bool = False  # True ONLY when slot is confirmed available
-    
-    # Phone lifecycle: detected_phone → phone_pending → phone_e164 (confirmed)
-    detected_phone: Optional[str] = None  # From SIP, never spoken aloud
-    phone_pending: Optional[str] = None   # Waiting for user confirmation
     
     # Confirmations
     phone_confirmed: bool = False
@@ -2286,9 +1531,6 @@ class PatientState:
     
     # Phone source tracking (for confirmation UX)
     phone_source: Optional[str] = None  # "sip", "user_spoken", "extracted"
-    
-    # Contact phase gating - phone MUST NOT be mentioned until this is True
-    contact_phase_started: bool = False
     
     # Review flow tracking
     review_presented: bool = False  # True after review summary shown
@@ -2303,146 +1545,10 @@ class PatientState:
     booking_in_progress: bool = False
     calendar_event_id: Optional[str] = None
     
-    # FIX 4: Date Locking Rule
-    date_confirmed: bool = False
-    date_source: Optional[str] = None  # "explicit_confirmed" | "date_time_together" | "inferred" | None
-    proposed_date: Optional[date] = None  # Tentative date candidate
-    confirmation_pending_for_date: bool = False
-    last_date_candidate: Optional[date] = None
-    
-    # FIX 5: One Filler Per Turn
-    filler_active: bool = False
-    filler_turn_id: Optional[str] = None
-    filler_task: Any = None  # asyncio.Task
-    current_turn_id: Optional[str] = None
-    last_filler_scheduled_at: Optional[float] = None
-    real_response_started: bool = False
-
     # Context
     tz: str = DEFAULT_TZ
-
     patient_type: Optional[str] = None
     
-    def add_rejected_slot(self, dt: datetime, reason: str = "user_rejected"):
-        """Track rejected slots to avoid re-suggesting them."""
-        key = dt.strftime("%Y-%m-%d %H:%M")
-        self.rejected_slots.add(key)
-        logger.info(f"[STATE] 🚫 Slot rejected: {key} ({reason})")
-
-    def is_slot_rejected(self, dt: datetime) -> bool:
-        """Check if a slot was previously rejected."""
-        key = dt.strftime("%Y-%m-%d %H:%M")
-        return key in self.rejected_slots
-
-    def assert_integrity(self, context: str):
-        """
-        Verify state hasn't been accidentally wiped.
-        Logs WARNING if critical fields disappear.
-        """
-        if self.full_name is None and self.turn_count > 2:
-             logger.warning(f"[INTEGRITY] ⚠️ Name text lost during {context}!")
-        if self.phone_e164 and not isinstance(self.phone_e164, str):
-             logger.warning(f"[INTEGRITY] ⚠️ Phone type corruption in {context}: {type(self.phone_e164)}")
-
-    def start_new_turn(self, user_text: str):
-        """Start a new turn tracking context."""
-        self.turn_count += 1
-        
-        # FIX #3: Context-Aware Verification Countdown
-        if self.awaiting_slot_confirmation:
-            if self.slot_confirm_turns_left > 0:
-                self.slot_confirm_turns_left -= 1
-                logger.debug(f"[SLOT_CONFIRM] ⏳ Verification window active for {self.last_captured_slot} (turns left: {self.slot_confirm_turns_left})")
-            else:
-                self.awaiting_slot_confirmation = False
-                self.last_captured_slot = None
-                logger.debug(f"[SLOT_CONFIRM] ⏹️ Verification window expired")
-
-        # Create unique ID for this turn
-        import hashlib
-        # Hash user text + timestamp + turn count
-        raw = f"{self.turn_count}:{user_text[:50]}:{time.time()}"
-        self.turn_id = hashlib.md5(raw.encode()).hexdigest()[:8]
-        self.last_user_text = user_text
-        # Clean up old turn history to prevent memory leak (keep last 5 turns)
-        if len(self.executed_tools) > 5:
-            sorted_keys = sorted(self.executed_tools.keys())
-            for k in sorted_keys[:-5]:
-                del self.executed_tools[k]
-        # Initialize set for this turn
-        self.executed_tools[self.turn_id] = set()
-        logger.debug(f"[STATE] 🔄 New Turn {self.turn_count} (ID: {self.turn_id})")
-
-    def check_tool_lock(self, tool_name: str, args: dict) -> bool:
-        """
-        Check if tool was already executed with same args in this turn.
-        Returns TRUE if locked (should skip), FALSE if allowed.
-        """
-        if not self.turn_id:
-            return False  # No turn context, allow execution
-            
-        # Create deterministic signature of relevant args
-        # Filter out None values to handle optional args consistently
-        clean_args = {k: str(v) for k, v in args.items() if v is not None and k != 'self'}
-        
-        # Sort keys for stability
-        sig_str = f"{tool_name}:" + ",".join(f"{k}={clean_args[k]}" for k in sorted(clean_args.keys()))
-        
-        import hashlib
-        sig_hash = hashlib.md5(sig_str.encode()).hexdigest()[:8]
-        
-        lock_key = f"{tool_name}:{sig_hash}"
-        
-        if lock_key in self.executed_tools.get(self.turn_id, set()):
-            logger.warning(f"[IDEMPOTENCY] 🔒 Skipping duplicate {tool_name} for turn {self.turn_id}")
-            return True
-            
-        # Mark as executed
-        if self.turn_id not in self.executed_tools:
-            self.executed_tools[self.turn_id] = set()
-        self.executed_tools[self.turn_id].add(lock_key)
-        return False
-
-    def should_update_field(self, field_name: str, current_value: Any, new_value: Any) -> bool:
-        """
-        Write-once guard for field updates.
-        Returns True if update allowed, False if should be skipped.
-        """
-        # 1. New value is empty -> prevent clearing unless logic dictates (usually we don't clear via null)
-        if not new_value:
-            return False
-            
-        # Normalization for comparison
-        curr_str = str(current_value).strip().lower() if current_value else ""
-        new_str = str(new_value).strip().lower() if new_value else ""
-        
-        # 2. Values identical -> No-op
-        if curr_str == new_str:
-            return False
-            
-        # 3. Current is empty -> Update allowed
-        if not current_value:
-            return True
-            
-        # 4. Current exists and differs -> Check for explicit correction
-        # Correction markers (expanded list)
-        correction_markers = [
-            "actually", "no", "nope", "sorry", "change", "instead", 
-            "i mean", "not that", "not", "wrong", "mistake", 
-            "correct", "correction", "it's", "it is", "my name is", 
-            "my phone", "my email"
-        ]
-        
-        user_text = (self.last_user_text or "").lower()
-        has_marker = any(m in user_text for m in correction_markers)
-        
-        if has_marker:
-            logger.info(f"[UPDATE] ✏️ Overwriting {field_name}: '{current_value}' -> '{new_value}' (Correction detected)")
-            return True
-            
-        logger.info(f"[UPDATE] 🛡️ Ignoring {field_name} change: '{current_value}' -> '{new_value}' (No correction marker)")
-        return False
-
     def is_complete(self) -> bool:
         """Check if we have all required info for booking."""
         return all([
@@ -2486,72 +1592,71 @@ class PatientState:
     
     def detailed_state_for_prompt(self) -> str:
         """
-        Generate a concise state snapshot for the dynamic system prompt.
+        Generate a detailed state snapshot for the dynamic system prompt.
         This is the LLM's 'source of truth' for what's already captured.
-        OPTIMIZED: Reduced redundancy to minimize prompt tokens while preserving semantics.
         """
         lines = []
         
-        # Name (concise)
+        # Name
         if self.full_name:
-            lines.append(f"• NAME: ✓ {self.full_name}")
+            lines.append(f"• NAME: ✓ '{self.full_name}' — SAVED. Do NOT ask again.")
         else:
-            lines.append("• NAME: ? — Ask naturally")
+            lines.append("• NAME: ? — Still needed. Ask naturally.")
         
-        # Phone - only show if contact phase started (prevents early confirmation)
-        # Use pending phone if available, otherwise detected phone
-        phone_display = self.phone_e164 or self.phone_pending or self.detected_phone
+        # Phone - always show full number for confirmation prompt
+        # Safety: ensure phone_e164 is string not tuple
+        phone_display = self.phone_e164
         if isinstance(phone_display, tuple):
             phone_display = phone_display[0] if phone_display else None
         
-        if not contact_phase_allowed(self):
-            # Contact phase not started - hide phone from prompt to prevent early mention
-            lines.append("• PHONE: — (collect after time confirmed)")
-        elif self.phone_e164 and self.phone_confirmed:
-            lines.append(f"• PHONE: ✓ ***{self.phone_last4}")
-        elif self.phone_pending or self.detected_phone:
-            # Show only last 4 digits for confirmation prompt
-            lines.append(f"• PHONE: ⏳ ***{self.phone_last4} — CONFIRM: 'I have a number ending in {self.phone_last4} — is that okay?'")
+        if phone_display and self.phone_confirmed:
+            speakable = speakable_phone(phone_display)
+            lines.append(f"• PHONE: ✓ {speakable} — CONFIRMED. Do NOT ask again.")
+        elif phone_display:
+            speakable = speakable_phone(phone_display)
+            source_note = f" (from {self.phone_source})" if self.phone_source else ""
+            lines.append(f"• PHONE: ⏳ {speakable}{source_note} — MUST CONFIRM FULL NUMBER with user!")
+            lines.append(f"  → SAY: 'Just to confirm, is your phone number {speakable}?'")
+            lines.append(f"  → If user says YES: call confirm_phone(confirmed=True)")
+            lines.append(f"  → If user says NO: call confirm_phone(confirmed=False)")
         else:
-            lines.append("• PHONE: ? — Ask naturally")
+            lines.append("• PHONE: ? — Still needed. Ask naturally.")
         
-        # Email - only show if contact phase started (prevents early collection)
-        if not contact_phase_allowed(self):
-            # Contact phase not started - hide email from prompt to prevent early mention
-            lines.append("• EMAIL: — (collect after time confirmed)")
-        elif self.email and self.email_confirmed:
-            lines.append(f"• EMAIL: ✓ {self.email}")
+        # Email
+        if self.email and self.email_confirmed:
+            lines.append(f"• EMAIL: ✓ '{self.email}' — CONFIRMED. Do NOT ask again.")
         elif self.email:
-            lines.append(f"• EMAIL: ⏳ {self.email} — CONFIRM: 'Is your email {self.email}?'")
+            lines.append(f"• EMAIL: ⏳ '{self.email}' — Captured but needs confirmation.")
         else:
-            lines.append("• EMAIL: ? — Ask naturally")
+            lines.append("• EMAIL: ? — Still needed. Ask naturally.")
         
-        # Reason (concise)
+        # Reason with duration
         if self.reason:
-            lines.append(f"• REASON: ✓ {self.reason} ({self.duration_minutes}m)")
+            lines.append(f"• REASON: ✓ '{self.reason}' (Duration: {self.duration_minutes}m) — SAVED. Do NOT ask again.")
         else:
-            lines.append("• REASON: ? — Ask what brings them in")
+            lines.append("• REASON: ? — Still needed. Ask what brings them in.")
         
-        # Time with validation status (concise)
+        # Time with validation status
         if self.dt_local and self.time_status == "valid":
-            time_str = self.dt_local.strftime('%a %b %d @ %I:%M %p')
-            lines.append(f"• TIME: ✓ {time_str}")
+            time_str = self.dt_local.strftime('%A, %B %d at %I:%M %p')
+            lines.append(f"• TIME: ✓ {time_str} ({self.duration_minutes}m slot) — VALIDATED. Do NOT ask again.")
         elif self.time_status == "invalid" and self.time_error:
-            lines.append(f"• TIME: ❌ {self.time_error}")
+            lines.append(f"• TIME: ❌ INVALID — {self.time_error}")
+            lines.append("  → Suggest the alternative time from the error message!")
         elif self.dt_text:
-            lines.append(f"• TIME: ⏳ '{self.dt_text}' — {self.time_status}")
+            lines.append(f"• TIME: ⏳ '{self.dt_text}' — Status: {self.time_status.upper()}")
         else:
-            lines.append("• TIME: ? — Ask when")
+            lines.append("• TIME: ? — Still needed. Ask when they'd like to come in.")
         
-        # Booking status (concise)
+        # Booking status
         if self.booking_confirmed:
-            lines.append("🎉 BOOKED!")
+            lines.append("\n🎉 BOOKING STATUS: CONFIRMED! Appointment is booked.")
         elif self.is_complete():
-            lines.append("✅ READY TO BOOK — Summarize & confirm")
+            lines.append("\n✅ READY TO BOOK: All info collected. Summarize & confirm with patient.")
         else:
             missing = [s for s in self.missing_slots() if not s.endswith('_confirmed')]
             if missing:
-                lines.append(f"⏳ NEED: {', '.join(missing)}")
+                lines.append(f"\n⏳ STILL NEEDED: {', '.join(missing)}")
         
         return '\n'.join(lines)
 
@@ -2565,7 +1670,6 @@ DEMO_CLINIC_ID = "5afce5fa-8436-43a3-af65-da29ccad7228"
 
 async def fetch_clinic_context_optimized(
     called_number: str,
-    use_cache: bool = True,
 ) -> Tuple[Optional[dict], Optional[dict], Optional[dict], str]:
     """
     A-TIER: Robust clinic lookup with fuzzy suffix matching and demo fallback.
@@ -2576,26 +1680,8 @@ async def fetch_clinic_context_optimized(
     3. DEMO FALLBACK: If only 1 clinic exists in DB, use it automatically
     4. PITCH MODE: Force-load DEMO_CLINIC_ID as ultimate fallback
     
-    CACHING:
-    - Static clinic info and agent settings are cached for CLINIC_CONTEXT_CACHE_TTL seconds
-    - This avoids repeated DB queries during the same call
-    - Cache is keyed by clinic_id:agent_id (stable, no collision)
-    - NEVER caches: availability, schedule conflicts, appointment data
-    
     Returns: (clinic_info, agent_info, agent_settings, agent_name)
     """
-    
-    # Cache key will be built from clinic_id:agent_id after fetch (stable identifiers)
-    # We cannot check cache before knowing clinic_id, so caching happens on return only
-    
-    # Helper: Build stable cache key from fetched data
-    def _build_cache_key(clinic: Optional[dict], agent: Optional[dict]) -> Optional[str]:
-        """Build deterministic cache key from clinic_id:agent_id."""
-        clinic_id = (clinic or {}).get("id")
-        agent_id = (agent or {}).get("id")
-        if clinic_id:
-            return f"{clinic_id}:{agent_id or 'no_agent'}"
-        return None
     
     # Helper: Extract nested settings from agent_info
     def _extract_settings(agent_info: Optional[dict]) -> Tuple[Optional[dict], Optional[dict]]:
@@ -2681,12 +1767,7 @@ async def fetch_clinic_context_optimized(
             agent_name = (agent_info or {}).get("name") or "Office Assistant"
             
             logger.info(f"[DB] ✓ Context loaded via phone_numbers: clinic={clinic_info.get('name') if clinic_info else 'None'}, agent={agent_name}")
-            result = (clinic_info, agent_info, settings, agent_name)
-            if use_cache:
-                cache_key = _build_cache_key(clinic_info, agent_info)
-                if cache_key:
-                    _clinic_cache.set(cache_key, result)
-            return result
+            return clinic_info, agent_info, settings, agent_name
         
         logger.debug(f"[DB] No match in phone_numbers for last10='{last10}'")
 
@@ -2711,12 +1792,7 @@ async def fetch_clinic_context_optimized(
             agent_name = (agent_info or {}).get("name") or "Office Assistant"
             
             logger.info(f"[DB] ✓ Context loaded via clinics table: clinic={clinic_info.get('name')}, agent={agent_name}")
-            result = (clinic_info, agent_info, settings, agent_name)
-            if use_cache:
-                cache_key = _build_cache_key(clinic_info, agent_info)
-                if cache_key:
-                    _clinic_cache.set(cache_key, result)
-            return result
+            return clinic_info, agent_info, settings, agent_name
         
         # ═══════════════════════════════════════════════════════════════════════
         # 🚀 PITCH MODE — Phone lookup failed, force-load demo clinic by UUID
@@ -2742,12 +1818,7 @@ async def fetch_clinic_context_optimized(
             logger.info(
                 f"[DB] ✓ Pitch Mode context loaded: clinic={clinic_info.get('name')}, agent={agent_name}"
             )
-            result = (clinic_info, agent_info, settings, agent_name)
-            if use_cache:
-                cache_key = _build_cache_key(clinic_info, agent_info)
-                if cache_key:
-                    _clinic_cache.set(cache_key, result)
-            return result
+            return clinic_info, agent_info, settings, agent_name
 
         # ═══════════════════════════════════════════════════════════════════════
         # ABSOLUTE FALLBACK — Demo clinic UUID not found in DB
@@ -3341,7 +2412,7 @@ async def save_refreshed_token_to_db(agent_settings_id: str, token_data: dict):
         logger.error(f"[CALENDAR_AUTH] Failed to save refreshed token to DB: {e}")
 
 
-def _create_token_refresh_callback(agent_settings_id: str) -> Callable[[dict], None]:
+def _create_token_refresh_callback(agent_settings_id: str) -> callable:
     """
     Create a callback that saves refreshed tokens to the database.
     
@@ -3368,7 +2439,7 @@ def _create_token_refresh_callback(agent_settings_id: str) -> Callable[[dict], N
 async def resolve_calendar_auth_async(
     clinic_info: Optional[dict],
     settings: Optional[dict] = None,
-) -> Tuple[Optional[CalendarAuth], str, Optional[Callable[[dict], None]]]:
+) -> Tuple[Optional[CalendarAuth], str, Optional[callable]]:
     """
     Resolve calendar auth with DATABASE-FIRST priority.
     
@@ -3582,9 +2653,6 @@ async def book_to_supabase(
     """Insert appointment into Supabase."""
     try:
         start_time = patient_state.dt_local
-        if not start_time:
-            logger.error("[DB] Cannot book: no start_time set")
-            return False
         end_time = start_time + timedelta(minutes=patient_state.duration_minutes)  # Use service-specific duration
         
         payload = {
@@ -3670,9 +2738,6 @@ async def try_book_appointment(
             return False, "Calendar unavailable."
         
         start_dt = patient_state.dt_local
-        if not start_dt:
-            patient_state.booking_in_progress = False
-            return False, "No appointment time set."
         end_dt = start_dt + timedelta(minutes=DEFAULT_MIN)
         
         # Say we're checking
@@ -3766,7 +2831,7 @@ async def snappy_entrypoint(ctx: JobContext):
     
     Optimizations:
     1. Single Supabase query (3.2s → 100ms)
-    2. VoicePipelineAgent with min_endpointing_delay=0.6s
+    2. VoicePipelineAgent with min_endpointing_delay=0.5s
     3. gpt-4o-mini for speed + quality
     4. LLM Function Calling for real-time parallel extraction
     5. Non-blocking booking
@@ -3778,9 +2843,6 @@ async def snappy_entrypoint(ctx: JobContext):
     
     state = PatientState()
     _GLOBAL_STATE = state  # Set global reference for tools
-
-    active_filler_handle = {"handle": None, "is_filler": False, "start_time": None}
-    active_agent_handle = {"handle": None}
     
     # ═══════════════════════════════════════════════════════════════════════════
     # 🔧 DEFAULTS INITIALIZATION — Must be set BEFORE SIP block uses clinic_region
@@ -3823,19 +2885,21 @@ async def snappy_entrypoint(ctx: JobContext):
         logger.info(f"📞 [SIP] Caller (from): {caller_phone}")
         logger.info(f"📞 [SIP] Called (to): {called_num}")
         
-        # Pre-fill caller's phone from SIP - SILENTLY store in detected_phone
-        # Agent will confirm later after name + time are captured
+        # Pre-fill caller's phone from SIP - but NEVER auto-confirm!
+        # Agent MUST confirm full phone number with user before booking
         if caller_phone:
             clean_phone, last4 = _normalize_phone_preserve_plus(caller_phone, clinic_region)
             if clean_phone:
-                state.detected_phone = str(clean_phone)  # Silent detection - never spoken
+                state.phone_e164 = str(clean_phone)  # Enforce string type
                 state.phone_last4 = str(last4) if last4 else ""
                 # Safety guard: ensure no tuple was stored
                 _ensure_phone_is_string(state)
                 state.phone_confirmed = False  # NEVER auto-confirm - always ask user
                 state.phone_source = "sip"  # Track source for confirmation logic
-                # DO NOT set pending_confirm here - contact phase hasn't started
-                logger.info(f"📞 [SIP] ✓ Caller phone detected silently: ***{state.phone_last4}")
+                state.pending_confirm = "phone"  # Flag that phone needs confirmation
+                state.pending_confirm_field = "phone"  # For deterministic yes/no routing
+                speakable = speakable_phone(state.phone_e164)
+                logger.info(f"📞 [SIP] ⏳ Caller phone pre-filled (needs confirmation): {speakable}")
     
     # PRIORITY 2: Room name regex — flexible US phone number extraction
     # Matches +1XXXXXXXXXX anywhere in room name (e.g., call_+13103410536_abc123)
@@ -3928,7 +2992,7 @@ async def snappy_entrypoint(ctx: JobContext):
         )
     
     # Store reference to session for the refresh callback (set after session creation)
-    session_ref: Dict[str, Any] = {"session": None, "agent": None}
+    session_ref = {"session": None, "agent": None}
     
     def refresh_agent_memory():
         """
@@ -3977,18 +3041,26 @@ async def snappy_entrypoint(ctx: JobContext):
     # ═══════════════════════════════════════════════════════════════════════════
     # 🎙️ GREETING: Use DB greeting_text if context loaded, otherwise fallback
     # ═══════════════════════════════════════════════════════════════════════════
-    # NOTE: Do NOT confirm phone in greeting - it feels robotic.
-    # Phone confirmation should only happen when contact details are explicitly needed.
-    # The phone is captured from SIP but will be confirmed later in the flow.
+    # Build greeting - if we have SIP phone prefilled, proactively confirm it
+    phone_confirm_addon = ""
+    if state.phone_e164 and state.phone_source == "sip" and not state.phone_confirmed:
+        # SIP call with prefilled phone - proactively ask to confirm FULL number
+        speakable = speakable_phone(state.phone_e164)
+        phone_confirm_addon = f" I see you're calling from {speakable}. Is this the best number to reach you on?"
+        logger.info(f"[GREETING] Will ask to confirm SIP caller phone: {speakable}")
     
     if settings and settings.get("greeting_text"):
-        greeting = settings.get("greeting_text")
+        greeting = settings.get("greeting_text") + phone_confirm_addon
         logger.info(f"[GREETING] Using DB greeting: {greeting[:50]}...")
     elif clinic_info:
-        greeting = f"Hi, thanks for calling {clinic_name}! How can I help you today?"
+        base_greeting = f"Hi, thanks for calling {clinic_name}!"
+        if phone_confirm_addon:
+            greeting = base_greeting + phone_confirm_addon
+        else:
+            greeting = base_greeting + " How can I help you today?"
         logger.info(f"[GREETING] Using clinic-aware greeting for {clinic_name}")
     else:
-        greeting = "Hello! Thanks for calling. How can I help you today?"
+        greeting = "Hello! Thanks for calling." + (phone_confirm_addon or " How can I help you today?")
         logger.info("[GREETING] Using default greeting (DB context not loaded)")
     
     # ⚡ HIGH-PERFORMANCE LLM with function calling
@@ -3997,43 +3069,22 @@ async def snappy_entrypoint(ctx: JobContext):
         temperature=0.7,
     )
     
-    # ⚡ SNAPPY STT with aggressive endpointing for faster turn detection
+    # ⚡ SNAPPY STT
     if os.getenv("DEEPGRAM_API_KEY"):
-        # Deepgram with optimized settings for low-latency
-        stt_config = {
-            "model": "nova-2-general",
-            "language": agent_lang,
-        }
-        # Enable aggressive endpointing if configured AND provider supports it
-        # Guard: Only apply if deepgram_plugin.STT accepts these kwargs
-        if STT_AGGRESSIVE_ENDPOINTING:
-            # Check if STT class accepts endpointing params (capability guard)
-            import inspect
-            try:
-                stt_sig = inspect.signature(deepgram_plugin.STT.__init__)
-                stt_params = set(stt_sig.parameters.keys())
-                # Only add if supported by this version of the plugin
-                if "endpointing" in stt_params or "kwargs" in str(stt_sig):
-                    stt_config["endpointing"] = 300  # 300ms silence triggers end
-                    stt_config["utterance_end_ms"] = 1000  # Max wait for utterance end
-                    if LATENCY_DEBUG:
-                        logger.debug("[STT] Deepgram aggressive endpointing enabled: 300ms")
-            except Exception:
-                pass  # Silently fall back to default if introspection fails
-        stt_instance = deepgram_plugin.STT(**stt_config)
+        stt_instance = deepgram_plugin.STT(
+            model="nova-2-general",
+            language=agent_lang,
+        )
     elif os.getenv("ASSEMBLYAI_API_KEY"):
         stt_instance = assemblyai_plugin.STT()
     else:
         stt_instance = openai_plugin.STT(model="gpt-4o-transcribe", language="en")
     
-    # ⚡ FAST VAD with tuned silence detection
-    # WARNING: min_silence < 0.25s may cause premature cutoffs; min_speech should stay at 0.1
+    # ⚡ FAST VAD
     vad_instance = silero.VAD.load(
-        min_speech_duration=VAD_MIN_SPEECH_DURATION,  # 0.1s - don't lower this
-        min_silence_duration=VAD_MIN_SILENCE_DURATION,  # 0.25s (was 0.3) - faster end detection
+        min_speech_duration=0.1,
+        min_silence_duration=0.3,
     )
-    if LATENCY_DEBUG:
-        logger.info(f"[VAD] Loaded with min_silence={VAD_MIN_SILENCE_DURATION}s, min_speech={VAD_MIN_SPEECH_DURATION}s")
     
     # TTS
     if os.getenv("CARTESIA_API_KEY"):
@@ -4042,41 +3093,42 @@ async def snappy_entrypoint(ctx: JobContext):
             voice=os.getenv("CARTESIA_VOICE_ID", "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
         )
     else:
-        tts_instance = openai_plugin.TTS(model="tts-1", voice="alloy")
-
-    # Initialize VoicePipelineAgent (as 'session' for decorators)
-    # Create chat context with system prompt
-    chat_context = llm.ChatContext()
-    chat_context.messages.append(llm.ChatMessage(role="system", content=initial_system_prompt))  # type: ignore[attr-defined]
+        tts_instance = openai_plugin.TTS(
+            model="gpt-4o-mini-tts",
+            voice=os.getenv("OPENAI_TTS_VOICE", "alloy"),
+        )
     
-    session = VoicePipelineAgent(
-        vad=vad_instance,
+    # ⚡ A-TIER AgentSession with LLM Function Calling (v1.2.14 API)
+    # The LLM extracts data via tools IN REAL-TIME while generating speech
+    # No blocking listeners - parallel extraction eliminates 20s silences
+    session = AgentSession(
         stt=stt_instance,
         llm=llm_instance,
         tts=tts_instance,
-        chat_ctx=chat_context,
-        fnc_ctx=None,  # Tools are passed to Agent class in v1.2.14
+        vad=vad_instance,
+        min_endpointing_delay=0.5,  # ⚡ 0.5s for snappy turn-taking (was 1.5s)
+        max_endpointing_delay=1.5,  # Reduced from 2.0 for faster response
+        allow_interruptions=True,
+        min_interruption_duration=0.5,
+        min_interruption_words=1,
     )
-
-    # Usage metrics
+    
+    # Metrics
     usage = lk_metrics.UsageCollector()
-
+    
     @session.on("metrics_collected")
     def _on_metrics(ev: MetricsCollectedEvent):
         lk_metrics.log_metrics(ev.metrics)
         usage.collect(ev.metrics)
-
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ⚡ INSTANT FILLER & INTERRUPTION — Sub-second perceived latency
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Track active filler speech handle for interruption when real response arrives
+    active_filler_handle = {"handle": None, "is_filler": False}
+    
     def _interrupt_filler():
-        """Interrupt active filler speech."""
-        # FIX 5: One Filler Per Turn - Clear state
-        if state.filler_active:
-             logger.debug("[FILLER] Cleared due to interruption/completion")
-
-        state.filler_active = False
-        state.filler_task = None
-        state.filler_turn_id = None
-        # state.real_response_started = True # Don't set here potentially? Actually yes, interrupt often means real response
-        
+        """Safely interrupt active filler speech."""
         h = active_filler_handle.get("handle")
         if not h:
             return
@@ -4088,95 +3140,32 @@ async def snappy_entrypoint(ctx: JobContext):
                 h.cancel()
             elif hasattr(h, 'stop'):
                 h.stop()
-            logger.debug("[FILLER] ✓ Interrupted filler")
+            logger.debug("[FILLER] ✓ Interrupted filler for real response")
         except Exception as e:
             logger.debug(f"[FILLER] Could not interrupt filler (non-critical): {e}")
         finally:
             active_filler_handle["handle"] = None
             active_filler_handle["is_filler"] = False
-            active_filler_handle["start_time"] = None
     
     async def _send_filler_async(filler_text: str):
-        """
-        Non-blocking filler speech with hard timeout.
-        Will be interrupted when real response arrives OR after FILLER_MAX_DURATION_MS.
-        """
+        """Non-blocking filler speech - will be interrupted when real response arrives."""
         try:
-            active_filler_handle["is_filler"] = True
-            active_filler_handle["start_time"] = time.perf_counter()
-            
             # Use session.say with allow_interruptions=True for non-blocking filler
+            # Store handle so we can interrupt it when real response arrives
+            active_filler_handle["is_filler"] = True
             handle = await session.say(filler_text, allow_interruptions=True)
             active_filler_handle["handle"] = handle
-            
-            if LATENCY_DEBUG:
-                logger.debug(f"[FILLER] Sent: '{filler_text}'")
-            
-            # Hard timeout: interrupt filler after FILLER_MAX_DURATION_MS even if TTS is slow
-            await asyncio.sleep(FILLER_MAX_DURATION_MS / 1000.0)
-            if active_filler_handle.get("is_filler"):
-                _interrupt_filler()
-                if LATENCY_DEBUG:
-                    logger.debug(f"[FILLER] Auto-interrupted after {FILLER_MAX_DURATION_MS}ms timeout")
-        
-        except asyncio.CancelledError:
-            # FIX 5: Ensure cleared on cancel
-            logger.debug("[FILLER] Cancelled due to interruption")
-            state.filler_active = False
-            pass
+            logger.debug(f"[FILLER] Sent filler: {filler_text}")
         except Exception as e:
             logger.debug(f"[FILLER] Could not send filler: {e}")
-            state.filler_active = False
-        finally:
             active_filler_handle["is_filler"] = False
-            # FIX 5: Ensure state is cleared when done
-            if state.filler_active:
-                logger.debug("[FILLER] Completed and cleared")
-                state.filler_active = False
-                state.filler_turn_id = None
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 🎯 SLOT VALUE DETECTION — Detect direct answers to skip filler
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Patterns that indicate user is giving a direct slot value (name, time, phone, email)
-    SLOT_VALUE_PATTERNS = [
-        r"^(?:it'?s|my name is|i'?m|this is)\s+\w+",  # Name patterns
-        r"^\d{3}[-.\s]?\d{3}[-.\s]?\d{4}$",  # Phone number
-        r"^(?:\+\d{1,3}[-.\s]?)?\d{10,}$",  # International phone
-        r"^(?:\+\d{1,3}[-.\s]?)?\d{10,}$",  # International phone
-        r"^\S+@\S+\.\S+$",  # Email pattern
-        r"^(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?",  # Time patterns
-        r"^(?:tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday)",  # Day patterns
-        r"^(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)",  # Next day
-        r"^(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d+",  # Date
-    ]
-    SLOT_VALUE_RE = re.compile("|".join(SLOT_VALUE_PATTERNS), re.IGNORECASE)
-    
-    def _is_direct_slot_value(text: str) -> bool:
-        """Check if user input looks like a direct answer to a slot question."""
-        text = text.strip().lower()
-        # Short direct answers (1-3 words) that aren't questions
-        words = text.split()
-        if len(words) <= 3 and not text.endswith("?"):
-            if SLOT_VALUE_RE.search(text):
-                return True
-        return False
     
     @session.on("user_input_transcribed")
     def _on_user_transcribed_filler(ev):
         """
         SYNC callback - spawns async task for filler.
         LiveKit .on() requires sync callbacks; async work via create_task.
-        
-        FILLER SUPPRESSION RULES (for low latency):
-        1. Skip for yes/no confirmations (handled deterministically)
-        2. Skip for micro-confirmations (< 3 words)
-        3. Skip for direct slot values (time, date, phone, email, name)
-        4. Skip if filler is disabled via FILLER_ENABLED
         """
-        # Mark user end-of-utterance for latency tracking
-        _turn_metrics.mark("user_eou")
-        
         # Only act on final transcriptions
         if not getattr(ev, 'is_final', True):
             return
@@ -4184,55 +3173,26 @@ async def snappy_entrypoint(ctx: JobContext):
         transcript = getattr(ev, 'transcript', '') or getattr(ev, 'text', '') or ''
         if not transcript.strip():
             return
-            
-        current_turn = state.turn_count
         
-        # FIX 5: Guard - One filler per turn
-        if state.filler_active:
-            if LATENCY_DEBUG: logger.debug(f"[FILLER] Skipped: filler already active")
-            return
-        if state.filler_turn_id == str(current_turn):
-            if LATENCY_DEBUG: logger.debug(f"[FILLER] Skipped: filler already scheduled for this turn")
-            return
-        
-        # Check if filler is globally disabled
-        if not FILLER_ENABLED:
-            _turn_metrics.set_filler_info(False, "disabled")
-            return
-        
+        # Don't send filler for simple yes/no (handled deterministically)
         transcript_lower = transcript.strip().lower()
-        word_count = len(transcript_lower.split())
-        
-        # RULE 1: Skip filler for yes/no confirmations (handled deterministically)
-        if word_count <= 2:
+        if len(transcript_lower.split()) <= 2:
             if YES_PAT.search(transcript_lower) or NO_PAT.search(transcript_lower):
-                _turn_metrics.set_filler_info(False, "yes_no")
-                return
+                return  # Skip filler for confirmations
         
-        # RULE 2: Skip filler for micro-confirmations (very short responses)
-        if word_count <= 2 and not transcript_lower.endswith("?"):
-            _turn_metrics.set_filler_info(False, "micro_confirm")
-            return
-        
-        # RULE 3: Skip filler for direct slot values (instant LLM response expected)
-        if _is_direct_slot_value(transcript):
-            _turn_metrics.set_filler_info(False, "direct_slot")
-            return
-        
-        # RULE 4: Skip if already speaking
+        # Don't send filler if we're already speaking
         if active_filler_handle.get("is_filler"):
-            _turn_metrics.set_filler_info(False, "already_speaking")
             return
-            
-        # Select a short filler phrase (< 400ms spoken duration)
-        import random
-        filler = random.choice(FILLER_PHRASES)
-
-        state.filler_active = True
-        state.filler_turn_id = str(current_turn)
-        logger.debug(f"[FILLER] Triggered for turn {current_turn}: '{filler}'")
         
-        _turn_metrics.set_filler_info(True, None)
+        # Fire off a quick filler phrase while LLM thinks
+        import random
+        fillers = [
+            "... hmm, let me check...",
+            "... one moment...",
+            "... okay...",
+            "... sure...",
+        ]
+        filler = random.choice(fillers)
         
         # Non-blocking: spawn task, don't await
         asyncio.create_task(_send_filler_async(filler))
@@ -4242,17 +3202,7 @@ async def snappy_entrypoint(ctx: JobContext):
         """
         SYNC callback - interrupt filler when real response starts.
         This ensures filler doesn't overlap with actual content.
-        Also marks latency metrics for audio start.
-        Captures agent speech handle for true barge-in support.
         """
-        # Mark audio start for latency tracking
-        _turn_metrics.mark("audio_start")
-        
-        # Capture agent speech handle for barge-in (try common attribute names)
-        speech_handle = getattr(ev, 'handle', None) or getattr(ev, 'speech_handle', None)
-        if speech_handle:
-            active_agent_handle["handle"] = speech_handle
-        
         # Check if this is a real response (not the filler itself)
         speech_text = ""
         try:
@@ -4264,57 +3214,16 @@ async def snappy_entrypoint(ctx: JobContext):
         handle = active_filler_handle.get("handle")
         is_filler = active_filler_handle.get("is_filler", False)
         
-        # Interrupt if: we have a handle AND (not a filler OR speech doesn't start with filler prefix)
-        is_filler_text = speech_text and any(speech_text.strip().startswith(f) for f in FILLER_PHRASES)
-        if handle and not is_filler_text:
+        # Interrupt if: we have a handle AND (not a filler OR speech doesn't start with "...")
+        if handle and (not is_filler or (speech_text and not speech_text.strip().startswith("..."))):
             _interrupt_filler()
-        
-        # Log latency metrics for this turn
-        if not is_filler_text:
-            _turn_metrics.log_turn(extra=f"response_preview='{speech_text[:50]}...'" if len(speech_text) > 50 else f"response='{speech_text}'")
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 🎤 TRUE BARGE-IN — Interrupt agent immediately when user starts speaking
-    # ═══════════════════════════════════════════════════════════════════════════
-    
-    def _interrupt_agent_speech():
-        """Interrupt active agent speech for barge-in."""
-        h = active_agent_handle.get("handle")
-        if h:
-            try:
-                if hasattr(h, 'interrupt'):
-                    h.interrupt()
-                elif hasattr(h, 'cancel'):
-                    h.cancel()
-                elif hasattr(h, 'stop'):
-                    h.stop()
-                logger.debug("[BARGE-IN] Agent speech interrupted by user")
-            except Exception as e:
-                logger.debug(f"[BARGE-IN] Interrupt failed: {e}")
-            finally:
-                active_agent_handle["handle"] = None
-    
-    @session.on("user_speech_started")
-    def _on_user_speech_started(ev):
-        """True barge-in: stop agent speech when user starts speaking."""
-        _interrupt_filler()
-        _interrupt_agent_speech()
-    
-    # Register alternative event names (LiveKit SDK variations)
-    try:
-        @session.on("user_started_speaking")
-        def _on_user_started_speaking(ev):
-            _interrupt_filler()
-            _interrupt_agent_speech()
-    except Exception:
-        pass  # Event may not exist in this SDK version
 
     # Create agent with tools (v1.2.14 API - tools passed to Agent, not AgentSession)
     class SnappyAgent(Agent):
         def __init__(self, instructions: str):
             super().__init__(
                 instructions=instructions,
-                tools=list(RECEPTIONIST_TOOLS),  # ⚡ Parallel extraction via function tools  # noqa
+                tools=RECEPTIONIST_TOOLS,  # ⚡ Parallel extraction via function tools
             )
             # Store instructions for dynamic updates
             self._instructions = instructions
@@ -4322,9 +3231,9 @@ async def snappy_entrypoint(ctx: JobContext):
     # Create agent instance with initial dynamic prompt
     snappy_agent = SnappyAgent(instructions=initial_system_prompt)
     
-    # Store references for the refresh callback (dynamic typing for session_ref dict)
-    session_ref["session"] = session  # noqa
-    session_ref["agent"] = snappy_agent  # noqa
+    # Store references for the refresh callback
+    session_ref["session"] = session
+    session_ref["agent"] = snappy_agent
     
     # ═══════════════════════════════════════════════════════════════════════════
     # 🔄 USER SPEECH EVENT — Refresh memory after each user turn
@@ -4429,19 +3338,8 @@ async def snappy_entrypoint(ctx: JobContext):
         
         # Route to appropriate confirm tool (spawn async task - don't await)
         if pending == "phone":
-            # Only confirm phone if contact phase has started
-            if state.contact_phase_started:
-                asyncio.create_task(_handle_phone_confirm_async(is_yes))
-            else:
-                logger.debug("[CONFIRM] Phone confirm blocked - contact phase not started")
-                return
+            asyncio.create_task(_handle_phone_confirm_async(is_yes))
         elif pending == "email":
-            # Skip if email already confirmed (idempotent guard)
-            if state.email_confirmed:
-                logger.debug("[CONFIRM] Email confirm skipped - already confirmed")
-                state.pending_confirm = None
-                state.pending_confirm_field = None
-                return
             asyncio.create_task(_handle_email_confirm_async(is_yes))
     
     # ═══════════════════════════════════════════════════════════════════════════
@@ -4556,28 +3454,18 @@ async def snappy_entrypoint(ctx: JobContext):
         
         try:
             if clinic_info:
-                # Map to valid Supabase enum: booked, info_only, missed, transferred, voicemail
-                outcome = map_call_outcome(
-                    raw_outcome=None,
-                    booking_made=state.booking_confirmed,
-                )
-                
-                # Build call session payload with proper schema (no called_number column)
-                call_session_payload = {
-                    "organization_id": clinic_info["organization_id"],
-                    "clinic_id": clinic_info["id"],
-                    "caller_phone_masked": f"***{state.phone_last4}" if state.phone_last4 else "Unknown",
-                    "caller_name": state.full_name,
-                    "outcome": outcome,
-                    "duration_seconds": dur,
-                }
-                
-                # Add agent_id if available
-                if agent_info and agent_info.get("id"):
-                    call_session_payload["agent_id"] = agent_info["id"]
-                
+                # FIX: Use "completed" as fallback (valid Supabase enum value)
+                # Previously "inquiry" caused database crashes
+                outcome = "appointment_booked" if state.booking_confirmed else "completed"
                 await asyncio.to_thread(
-                    lambda: supabase.table("call_sessions").insert(call_session_payload).execute()
+                    lambda: supabase.table("call_sessions").insert({
+                        "organization_id": clinic_info["organization_id"],
+                        "clinic_id": clinic_info["id"],
+                        "caller_phone_masked": state.phone_last4 or "Unknown",
+                        "outcome": outcome,
+                        "duration_seconds": dur,
+                        "called_number": called_num,
+                    }).execute()
                 )
                 logger.info(f"[DB] ✓ Call session saved: outcome={outcome}")
         except Exception as e:
@@ -4642,44 +3530,6 @@ def _run_debug_tests():
     Run inline tests for phone normalization and slot suggestion logic.
     Call this via: python agent_v2.py --test
     """
-    print("\n" + "="*60)
-    print(" IDEMPOTENCY & LOCKING TESTS")
-    print("="*60)
-    
-    state = PatientState()
-    state.start_new_turn("Hello, my name is John")
-    
-    # Test 1: Tool Locking
-    locked1 = state.check_tool_lock("test_tool", {"arg": 1})
-    locked2 = state.check_tool_lock("test_tool", {"arg": 1})
-    locked3 = state.check_tool_lock("test_tool", {"arg": 2})
-    
-    print(f"Lock 1 (First call): {locked1} (Expected: False)")
-    print(f"Lock 2 (Same turn, same args): {locked2} (Expected: True)")
-    print(f"Lock 3 (Same turn, diff args): {locked3} (Expected: False)")
-    
-    assert locked1 is False
-    assert locked2 is True
-    assert locked3 is False
-    
-    # Test 2: Field Correction
-    state.full_name = "John"
-    state.last_user_text = "No, it's Jon"
-    should_update = state.should_update_field("name", "John", "Jon")
-    print(f"Field Update (Correction): {should_update} (Expected: True)")
-    assert should_update is True
-    
-    state.last_user_text = "My name is Jon"
-    should_update_dup = state.should_update_field("name", "John", "John")
-    print(f"Field Update (Duplicate): {should_update_dup} (Expected: False)")
-    assert should_update_dup is False
-    
-    # Test 3: Field Change Without Correction
-    state.last_user_text = "I like blue"
-    should_update_hallucination = state.should_update_field("name", "John", "Jim")
-    print(f"Field Update (No Correction): {should_update_hallucination} (Expected: False)")
-    assert should_update_hallucination is False
-    
     print("\n" + "="*60)
     print(" PHONE NORMALIZATION TESTS")
     print("="*60)
