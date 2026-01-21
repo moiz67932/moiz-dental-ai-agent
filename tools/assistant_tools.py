@@ -48,10 +48,8 @@ from services.scheduling_service import (
 )
 
 # Import extraction utilities
-from services.extraction_service import (
-    _iso,
-    parse_datetime_natural,
-)
+from services.extraction_service import _iso
+from utils.contact_utils import parse_datetime_natural
 
 
 # ============================================================================
