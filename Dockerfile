@@ -43,10 +43,18 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy all required local files
-COPY agent_v2.py .
-COPY contact_utils.py .
-COPY calendar_client.py .
+# Copy modular application structure
+COPY main.py .
+COPY agent.py .
+COPY config.py .
+COPY models/ ./models/
+COPY services/ ./services/
+COPY tools/ ./tools/
+COPY prompts/ ./prompts/
+COPY utils/ ./utils/
+
+# Copy legacy files only if still needed (for compatibility)
+# These can be removed once fully migrated
 COPY supabase_calendar_store.py .
 
 ENV PYTHONUNBUFFERED=1
@@ -56,4 +64,5 @@ ENV ENVIRONMENT=production
 USER agent
 EXPOSE 8080
 
-CMD ["python", "agent_v2.py", "dev"]
+# Run the new modular entry point
+CMD ["python", "main.py", "dev"]
