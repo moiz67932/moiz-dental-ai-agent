@@ -123,7 +123,7 @@ class AssistantTools(_FunctionContextBase):
         super().__init__()
         self.state = state
     
-    @llm.ai_callable(description="""
+    @llm.function_tool(description="""
     Update the patient record with any information heard during conversation.
     Call this IMMEDIATELY when you hear: name, phone, email, reason for visit, or preferred time.
     You can call this multiple times as you gather information.
@@ -528,7 +528,7 @@ class AssistantTools(_FunctionContextBase):
     
     
 
-    @llm.ai_callable(description="""
+    @llm.function_tool(description="""
     Get the next available appointment slots. Call this when:
     - The patient asks 'when is the next opening?'
     - A requested time is unavailable and you need alternatives
@@ -600,7 +600,7 @@ class AssistantTools(_FunctionContextBase):
     
 
     APPOINTMENT_BUFFER_MINUTES = 15
-    @llm.ai_callable(description="""
+    @llm.function_tool(description="""
     Advanced scheduling tool with relative time searching. Use this when:
     - User asks for slots "after 2pm tomorrow" or "before noon on Monday"
     - User specifies a preferred day like "next Wednesday"
@@ -839,7 +839,7 @@ class AssistantTools(_FunctionContextBase):
     
     
 
-    @llm.ai_callable(description="""
+    @llm.function_tool(description="""
     Find the next available slot after a specific time, or the last slot on a specific day.
     Use this when:
     - User asks for "next available after [time]" or "last slot on [day]"
@@ -1052,7 +1052,7 @@ class AssistantTools(_FunctionContextBase):
     
     
 
-    @llm.ai_callable(description="""
+    @llm.function_tool(description="""
     Confirm the phone number with the patient. Call this ONLY after the contact phase is started.
     Example: "I have a number ending in 7839 — is that okay?"
     
@@ -1176,7 +1176,7 @@ class AssistantTools(_FunctionContextBase):
     
     
 
-    @llm.ai_callable(description="""
+    @llm.function_tool(description="""
     Confirm the email address with the patient. Call this after spelling it back.
     
     SMART CAPTURE: You can also pass an email_address to save it before confirming.
@@ -1256,7 +1256,7 @@ class AssistantTools(_FunctionContextBase):
     
     
 
-    @llm.ai_callable(description="""
+    @llm.function_tool(description="""
     Check the current booking status and what information is still missing.
     Call this to know what to ask for next.
     """)
@@ -1315,7 +1315,7 @@ class AssistantTools(_FunctionContextBase):
     
     
 
-    @llm.ai_callable(description="""
+    @llm.function_tool(description="""
     Finalize the appointment booking. Call this ONLY after:
     1. You have collected ALL required information (name, phone, email, reason, time)
     2. You have read back the summary to the patient
@@ -1457,7 +1457,7 @@ class AssistantTools(_FunctionContextBase):
     
     
 
-    @llm.ai_callable(description="""
+    @llm.function_tool(description="""
     Search the clinic knowledge base for information about parking, pricing, insurance, 
     location, services, or any clinic-specific details. Call this IMMEDIATELY when the 
     user asks about anything not related to booking (e.g., 'Where do I park?', 
