@@ -14,7 +14,7 @@ import json
 import asyncio
 from typing import Optional, Dict, Callable, Tuple
 
-from calendar_client import CalendarAuth, set_token_refresh_callback
+from .calendar_client import CalendarAuth, set_token_refresh_callback
 from config import supabase, logger, GOOGLE_OAUTH_TOKEN_PATH, GOOGLE_CALENDAR_AUTH_MODE, GOOGLE_CALENDAR_ID_DEFAULT
 
 # Global to track agent settings ID for token refresh
