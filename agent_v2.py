@@ -4034,7 +4034,7 @@ async def entrypoint(ctx: JobContext):
     # Initialize VoicePipelineAgent (as 'session' for decorators)
     # Create chat context with system prompt
     chat_context = llm.ChatContext()
-    chat_context.add_message(llm.ChatMessage(role="system", content=[initial_system_prompt]))
+    chat_context.add_message(role="system", content=initial_system_prompt)
     
     # Create function context for Receptionist tools
     fnc_ctx = AssistantTools(state)
