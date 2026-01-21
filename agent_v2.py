@@ -759,7 +759,7 @@ def contact_phase_allowed(state: "PatientState") -> bool:
 
 
 APPOINTMENT_BUFFER_MINUTES = 15
-class AssistantTools(llm.FunctionContext):
+class AssistantTools(llm.ToolContext):
     def __init__(self, state: PatientState):
         super().__init__()
         self.state = state
