@@ -46,6 +46,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Copy modular application structure
 COPY main.py .
 COPY agent.py .
+COPY agent_v2.py .
 COPY config.py .
 COPY models/ ./models/
 COPY services/ ./services/
@@ -53,8 +54,7 @@ COPY tools/ ./tools/
 COPY prompts/ ./prompts/
 COPY utils/ ./utils/
 
-# Copy legacy files only if still needed (for compatibility)
-# These can be removed once fully migrated
+# Copy legacy files required by agent_v2.py
 COPY supabase_calendar_store.py .
 
 ENV PYTHONUNBUFFERED=1
