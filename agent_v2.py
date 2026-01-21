@@ -759,9 +759,8 @@ def contact_phase_allowed(state: "PatientState") -> bool:
 
 
 APPOINTMENT_BUFFER_MINUTES = 15
-class AssistantTools(llm.ToolContext):
+class AssistantTools:
     def __init__(self, state: PatientState):
-        super().__init__()
         self.state = state
     
     @llm.function_tool(description="""
@@ -4037,7 +4036,8 @@ async def entrypoint(ctx: JobContext):
     chat_context.add_message(role="system", content=initial_system_prompt)
     
     # Create function context for Receptionist tools
-    fnc_ctx = AssistantTools(state)
+    assistant_tools = AssistantTools(state)
+    fnc_ctx = llm.ToolContext(tools=llm.find_function_tools(assistant_tools))
     
     session = VoicePipelineAgent(
         vad=vad_instance,
