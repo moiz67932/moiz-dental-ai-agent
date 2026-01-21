@@ -19,6 +19,9 @@ from zoneinfo import ZoneInfo
 
 from config import DEFAULT_TREATMENT_DURATIONS, DEFAULT_LUNCH_BREAK, logger, DEFAULT_TZ
 
+# Week day keys for schedule mapping (Monday=0 to Sunday=6)
+WEEK_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
 # TODO: Extract these functions from agent_v2.py:
 # - _default_hours() (lines 2759-2768)
 # - load_schedule_from_settings() (lines 2770-2825)
