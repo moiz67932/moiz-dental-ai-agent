@@ -226,14 +226,14 @@ from livekit.plugins import (
 # Contact Utilities
 # =============================================================================
 
-from contact_utils import (
+from utils.contact_utils import (
     normalize_phone,
     normalize_email,
     validate_email_address,
     parse_datetime_natural,
 )
 
-from calendar_client import (
+from services.calendar_client import (
     CalendarAuth, 
     is_time_free, 
     create_event, 
