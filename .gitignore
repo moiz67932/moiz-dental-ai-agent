@@ -1,8 +1,7 @@
 # =============================================================================
-# PRODUCTION .gitignore — Agent V2 Voice AI
+# Dental AI Agent - .gitignore
 # =============================================================================
-# Auto-generated for production deployment. Excludes secrets, development
-# artifacts, test files, and legacy/unused code.
+# Modular architecture - keeps only necessary files for production
 
 # =============================================================================
 # 🔐 SECRETS & CREDENTIALS (NEVER COMMIT)
@@ -17,9 +16,6 @@
 # Google OAuth & Service Account tokens
 google_token.json
 google_oauth_client_secret.json
-*.json
-!package.json
-!package-lock.json
 
 # =============================================================================
 # 🐍 PYTHON DEVELOPMENT ARTIFACTS
@@ -50,14 +46,12 @@ venv/
 ENV/
 env/
 .venv/
-.env/
 
 # =============================================================================
-# 🧪 TESTING (NOT FOR PRODUCTION)
+# 🧪 TESTING & DEBUGGING
 # =============================================================================
 test_*.py
 *_test.py
-tests/
 pytest.ini
 .pytest_cache/
 .coverage
@@ -69,27 +63,31 @@ coverage.xml
 *.py,cover
 
 # =============================================================================
-# 🗑️ LEGACY/UNUSED FILES (Not imported by agent_v2.py)
+# 🗑️ LEGACY/BACKUP FILES (keep out of git)
 # =============================================================================
-# Old agent version
-agent.py
+# Legacy monolith files (replaced by modular structure)
+agent_v2.py
+agent_v2_backup.py
 
-# Extraction module (inline in agent_v2.py now)
+# Old extraction module (may still be in codebase but not actively used)
 extraction/
 
-# Intent router (not used)
+# Old intent router
 intent_router.py
 
-# Knowledge/RAG (commented out, not active)
-knowledge/
-
-# Utility/setup scripts (not needed in production)
+# Standalone utility scripts
+contact_utils.py
+calendar_client.py
+supabase_calendar_store.py
+extract_code.py
 fix_prompts.py
 knowledge_uploader.py
-oauth_bootstrap.py
 
-# Prompts module (prompt is inline in agent_v2.py)
-prompts/
+# Knowledge/RAG if not used
+knowledge/
+
+# KMS directory
+KMS/
 
 # =============================================================================
 # 💻 IDE & EDITOR
@@ -102,14 +100,29 @@ prompts/
 .project
 .pydevproject
 .settings/
+pyrightconfig.json
 
 # =============================================================================
 # 📦 MISC
 # =============================================================================
 *.log
 logs/
-KMS/
 .DS_Store
 Thumbs.db
 *.bak
 *.tmp
+
+# =============================================================================
+# ✅ WHAT GETS COMMITTED (for reference)
+# =============================================================================
+# ✓ main.py              - Entry point
+# ✓ agent.py             - Main agent logic
+# ✓ config.py            - Configuration
+# ✓ models/              - Data structures
+# ✓ services/            - Business logic
+# ✓ tools/               - Agent functions
+# ✓ prompts/             - System instructions
+# ✓ utils/               - Helper utilities
+# ✓ requirements.txt     - Dependencies
+# ✓ Dockerfile           - Container config
+# ✓ .gitignore           - This file
