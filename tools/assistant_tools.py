@@ -10,6 +10,10 @@ import traceback
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+# CRITICAL: Import livekit first, before any config/heavy imports
+# This ensures llm.FunctionContext is fully loaded before circular imports
+from livekit.agents import llm
+
 # Import all required constants and clients from config
 from config import (
     DEFAULT_TZ,
@@ -19,9 +23,6 @@ from config import (
     supabase,
     logger,
 )
-
-# Import required utilities and services
-from livekit.agents import llm
 
 # Import models
 from models.state import PatientState
