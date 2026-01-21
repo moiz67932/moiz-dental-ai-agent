@@ -16,7 +16,7 @@ import traceback
 from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
 
-from config import supabase, logger, BOOKED_STATUSES,DEFAULT_MIN
+from config import supabase, logger, BOOKED_STATUSES, DEFAULT_MIN, DEMO_CLINIC_ID
 
 # Import from other new modules
 from utils.cache import _clinic_cache
@@ -32,10 +32,6 @@ if TYPE_CHECKING:
     from models.state import PatientState
     from livekit.agents.voice import Agent as VoicePipelineAgent
     
-
-# DEMO_CLINIC_ID constant - should be in config but defining here for now
-DEMO_CLINIC_ID = os.getenv("DEMO_CLINIC_ID", "00000000-0000-0000-0000-000000000000")
-
 
 async def fetch_clinic_context_optimized(
     called_number: str,
