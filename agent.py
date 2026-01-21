@@ -30,7 +30,7 @@ from livekit.plugins import openai as openai_plugin
 from livekit.plugins import deepgram as deepgram_plugin
 from livekit.plugins import cartesia as cartesia_plugin
 from livekit.plugins import silero
-from livekit.protocol.participant import ParticipantKind
+from livekit.rtc import ParticipantKind
 
 # Metrics
 from livekit.agents import metrics as lk_metrics
