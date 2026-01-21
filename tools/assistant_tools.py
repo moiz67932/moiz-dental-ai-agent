@@ -10,9 +10,9 @@ import traceback
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# CRITICAL: Import livekit first, before any config/heavy imports
-# This ensures llm.FunctionContext is fully loaded before circular imports
+# CRITICAL: Import FunctionContext from correct submodule
 from livekit.agents import llm
+from livekit.agents.llm.function_context import FunctionContext
 
 # Import all required constants and clients from config
 from config import (
@@ -110,7 +110,7 @@ def has_correction_intent(text: str) -> bool:
     text_lower = text.lower()
     return any(kw in text_lower for kw in correction_keywords)
 
-class AssistantTools(llm.FunctionContext):
+class AssistantTools(FunctionContext):
     def __init__(self, state: PatientState):
         super().__init__()
         self.state = state
