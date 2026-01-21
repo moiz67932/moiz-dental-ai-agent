@@ -1,3 +1,9 @@
+"""
+Assistant tools for the dental AI agent.
+"""
+
+from __future__ import annotations
+from typing import Optional
 
 
 # ============================================================================
@@ -24,13 +30,6 @@ _GLOBAL_SCHEDULE: Optional[Dict[str, Any]] = None  # Scheduling config (working 
 # ============================================================================
 # Extracted: AssistantTools class with all methods
 # ============================================================================
-
-"""
-Assistant tools for the dental AI agent.
-"""
-
-from __future__ import annotations
-from typing import Optional
 
 class AssistantTools(llm.FunctionContext):
     def __init__(self, state: PatientState):
