@@ -1,3 +1,94 @@
+"""
+Main agent entrypoint and event handlers for the Dental AI Voice Agent.
+
+This module contains the core voice agent logic including:
+- LiveKit VoicePipelineAgent setup
+- SIP telephony detection and phone capture
+- Dynamic slot-aware prompting
+- Filler speech management
+- Barge-in support
+- Yes/No confirmation routing
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import json
+import time
+import asyncio
+from datetime import datetime
+from typing import Optional, Dict, Any
+
+# LiveKit imports
+from livekit import rtc
+from livekit.agents import JobContext, AutoSubscribe
+from livekit.agents.voice import Agent as VoicePipelineAgent
+from livekit.agents import llm
+from livekit.agents.metrics import UsageCollector
+from livekit.plugins import openai as openai_plugin
+from livekit.plugins import deepgram as deepgram_plugin
+from livekit.plugins import cartesia as cartesia_plugin
+from livekit.plugins import silero
+from livekit.protocol.participant import ParticipantKind
+
+# Metrics
+from livekit.agents import metrics as lk_metrics
+from livekit.agents.metrics import MetricsCollectedEvent
+
+# Local config imports
+from config import (
+    logger,
+    DEFAULT_TZ,
+    DEFAULT_PHONE_REGION,
+    DEMO_CLINIC_ID,
+    FILLER_ENABLED,
+    FILLER_MAX_DURATION_MS,
+    FILLER_PHRASES,
+    STT_AGGRESSIVE_ENDPOINTING,
+    VAD_MIN_SPEECH_DURATION,
+    VAD_MIN_SILENCE_DURATION,
+    LATENCY_DEBUG,
+    map_call_outcome,
+    supabase,
+)
+
+# Models
+from models.state import PatientState
+
+# Services
+from services.database_service import fetch_clinic_context_optimized
+from services.scheduling_service import load_schedule_from_settings
+
+# Tools
+from tools.assistant_tools import AssistantTools
+
+# Prompts
+from prompts.agent_prompts import A_TIER_PROMPT
+
+# Utilities
+from utils.phone_utils import (
+    _normalize_phone_preserve_plus,
+    _normalize_sip_user_to_e164,
+    _ensure_phone_is_string,
+    speakable_phone,
+)
+from utils.latency_metrics import TurnMetrics
+
+# Yes/No patterns for deterministic confirmation routing
+YES_PAT = re.compile(r"\b(yes|yeah|yep|yup|correct|right|sure|okay|ok|affirmative|absolutely|definitely|that'?s right|that'?s correct)\b", re.IGNORECASE)
+NO_PAT = re.compile(r"\b(no|nope|nah|wrong|incorrect|negative|not right|that'?s wrong|that'?s not)\b", re.IGNORECASE)
+
+# Global state references for cross-module access
+_GLOBAL_STATE: Optional[PatientState] = None
+_GLOBAL_CLINIC_TZ: str = DEFAULT_TZ
+_GLOBAL_CLINIC_INFO: Optional[dict] = None
+_GLOBAL_AGENT_SETTINGS: Optional[dict] = None
+_GLOBAL_SCHEDULE: Optional[dict] = None
+_REFRESH_AGENT_MEMORY: Optional[callable] = None
+
+# Turn metrics for latency tracking
+_turn_metrics = TurnMetrics()
 
 
 # ============================================================================
