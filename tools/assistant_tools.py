@@ -10,9 +10,17 @@ import traceback
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# CRITICAL: Import FunctionContext from correct submodule
+# Import livekit llm module
 from livekit.agents import llm
-from livekit.agents.llm.function_context import FunctionContext
+
+# Create base class reference - FunctionContext may be accessed as llm.FunctionContext
+# or need to be retrieved from the module dynamically
+try:
+    _FunctionContextBase = llm.FunctionContext
+except AttributeError:
+    # Fallback: Try to get it from the internal module
+    import livekit.agents.llm as _llm_module
+    _FunctionContextBase = getattr(_llm_module, 'FunctionContext', object)
 
 # Import all required constants and clients from config
 from config import (
@@ -110,7 +118,7 @@ def has_correction_intent(text: str) -> bool:
     text_lower = text.lower()
     return any(kw in text_lower for kw in correction_keywords)
 
-class AssistantTools(FunctionContext):
+class AssistantTools(_FunctionContextBase):
     def __init__(self, state: PatientState):
         super().__init__()
         self.state = state
