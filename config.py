@@ -131,6 +131,10 @@ VALID_CALL_OUTCOMES = {
     "voicemail",
 }
 
+# Demo/fallback clinic ID for testing and when phone lookup fails
+# Override via DEMO_CLINIC_ID environment variable in production
+DEMO_CLINIC_ID = os.getenv("DEMO_CLINIC_ID", "5afce5fa-8436-43a3-af65-da29ccad7228")
+
 # =============================================================================
 # DEFAULT TREATMENT DURATIONS (minutes)
 # =============================================================================
