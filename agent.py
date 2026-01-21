@@ -25,16 +25,11 @@ from livekit import rtc
 from livekit.agents import JobContext, AutoSubscribe
 from livekit.agents.voice import Agent as VoicePipelineAgent
 from livekit.agents import llm
-from livekit.agents.metrics import UsageCollector
 from livekit.plugins import openai as openai_plugin
 from livekit.plugins import deepgram as deepgram_plugin
 from livekit.plugins import cartesia as cartesia_plugin
 from livekit.plugins import silero
 from livekit.rtc import ParticipantKind
-
-# Metrics
-from livekit.agents import metrics as lk_metrics
-from livekit.agents.metrics import MetricsCollectedEvent
 
 # Local config imports
 from config import (
