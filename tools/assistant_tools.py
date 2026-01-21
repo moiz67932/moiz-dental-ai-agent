@@ -3,7 +3,55 @@ Assistant tools for the dental AI agent.
 """
 
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, Dict, Any, Callable
+import re
+import asyncio
+import traceback
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+# Import all required constants and clients from config
+from config import (
+    DEFAULT_TZ,
+    BOOKED_STATUSES,
+    DEFAULT_PHONE_REGION,
+    APPOINTMENT_BUFFER_MINUTES,
+    supabase,
+    logger,
+)
+
+# Import required utilities and services
+from livekit.agents import llm
+
+# Import models
+from models.state import PatientState
+
+# Import utility functions (these will need to be available)
+from utils.phone_utils import (
+    _normalize_phone_preserve_plus,
+    _ensure_phone_is_string,
+    speakable_phone,
+)
+
+# Import services
+from services.database_service import (
+    is_slot_free_supabase,
+    book_to_supabase,
+)
+
+from services.scheduling_service import (
+    get_duration_for_service,
+    is_within_working_hours,
+    get_next_available_slots,
+    suggest_slots_around,
+    WEEK_KEYS,
+)
+
+# Import extraction utilities
+from services.extraction_service import (
+    _iso,
+    parse_datetime_natural,
+)
 
 
 # ============================================================================
@@ -19,17 +67,49 @@ _REFRESH_AGENT_MEMORY: Optional[Callable[[], None]] = None  # Callback to refres
 _GLOBAL_SCHEDULE: Optional[Dict[str, Any]] = None  # Scheduling config (working hours, lunch, durations)
 
 
-
 # ============================================================================
-# Extracted: APPOINTMENT_BUFFER_MINUTES
+# Helper functions that might be needed
 # ============================================================================
 
+def _sanitize_tool_arg(value: Optional[str]) -> Optional[str]:
+    """Sanitize tool arguments by handling None, empty, or 'null' values."""
+    if not value:
+        return None
+    s = str(value).strip()
+    if s.lower() in ("null", "none", ""):
+        return None
+    return s
 
 
+def interpret_followup_for_slot(slot_name: str, captured_value: str, user_response: str) -> tuple[str, str]:
+    """Interpret if user response is a fragment, confirmation, or correction."""
+    # Simplified implementation - can be expanded
+    response_lower = user_response.lower().strip()
+    if response_lower in ("yes", "correct", "right", "yeah", "yep"):
+        return "CONFIRM", "user confirmed"
+    if len(response_lower.split()) <= 2:
+        return "FRAGMENT", "short response"
+    return "NEW_VALUE", "appears to be new value"
 
-# ============================================================================
-# Extracted: AssistantTools class with all methods
-# ============================================================================
+
+def email_for_speech(email: str) -> str:
+    """Format email for speech synthesis."""
+    if not email:
+        return "unknown"
+    # Replace @ with "at" and . with "dot" for better TTS
+    return email.replace("@", " at ").replace(".", " dot ")
+
+
+def contact_phase_allowed(state: PatientState) -> bool:
+    """Check if contact phase is allowed to start."""
+    return state.contact_phase_started
+
+
+def has_correction_intent(text: str) -> bool:
+    """Detect if user is correcting a previous input."""
+    correction_keywords = ["no", "not", "wrong", "actually", "correction", "change", "instead"]
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in correction_keywords)
 
 class AssistantTools(llm.FunctionContext):
     def __init__(self, state: PatientState):
