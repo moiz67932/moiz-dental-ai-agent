@@ -21,7 +21,7 @@ from config import (
     ENVIRONMENT,
     GOOGLE_OAUTH_TOKEN_PATH,
 )
-from agent import entrypoint
+from agent_v2 import entrypoint
 from models.state import PatientState
 from utils.phone_utils import _normalize_phone_preserve_plus, speakable_phone
 
