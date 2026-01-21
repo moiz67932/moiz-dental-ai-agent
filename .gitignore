@@ -76,9 +76,9 @@ extraction/
 intent_router.py
 
 # Standalone utility scripts
-contact_utils.py
-calendar_client.py
-supabase_calendar_store.py
+#contact_utils.py
+#calendar_client.py
+#supabase_calendar_store.py
 extract_code.py
 fix_prompts.py
 knowledge_uploader.py
