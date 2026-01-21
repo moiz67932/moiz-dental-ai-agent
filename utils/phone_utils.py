@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 from typing import Optional, Tuple, TYPE_CHECKING
 
-from contact_utils import normalize_phone
+from .contact_utils import normalize_phone
 from config import logger, DEFAULT_PHONE_REGION
 
 if TYPE_CHECKING:
