@@ -4045,7 +4045,7 @@ async def entrypoint(ctx: JobContext):
         llm=llm_instance,
         tts=tts_instance,
         chat_ctx=chat_context,
-        interrupt_supported=True,
+        allow_interruptions=True,
     )
     
     # Attach tools to the session after initialization
