@@ -212,7 +212,7 @@ from livekit.agents import (
     llm,
     metrics as lk_metrics,
 )
-from livekit.agents.voice import Agent as VoicePipelineAgent
+from livekit.agents.voice import VoicePipelineAgent
 from livekit.agents.voice import MetricsCollectedEvent
 from livekit.rtc import ParticipantKind
 from livekit.plugins import (
