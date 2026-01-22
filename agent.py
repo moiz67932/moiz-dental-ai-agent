@@ -395,6 +395,46 @@ async def entrypoint(ctx: JobContext):
     # Create function context for Receptionist tools
     fnc_ctx = AssistantTools(state)
     
+    # FIX 1: Semantic Buffering Callback
+    async def before_llm_cb(agent: VoicePipelineAgent, chat_ctx: llm.ChatContext):
+        """
+        Gate LLM triggers for short fragments.
+        Prevent '310' and '325' from being separate billing events.
+        """
+        if not chat_ctx.messages:
+            return True
+            
+        last_msg = chat_ctx.messages[-1]
+        if last_msg.role != llm.ChatRole.USER:
+            return True
+        
+        text = last_msg.content
+        if not isinstance(text, str): # Handle potential complex content types
+            try:
+                text = getattr(text, "text", "") or str(text) or ""
+            except:
+                text = ""
+            
+        clean = text.strip().lower()
+        if not clean:
+            return True
+            
+        # 5 char gate + keyword check (Issue 1)
+        is_short = len(clean) < 5
+        keywords = ["yes", "no", "yep", "nope", "bye", "ok", "sure", "hi", "hey"]
+        has_keyword = any(w in clean for w in keywords)
+        
+        if is_short and not has_keyword:
+            logger.info(f"[GATE] 🛑 Buffering fragment: '{clean}'")
+            state.transcript_buffer.append(clean)
+            return False # SKIP LLM
+        
+        if state.transcript_buffer:
+             logger.info(f"[GATE] 🟢 Releasing buffer with: '{clean}'")
+             state.transcript_buffer.clear()
+             
+        return True
+
     session = VoicePipelineAgent(
         vad=vad_instance,
         stt=stt_instance,
@@ -403,6 +443,7 @@ async def entrypoint(ctx: JobContext):
         chat_ctx=chat_context,
         fnc_ctx=fnc_ctx,
         interruptible=True,
+        before_llm_cb=before_llm_cb,
     )
 
     # Usage metrics
@@ -683,6 +724,15 @@ async def entrypoint(ctx: JobContext):
             logger.info(f"🤖 [AGENT RESPONSE] [{ts}] >> {text}")
             # Also log to debug for detailed tracing
             logger.debug(f"[CONVO] [{ts}] AGENT: {text}")
+
+        # FIX 2: Check for terminal state (Bye)
+        if state.call_ended:
+            logger.info("[TERMINAL] Call ended flag detected. Initiating disconnect sequence...")
+            async def _delayed_disconnect():
+                await asyncio.sleep(3.0)  # Allow TTS to finish "Goodbye!"
+                logger.info("[TERMINAL] Disconnecting room.")
+                await ctx.room.disconnect()
+            asyncio.create_task(_delayed_disconnect())
     
     # ═══════════════════════════════════════════════════════════════════════════
     # 🎯 DETERMINISTIC YES/NO ROUTING — Handle confirmations without LLM

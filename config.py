@@ -34,7 +34,7 @@ LATENCY TUNING GUIDE:
 
 # Endpointing: How quickly agent detects user finished speaking
 # WARNING: Do NOT go below 0.3s unless in controlled low-noise environment
-MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.6"))  # 0.45s - less jumpy on natural pauses
+MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "1.0"))  # 1.0s - allow breath without interruption
 MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "1.2"))   # 1.5s max wait
 
 # VAD (Voice Activity Detection) tuning

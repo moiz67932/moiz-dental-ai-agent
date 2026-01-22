@@ -259,6 +259,12 @@ class PatientState:
     last_filler_scheduled_at: Optional[float] = None
     real_response_started: bool = False
 
+    # FIX 1: Semantic Buffering
+    transcript_buffer: List[str] = field(default_factory=list)
+
+    # FIX 2: Terminal State
+    call_ended: bool = False
+
     # Context
     tz: str = DEFAULT_TZ
 

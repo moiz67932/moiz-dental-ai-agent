@@ -124,6 +124,7 @@ class AssistantTools(_FunctionContextBase):
     def __init__(self, state: PatientState):
         super().__init__()
         self.state = state
+        self._rag_cache = {}
     
     @llm.function_tool(description="""
     Update the patient record with any information heard during conversation.
@@ -1481,6 +1482,10 @@ class AssistantTools(_FunctionContextBase):
     
         if not query:
             return "What would you like to know about the clinic?"
+
+        if query in self._rag_cache:
+            logger.info(f"[RAG] Cache hit for: {query}")
+            return self._rag_cache[query]
     
         if not _GLOBAL_CLINIC_INFO:
             return "I'm sorry, I'm having trouble accessing the office records for this location."
@@ -1526,9 +1531,21 @@ class AssistantTools(_FunctionContextBase):
                 return "I don't have that specific info in my notes right now."
             
             logger.info(f"[RAG] Found {len(answers)} matches for: {query}")
-            return "\n".join([f"- {a}" for a in answers])
+            # Cache the result
+            final_answer = "\n".join([f"- {a}" for a in answers])
+            self._rag_cache[query] = final_answer
+            return final_answer
             
         except Exception as e:
             logger.error(f"[RAG] Search failed: {e}")
             return "I'm having trouble accessing my notes right now."
+
+    @llm.function_tool(description="""
+    End the conversation immediately. Call this when the user says "goodbye", "bye", "I'm done", "hang up", or expressly indicates they want to end the call.
+    """)
+    async def end_conversation(self) -> str:
+        """End the call."""
+        if self.state:
+            self.state.call_ended = True
+        return "Goodbye! Have a great day."
     
