@@ -4035,9 +4035,9 @@ async def entrypoint(ctx: JobContext):
     chat_context = llm.ChatContext()
     chat_context.add_message(role="system", content=initial_system_prompt)
     
-    # Create function context for Receptionist tools
+    # Create function tools for Receptionist
     assistant_tools = AssistantTools(state)
-    fnc_ctx = llm.ToolContext(tools=llm.find_function_tools(assistant_tools))
+    function_tools = llm.find_function_tools(assistant_tools)
     
     session = VoicePipelineAgent(
         vad=vad_instance,
@@ -4045,9 +4045,11 @@ async def entrypoint(ctx: JobContext):
         llm=llm_instance,
         tts=tts_instance,
         chat_ctx=chat_context,
-        function_context=fnc_ctx,
         interruptible=True,
     )
+    
+    # Attach tools to the session after initialization
+    session._fnc_ctx = llm.ToolContext(tools=function_tools)
 
     # Usage metrics
     usage = lk_metrics.UsageCollector()
