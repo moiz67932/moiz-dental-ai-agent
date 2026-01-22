@@ -10,18 +10,6 @@ import traceback
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# Import livekit llm module
-from livekit.agents import llm
-
-# Create base class reference - FunctionContext may be accessed as llm.FunctionContext
-# or need to be retrieved from the module dynamically
-try:
-    _FunctionContextBase = llm.FunctionContext
-except AttributeError:
-    # Fallback: Try to get it from the internal module
-    import livekit.agents.llm as _llm_module
-    _FunctionContextBase = getattr(_llm_module, 'FunctionContext', object)
-
 # Import all required constants and clients from config
 from config import (
     DEFAULT_TZ,
@@ -34,6 +22,20 @@ from config import (
 
 # Import models
 from models.state import PatientState
+
+# Import livekit llm module
+from livekit.agents import llm
+
+# Create base class reference - FunctionContext may be accessed as llm.FunctionContext
+# or need to be retrieved from the module dynamically
+try:
+    _FunctionContextBase = llm.FunctionContext
+except AttributeError:
+    # Fallback: Try to get it from the internal module
+    import livekit.agents.llm as _llm_module
+    _FunctionContextBase = getattr(_llm_module, 'FunctionContext', object)
+
+
 
 # Import utility functions (these will need to be available)
 from utils.phone_utils import (
@@ -135,12 +137,12 @@ class AssistantTools(_FunctionContextBase):
     nearby alternatives (e.g., "9:00 AM or 11:30 AM"). Simply offer these to the patient!
     """)
     async def update_patient_record(self, 
-    name: Optional[str] = None,
-    phone: Optional[str] = None,
-    email: Optional[str] = None,
-    reason: Optional[str] = None,
-    time_suggestion: Optional[str] = None,
-) -> str:
+        name: Optional[str] = None,
+        phone: Optional[str] = None,
+        email: Optional[str] = None,
+        reason: Optional[str] = None,
+        time_suggestion: Optional[str] = None,
+    ) -> str:
         """
         Update the internal patient record with extracted information.
         
@@ -618,10 +620,10 @@ class AssistantTools(_FunctionContextBase):
     Automatically skips lunch break (1pm-2pm) and provides helpful messaging.
     """)
     async def get_available_slots_v2(self, 
-    after_datetime: Optional[str] = None,
-    preferred_day: Optional[str] = None,
-    num_slots: int = 3,
-) -> str:
+        after_datetime: Optional[str] = None,
+        preferred_day: Optional[str] = None,
+        num_slots: int = 3,
+    ) -> str:
         """
         Advanced slot finder with relative time constraints.
         

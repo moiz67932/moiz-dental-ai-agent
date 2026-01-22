@@ -164,8 +164,13 @@ async def entrypoint(ctx: JobContext):
                 _ensure_phone_is_string(state)
                 state.phone_confirmed = False  # NEVER auto-confirm - always ask user
                 state.phone_source = "sip"  # Track source for confirmation logic
-                # DO NOT set pending_confirm here - contact phase hasn't started
-                logger.info(f"📞 [SIP] ✓ Caller phone detected silently: ***{state.phone_last4}")
+                
+                # FIX 3: Proactive Phone Verification
+                # Immediately assume this is pending so "Yes" works instantly.
+                state.phone_pending = state.phone_e164
+                state.phone_last4 = str(last4) if last4 else ""
+                
+                logger.info(f"📞 [SIP] ✓ Caller phone detected silently: ***{state.phone_last4} (Pending)")
     
     # PRIORITY 2: Room name regex — flexible US phone number extraction
     # Matches +1XXXXXXXXXX anywhere in room name (e.g., call_+13103410536_abc123)
@@ -316,6 +321,16 @@ async def entrypoint(ctx: JobContext):
         logger.info(f"[GREETING] Using DB greeting: {greeting[:50]}...")
     elif clinic_info:
         greeting = f"Hi, thanks for calling {clinic_name}! How can I help you today?"
+        
+        # FIX 3: Proactive Phone Verification Prompt
+        if state.phone_pending:
+            speakable = speakable_phone(state.phone_pending)
+            greeting = f"Hi, thanks for calling {clinic_name}! I see you're calling from {speakable}, is that the best number to reach you at?"
+            # Mark that we are expecting a yes/no verification for phone
+            state.pending_confirm = "phone" 
+            state.pending_confirm_field = "phone"
+            state.contact_phase_started = True # Start contact phase so logic works
+
         logger.info(f"[GREETING] Using clinic-aware greeting for {clinic_name}")
     else:
         greeting = "Hello! Thanks for calling. How can I help you today?"

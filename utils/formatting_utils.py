@@ -40,8 +40,10 @@ def build_spoken_confirmation(state: "PatientState") -> str:
         )
     
     if state.email:
-        # Spaces in the email string slow down the TTS for clarity
-        spaced_email = state.email.replace("@", " at ").replace(".", " dot ")
+        # Use this logic for emails:
+        local_part, domain = state.email.split('@')
+        spelled_local = ", ".join(list(local_part))
+        spaced_email = f"{spelled_local} at {domain.replace('.', ' dot ')}"
         parts.append(f"And I've got your email as {spaced_email}.")
     
     parts.append("Is there anything else I can help you with today?")
