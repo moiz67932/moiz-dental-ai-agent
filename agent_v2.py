@@ -211,8 +211,16 @@ from livekit.agents import (
     cli,
     llm,
     metrics as lk_metrics,
+    AgentSession,
+    Agent,
+    room_io,
 )
-from livekit.agents.voice import VoicePipelineAgent
+
+# 1.3.11+ Version Safety Check
+import livekit.agents
+print(f"[INIT] LiveKit Agents Version: {livekit.agents.__version__}")
+
+# VoicePipelineAgent removed
 from livekit.agents.voice import MetricsCollectedEvent
 from livekit.rtc import ParticipantKind
 from livekit.plugins import (
@@ -220,6 +228,7 @@ from livekit.plugins import (
     silero,
     deepgram as deepgram_plugin,
     cartesia as cartesia_plugin,
+    noise_cancellation,
 )
 
 # =============================================================================
@@ -4030,7 +4039,7 @@ async def entrypoint(ctx: JobContext):
     else:
         tts_instance = openai_plugin.TTS(model="tts-1", voice="alloy")
 
-    # Initialize VoicePipelineAgent (as 'session' for decorators)
+    # Initialize AgentSession for 1.3.11 compatibility
     # Create chat context with system prompt
     chat_context = llm.ChatContext()
     chat_context.add_message(role="system", content=initial_system_prompt)
@@ -4039,17 +4048,24 @@ async def entrypoint(ctx: JobContext):
     assistant_tools = AssistantTools(state)
     function_tools = llm.find_function_tools(assistant_tools)
     
-    session = VoicePipelineAgent(
+    # Create the session
+    session = AgentSession(
         vad=vad_instance,
         stt=stt_instance,
         llm=llm_instance,
         tts=tts_instance,
         chat_ctx=chat_context,
-        allow_interruptions=True,
     )
     
-    # Attach tools to the session after initialization
-    session._fnc_ctx = llm.ToolContext(tools=function_tools)
+    # Define agent with instructions and tools
+    agent = Agent(
+        instructions=initial_system_prompt, 
+        tools=function_tools,
+        allow_interruptions=True
+    )
+
+    # Attach tools to the session after initialization if needed (legacy pattern check)
+    # session._fnc_ctx = llm.ToolContext(tools=function_tools) # Removed, passed to Agent
 
     # Usage metrics
     usage = lk_metrics.UsageCollector()
@@ -4058,6 +4074,8 @@ async def entrypoint(ctx: JobContext):
     def _on_metrics(ev: MetricsCollectedEvent):
         lk_metrics.log_metrics(ev.metrics)
         usage.collect(ev.metrics)
+        
+    session.on("metrics_collected", _on_metrics)
 
     def _interrupt_filler():
         """Interrupt active filler speech."""
@@ -4484,12 +4502,21 @@ async def entrypoint(ctx: JobContext):
 
                 asyncio.create_task(_refresh_context())
     
-    # Start the agent
-    agent = session
-    agent.start(ctx.room, participant)
+    # Start the session
+    # agent = session # Removed alias
+    
+    # Configure RoomOptions with noise cancellation
+    room_opts = room_io.RoomOptions(
+        audio_input=room_io.AudioInputOptions(
+            noise_cancellation=noise_cancellation.BVC(),
+        ),
+        close_on_disconnect=True,
+    )
+    
+    await session.start(room=ctx.room, agent=agent, room_options=room_opts)
 
     # Say greeting ASAP (don't await; let TTS start immediately)
-    session.say(greeting)
+    await session.say(greeting)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 🔄 DEFERRED CONTEXT LOAD — Only if 2s timeout was exceeded
