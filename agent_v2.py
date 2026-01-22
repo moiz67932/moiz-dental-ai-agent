@@ -228,8 +228,14 @@ from livekit.plugins import (
     silero,
     deepgram as deepgram_plugin,
     cartesia as cartesia_plugin,
-    noise_cancellation,
 )
+
+try:
+    from livekit.plugins import noise_cancellation
+    NC_AVAILABLE = True
+except ImportError:
+    noise_cancellation = None
+    NC_AVAILABLE = False
 
 # =============================================================================
 # Contact Utilities
@@ -4506,10 +4512,16 @@ async def entrypoint(ctx: JobContext):
     # agent = session # Removed alias
     
     # Configure RoomOptions with noise cancellation
+    audio_input_opts = room_io.AudioInputOptions(
+        noise_cancellation=noise_cancellation.BVC() if NC_AVAILABLE else None,
+    )
+    if NC_AVAILABLE:
+        logger.info("[AUDIO] Noise cancellation enabled")
+    else:
+        logger.warning("[AUDIO] Noise cancellation disabled (module not found)")
+
     room_opts = room_io.RoomOptions(
-        audio_input=room_io.AudioInputOptions(
-            noise_cancellation=noise_cancellation.BVC(),
-        ),
+        audio_input=audio_input_opts,
         close_on_disconnect=True,
     )
     
