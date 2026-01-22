@@ -4045,7 +4045,7 @@ async def entrypoint(ctx: JobContext):
         llm=llm_instance,
         tts=tts_instance,
         chat_ctx=chat_context,
-        fnc_ctx=fnc_ctx,
+        function_context=fnc_ctx,
         interruptible=True,
     )
 
