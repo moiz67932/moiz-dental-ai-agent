@@ -4046,9 +4046,6 @@ async def entrypoint(ctx: JobContext):
         tts_instance = openai_plugin.TTS(model="tts-1", voice="alloy")
 
     # Initialize AgentSession for 1.3.11 compatibility
-    # Create chat context with system prompt
-    chat_context = llm.ChatContext()
-    chat_context.add_message(role="system", content=initial_system_prompt)
     
     # Create function tools for Receptionist
     assistant_tools = AssistantTools(state)
@@ -4060,7 +4057,6 @@ async def entrypoint(ctx: JobContext):
         stt=stt_instance,
         llm=llm_instance,
         tts=tts_instance,
-        chat_ctx=chat_context,
     )
     
     # Define agent with instructions and tools
