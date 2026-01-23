@@ -15,6 +15,7 @@ import sys
 import time
 import signal
 import threading
+import asyncio
 
 # Cloud Run / HTTP Server imports
 from fastapi import FastAPI
@@ -179,12 +180,22 @@ def _run_debug_tests():
 # Main Execution
 # ============================================================================
 
+# Global flag to ensure worker starts only once
+_worker_started = False
+
 def run_livekit_worker():
-    """Run LiveKit worker in a background thread."""
+    """
+    Run LiveKit worker in a background thread with its own asyncio loop.
+    This is required on Cloud Run because threads do not have event loops.
+    """
     try:
         logger.info("[WORKER] Starting LiveKit worker thread...")
-        # Note: cli.run_app uses asyncio internally. Running in a thread works
-        # because it creates its own event loop for that thread.
+        
+        # ✅ Critical: ensure this thread has its own event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Run LiveKit worker (LiveKit internally manages its asyncio usage)
         cli.run_app(
             WorkerOptions(
                 entrypoint_fnc=entrypoint,
@@ -195,8 +206,25 @@ def run_livekit_worker():
         )
     except SystemExit:
         logger.info("[WORKER] LiveKit worker requested exit")
-    except Exception as e:
-        logger.error(f"[WORKER] LiveKit worker crashed: {e}")
+    except Exception:
+        logger.exception("[WORKER] LiveKit worker crashed")
+
+
+def start_worker_thread_once():
+    """
+    Start the worker as a daemon thread so FastAPI stays alive.
+    Ensure it starts only once (important for reload / multiple imports).
+    """
+    global _worker_started
+    
+    if _worker_started:
+        logger.info("[WORKER] Worker already started, skipping duplicate start")
+        return
+    
+    t = threading.Thread(target=run_livekit_worker, name="run_livekit_worker", daemon=True)
+    t.start()
+    _worker_started = True
+    logger.info("[WORKER] Worker thread started.")
 
 if __name__ == "__main__":
     if "--test" in sys.argv:
@@ -241,8 +269,7 @@ if __name__ == "__main__":
         # 2. Start LiveKit agent in background daemon thread
         # Setting daemon=True ensures it doesn't block program exit if main thread dies,
         # but our signal handler ensures main thread stays alive long enough for cleanup.
-        worker_thread = threading.Thread(target=run_livekit_worker, daemon=True)
-        worker_thread.start()
+        start_worker_thread_once()
         
         # 3. Start HTTP Server (Blocking)
         logger.info(f"[HTTP] Starting production FastAPI server on port {port}")
