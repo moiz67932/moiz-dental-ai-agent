@@ -18,7 +18,7 @@ cli.run_app() is designed for standalone development:
 - Creates internal event loops (unpredictable in containers)
 - Expects to own the process (breaks in multi-component setups)
 
-We use agents.Worker directly with asyncio.run() for:
+We use agents.AgentServer directly with asyncio.run() for:
 - Single, clean event loop
 - Predictable shutdown behavior
 - Full control over lifecycle
@@ -27,6 +27,13 @@ USAGE:
 ======
 Cloud Run Job: CMD ["python", "worker_main.py"]
 Local dev:     python worker_main.py
+
+API CHANGES (livekit-agents >= 1.3.x):
+======================================
+- agents.Worker → agents.AgentServer
+- Uses @server.rtc_session(agent_name=...) decorator pattern
+- agent_name is set in the rtc_session decorator, NOT the constructor
+- setup_fnc property replaces prewarm_fnc constructor param
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ import asyncio
 import logging
 
 from livekit import agents
-from livekit.agents import WorkerOptions
+from livekit.agents import AgentServer, JobContext, JobProcess
 from livekit.plugins import silero
 
 # Local imports
@@ -77,7 +84,7 @@ def _handle_sigterm(signum, frame):
 # PREWARM — Called once when worker starts
 # =============================================================================
 
-def prewarm(proc: agents.JobProcess):
+def prewarm(proc: JobProcess):
     """
     Prewarm function called once when the worker process starts.
     
@@ -106,6 +113,37 @@ def prewarm(proc: agents.JobProcess):
 
 
 # =============================================================================
+# CREATE AGENT SERVER
+# =============================================================================
+
+# Create the AgentServer instance (replaces the old Worker class)
+# NOTE: agent_name is NOT a constructor parameter in 1.3.x
+# It's set via @server.rtc_session(agent_name=...) decorator
+server = AgentServer(
+    load_threshold=1.0,
+    setup_fnc=prewarm,
+)
+
+
+# =============================================================================
+# RTC SESSION — Register entrypoint using decorator pattern
+# =============================================================================
+
+@server.rtc_session(agent_name=LIVEKIT_AGENT_NAME)
+async def session_entrypoint(ctx: JobContext):
+    """
+    RTC session entrypoint - delegates to the actual agent entrypoint.
+    
+    This decorator pattern is required for livekit-agents >= 1.3.x.
+    The @server.rtc_session() decorator registers this function as the
+    handler for incoming LiveKit room connections.
+    
+    The agent_name parameter here is what enables explicit dispatch.
+    """
+    await entrypoint(ctx)
+
+
+# =============================================================================
 # MAIN — Clean asyncio entry point
 # =============================================================================
 
@@ -127,20 +165,10 @@ async def main():
     logger.info(f"[WORKER] Agent name: {LIVEKIT_AGENT_NAME}")
     logger.info(f"[WORKER] Environment: {ENVIRONMENT}")
     
-    # Create the worker
-    worker = agents.Worker(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            prewarm_fnc=prewarm,
-            agent_name=LIVEKIT_AGENT_NAME,
-            load_threshold=1.0,
-        )
-    )
-    
-    # Run the worker
-    # This blocks until the worker is shut down (SIGTERM or error)
+    # Run the server
+    # This blocks until the server is shut down (SIGTERM or error)
     try:
-        await worker.run()
+        await server.run()
     except asyncio.CancelledError:
         logger.info("[WORKER] Worker cancelled, shutting down...")
     except Exception:
