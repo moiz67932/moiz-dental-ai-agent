@@ -248,6 +248,8 @@ from utils.contact_utils import (
     parse_datetime_natural,
 )
 
+from utils.call_logger import CallLogger, create_call_logger
+
 from services.calendar_client import (
     CalendarAuth, 
     is_time_free, 
@@ -3799,6 +3801,12 @@ async def entrypoint(ctx: JobContext):
     
     call_started = time.time()
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 📊 CALL LOGGER INITIALIZATION — Structured logging for observability
+    # ═══════════════════════════════════════════════════════════════════════════
+    call_logger = create_call_logger()
+    state._call_logger = call_logger  # Attach to state for tool access
+    
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     
     participant = await ctx.wait_for_participant()
@@ -3871,6 +3879,14 @@ async def entrypoint(ctx: JobContext):
         called_num = os.getenv("DEFAULT_TEST_NUMBER", "+13103410536")
         logger.warning(f"[FALLBACK] Using default test number: {called_num}")
         used_fallback_called_num = True
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 📊 LOG CALL START — After phone numbers are captured
+    # ═══════════════════════════════════════════════════════════════════════════
+    call_logger.log_call_start(
+        from_number=caller_phone,
+        to_number=called_num
+    )
 
     # ⚡ FAST-PATH CONTEXT: start the optimized fetch immediately once called_num is known.
     # Do not block audio startup on this; we only wait a tiny budget to personalize if it returns fast.
@@ -4077,6 +4093,51 @@ async def entrypoint(ctx: JobContext):
         lk_metrics.log_metrics(ev.metrics)
         usage.collect(ev.metrics)
         
+        # ═══════════════════════════════════════════════════════════════════════
+        # 📊 LOG LLM METRICS — Token counts and latency
+        # ═══════════════════════════════════════════════════════════════════════
+        try:
+            metrics = ev.metrics
+            # Check for LLM metrics (structure varies by SDK version)
+            if hasattr(metrics, 'llm_prompt_tokens') or hasattr(metrics, 'llm'):
+                prompt_tokens = getattr(metrics, 'llm_prompt_tokens', 0) or 0
+                completion_tokens = getattr(metrics, 'llm_completion_tokens', 0) or 0
+                llm_latency = getattr(metrics, 'llm_ttft', 0) or 0
+                
+                # Also try nested structure
+                if hasattr(metrics, 'llm') and metrics.llm:
+                    prompt_tokens = getattr(metrics.llm, 'prompt_tokens', prompt_tokens) or prompt_tokens
+                    completion_tokens = getattr(metrics.llm, 'completion_tokens', completion_tokens) or completion_tokens
+                    llm_latency = getattr(metrics.llm, 'ttft', llm_latency) or llm_latency
+                
+                if prompt_tokens > 0 or completion_tokens > 0:
+                    call_logger.log_llm(
+                        model="gpt-4o-mini",
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        latency_ms=int(llm_latency * 1000) if llm_latency < 100 else int(llm_latency),
+                        response_text=""  # Captured separately in speech events
+                    )
+            
+            # Check for STT metrics
+            if hasattr(metrics, 'stt_duration') or hasattr(metrics, 'stt'):
+                stt_duration = getattr(metrics, 'stt_duration', 0) or 0
+                if hasattr(metrics, 'stt') and metrics.stt:
+                    stt_duration = getattr(metrics.stt, 'duration', stt_duration) or stt_duration
+                
+                # Note: STT text is logged separately in user_input handler
+                
+            # Check for TTS metrics  
+            if hasattr(metrics, 'tts_ttfb') or hasattr(metrics, 'tts'):
+                tts_latency = getattr(metrics, 'tts_ttfb', 0) or 0
+                if hasattr(metrics, 'tts') and metrics.tts:
+                    tts_latency = getattr(metrics.tts, 'ttfb', tts_latency) or tts_latency
+                
+                # Note: TTS text is logged separately in speech events
+                
+        except Exception as e:
+            logger.debug(f"[METRICS] Error logging metrics: {e}")
+        
     session.on("metrics_collected", _on_metrics)
 
     def _interrupt_filler():
@@ -4197,8 +4258,26 @@ async def entrypoint(ctx: JobContext):
         transcript = getattr(ev, 'transcript', '') or getattr(ev, 'text', '') or ''
         if not transcript.strip():
             return
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # 📊 LOG STT — User speech transcription
+        # ═══════════════════════════════════════════════════════════════════════
+        try:
+            stt_latency = int(_turn_metrics.get_elapsed("user_eou"))
+            audio_duration = getattr(ev, 'duration_ms', 0) or getattr(ev, 'audio_duration_ms', 0) or 0
+            confidence = getattr(ev, 'confidence', None)
+            call_logger.log_stt(
+                text=transcript.strip(),
+                latency_ms=stt_latency,
+                audio_duration_ms=int(audio_duration) if audio_duration else 0,
+                confidence=confidence,
+                is_final=getattr(ev, 'is_final', True)
+            )
+        except Exception as e:
+            logger.debug(f"[STT LOG] Error logging STT: {e}")
             
         current_turn = state.turn_count
+
         
         # FIX 5: Guard - One filler per turn
         if state.filler_active:
@@ -4282,6 +4361,23 @@ async def entrypoint(ctx: JobContext):
         if handle and not is_filler_text:
             _interrupt_filler()
         
+        # ═══════════════════════════════════════════════════════════════════════
+        # 📊 LOG TTS — Agent speech output
+        # ═══════════════════════════════════════════════════════════════════════
+        if not is_filler_text and speech_text:
+            try:
+                tts_latency = int(_turn_metrics.get_elapsed("audio_start"))
+                audio_duration = getattr(ev, 'audio_duration_ms', 0) or getattr(ev, 'duration_ms', 0) or 0
+                voice = os.getenv("CARTESIA_VOICE_ID", "cartesia-sonic")
+                call_logger.log_tts(
+                    text=speech_text,
+                    latency_ms=tts_latency,
+                    audio_duration_ms=int(audio_duration) if audio_duration else 0,
+                    voice=voice
+                )
+            except Exception as e:
+                logger.debug(f"[TTS LOG] Error logging TTS: {e}")
+        
         # Log latency metrics for this turn
         if not is_filler_text:
             _turn_metrics.log_turn(extra=f"response_preview='{speech_text[:50]}...'" if len(speech_text) > 50 else f"response='{speech_text}'")
@@ -4312,6 +4408,14 @@ async def entrypoint(ctx: JobContext):
         """True barge-in: stop agent speech when user starts speaking."""
         _interrupt_filler()
         _interrupt_agent_speech()
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # 📊 LOG VAD — Voice activity detection (speech start)
+        # ═══════════════════════════════════════════════════════════════════════
+        try:
+            call_logger.log_vad(event="speech_start")
+        except Exception as e:
+            logger.debug(f"[VAD LOG] Error logging VAD start: {e}")
     
     # Register alternative event names (LiveKit SDK variations)
     try:
@@ -4319,8 +4423,33 @@ async def entrypoint(ctx: JobContext):
         def _on_user_started_speaking(ev):
             _interrupt_filler()
             _interrupt_agent_speech()
+            try:
+                call_logger.log_vad(event="speech_start")
+            except Exception:
+                pass
     except Exception:
         pass  # Event may not exist in this SDK version
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 📊 VAD SPEECH END — Log when user stops speaking
+    # ═══════════════════════════════════════════════════════════════════════════
+    def _on_user_speech_ended(ev):
+        """Log VAD speech end event."""
+        try:
+            duration_ms = getattr(ev, 'duration_ms', None) or getattr(ev, 'speech_duration_ms', None)
+            call_logger.log_vad(event="speech_end", duration_ms=int(duration_ms) if duration_ms else None)
+        except Exception as e:
+            logger.debug(f"[VAD LOG] Error logging VAD end: {e}")
+    
+    # Try to register speech end event (name varies by SDK version)
+    try:
+        session.on("user_speech_ended", _on_user_speech_ended)
+    except Exception:
+        pass
+    try:
+        session.on("user_stopped_speaking", _on_user_speech_ended)
+    except Exception:
+        pass
 
     # Store references for the refresh callback
     session_ref["session"] = session
@@ -4564,6 +4693,18 @@ async def entrypoint(ctx: JobContext):
         dur = int(max(0, time.time() - call_started))
         logger.info(f"[LIFECYCLE] Ended after {dur}s, booking={state.booking_confirmed}")
         
+        # ═══════════════════════════════════════════════════════════════════════
+        # 📊 LOG CALL END — Final call metrics
+        # ═══════════════════════════════════════════════════════════════════════
+        end_reason = "completed" if state.booking_confirmed else "user_hangup"
+        try:
+            call_logger.log_call_end(
+                duration_seconds=dur,
+                end_reason=end_reason
+            )
+        except Exception as e:
+            logger.debug(f"[CALL LOG] Error logging call end: {e}")
+        
         try:
             if clinic_info:
                 # Map to valid Supabase enum: booked, info_only, missed, transferred, voicemail
@@ -4592,6 +4733,15 @@ async def entrypoint(ctx: JobContext):
                 logger.info(f"[DB] ✓ Call session saved: outcome={outcome}")
         except Exception as e:
             logger.error(f"[DB] Call session error: {e}")
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # 📊 FLUSH CALL LOGGER — Ensure all events are persisted to Supabase
+        # ═══════════════════════════════════════════════════════════════════════
+        try:
+            await call_logger.flush_to_supabase()
+            logger.info(f"[CALL LOG] ✓ Call events flushed to Supabase")
+        except Exception as e:
+            logger.error(f"[CALL LOG] Failed to flush events: {e}")
         
         try:
             print(f"[USAGE] {usage.get_summary()}")

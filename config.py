@@ -56,6 +56,22 @@ CLINIC_CONTEXT_CACHE_TTL = int(os.getenv("CLINIC_CACHE_TTL", "60"))  # 60s TTL
 # Latency debug mode - logs detailed timing per turn
 LATENCY_DEBUG = os.getenv("LATENCY_DEBUG", "0") == "1"
 
+# =============================================================================
+# LOGGING & OBSERVABILITY CONFIGURATION
+# =============================================================================
+
+# Enable structured JSON logging for Cloud Logging
+ENABLE_STRUCTURED_LOGGING = os.getenv("STRUCTURED_LOGGING", "1") == "1"
+
+# Enable Supabase logging (persistent analytics)
+SUPABASE_LOGGING_ENABLED = os.getenv("SUPABASE_LOGGING", "1") == "1"
+
+# Log buffer flush interval (seconds)
+LOG_BUFFER_FLUSH_INTERVAL = int(os.getenv("LOG_FLUSH_INTERVAL", "10"))
+
+# Max events in buffer before auto-flush
+LOG_BUFFER_MAX_SIZE = int(os.getenv("LOG_BUFFER_SIZE", "100"))
+
 # Mute noisy transport debug logs (reduces log-bloat in production)
 logging.getLogger("hpack").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)

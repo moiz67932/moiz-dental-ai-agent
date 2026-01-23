@@ -12,6 +12,7 @@ from .phone_utils import (
     _normalize_phone_preserve_plus,
 )
 from .formatting_utils import build_spoken_confirmation, email_for_speech
+from .call_logger import CallLogger, create_call_logger
 
 __all__ = [
     "TTLCache",
@@ -25,4 +26,6 @@ __all__ = [
     "_normalize_phone_preserve_plus",
     "build_spoken_confirmation",
     "email_for_speech",
+    "CallLogger",
+    "create_call_logger",
 ]
