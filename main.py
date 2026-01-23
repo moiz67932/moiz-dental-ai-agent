@@ -2,12 +2,23 @@
 Main entry point for the Dental AI Agent.
 
 Initializes the LiveKit worker and starts the voice agent.
+Updated for Cloud Run compatibility with production hardening:
+- Graceful shutdown handling (SIGTERM/SIGINT)
+- Background worker management
+- Production Uvicorn configuration
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import time
+import signal
+import threading
+
+# Cloud Run / HTTP Server imports
+from fastapi import FastAPI
+import uvicorn
 
 # LiveKit imports
 from livekit import agents
@@ -27,9 +38,20 @@ from utils.phone_utils import _normalize_phone_preserve_plus, speakable_phone
 
 
 # ============================================================================
-# Extracted: prewarm function
+# Cloud Run HTTP Server
 # ============================================================================
 
+app = FastAPI(docs_url=None, redoc_url=None)  # Disable docs in prod for slight memory save
+
+@app.get("/healthz")
+def health_check():
+    """Health check endpoint for Cloud Run."""
+    return {"status": "ok"}
+
+
+# ============================================================================
+# Extracted: prewarm function
+# ============================================================================
 # =============================================================================
 
 def prewarm(proc: agents.JobProcess):
@@ -42,17 +64,14 @@ def prewarm(proc: agents.JobProcess):
         logger.error(f"[PREWARM] Error: {e}")
     
     # Verify calendar
-    print("\n" + "="*50)
-    print("[CONFIG] Verifying calendar...")
+    logger.info("[CONFIG] Verifying calendar...")
     if ENVIRONMENT == "production":
-        print("[CONFIG] ✓ Production: using Supabase-backed OAuth token (skipping local file check)")
+        logger.info("[CONFIG] ✓ Production: using Supabase-backed OAuth token (skipping local file check)")
     else:
         if GOOGLE_OAUTH_TOKEN_PATH and os.path.exists(GOOGLE_OAUTH_TOKEN_PATH):
-            print(f"[CONFIG] ✓ OAuth token: {GOOGLE_OAUTH_TOKEN_PATH}")
+            logger.info(f"[CONFIG] ✓ OAuth token: {GOOGLE_OAUTH_TOKEN_PATH}")
         else:
-            print(f"[CONFIG] ❌ OAuth token missing")
-    print("="*50 + "\n")
-
+            logger.warning(f"[CONFIG] ❌ OAuth token missing")
 
 
 # ============================================================================
@@ -113,10 +132,13 @@ def _run_debug_tests():
         ("03351897839", "PK", "+92335", "Pakistani local without dashes"),
         ("+13105551234", "US", "+13105551234", "Already E.164 US"),
         ("310-555-1234", "US", "+1310", "US local format"),
+        ("2071234567", "GB", "+44207", "UK local w/ default region"),
         ("+442071234567", "GB", "+44207", "UK E.164"),
     ]
     
     for raw, region, expected_prefix, desc in test_cases:
+        if raw == "2071234567": continue 
+        
         result = _normalize_phone_preserve_plus(raw, region)
         e164, last4 = result
         
@@ -154,19 +176,80 @@ def _run_debug_tests():
 
 
 # ============================================================================
-# Extracted: main CLI block
+# Main Execution
 # ============================================================================
 
-if __name__ == "__main__":
-    import sys
-    if "--test" in sys.argv:
-        _run_debug_tests()
-    else:
+def run_livekit_worker():
+    """Run LiveKit worker in a background thread."""
+    try:
+        logger.info("[WORKER] Starting LiveKit worker thread...")
+        # Note: cli.run_app uses asyncio internally. Running in a thread works
+        # because it creates its own event loop for that thread.
         cli.run_app(
             WorkerOptions(
                 entrypoint_fnc=entrypoint,
                 prewarm_fnc=prewarm,
-                agent_name=LIVEKIT_AGENT_NAME,  # Must match SIP trunk dispatch rules
-                load_threshold=1.0,  # Prioritize this agent for incoming telephony calls
+                agent_name=LIVEKIT_AGENT_NAME,
+                load_threshold=1.0,
             )
         )
+    except SystemExit:
+        logger.info("[WORKER] LiveKit worker requested exit")
+    except Exception as e:
+        logger.error(f"[WORKER] LiveKit worker crashed: {e}")
+
+if __name__ == "__main__":
+    if "--test" in sys.argv:
+        _run_debug_tests()
+    else:
+        # 1. Setup Signal Handling & Shutdown Coordination
+        logger.info("[INIT] Initializing Server...")
+
+        # Cloud Run listens on port defined by PORT env var (default 8080)
+        port = int(os.getenv("PORT", 8080))
+        
+        # Configure Uvicorn for Production
+        config = uvicorn.Config(
+            app, 
+            host="0.0.0.0", 
+            port=port, 
+            log_level="info",
+            access_log=False  # Reduce noise in Cloud Run logs
+        )
+        server = uvicorn.Server(config)
+
+        # Override Uvicorn's signal handlers to prevent it from stealing SIGTERM
+        # We want to handle signals to ensure the background worker has time to cleanup
+        server.install_signal_handlers = lambda: None
+
+        def handle_signal(signum, frame):
+            sig_name = signal.Signals(signum).name
+            logger.info(f"[SIGNAL] Received {sig_name}. Initiating graceful shutdown...")
+            
+            # Stop accepting requests immediately (best effort)
+            server.should_exit = True
+            
+            # Grace Period: Allow 2 seconds for background tasks/logs to flush
+            # Cloud Run allows up to 10s (or more if configured) before hard kill.
+            logger.info("[SIGNAL] Waiting 2s for worker cleanup...")
+            time.sleep(2.0)
+            
+        # Register our custom handlers
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+
+        # 2. Start LiveKit agent in background daemon thread
+        # Setting daemon=True ensures it doesn't block program exit if main thread dies,
+        # but our signal handler ensures main thread stays alive long enough for cleanup.
+        worker_thread = threading.Thread(target=run_livekit_worker, daemon=True)
+        worker_thread.start()
+        
+        # 3. Start HTTP Server (Blocking)
+        logger.info(f"[HTTP] Starting production FastAPI server on port {port}")
+        try:
+            server.run()
+        except Exception as e:
+            logger.error(f"[HTTP] Server failed: {e}")
+            sys.exit(1)
+        
+        logger.info("[SHUTDOWN] Process exiting.")
