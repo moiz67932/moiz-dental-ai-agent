@@ -185,29 +185,49 @@ _worker_started = False
 
 def run_livekit_worker():
     """
-    Run LiveKit worker in a background thread with its own asyncio loop.
-    This is required on Cloud Run because threads do not have event loops.
+    Run LiveKit worker in a background thread with a fully running asyncio loop.
+    
+    Required for Cloud Run because:
+    1. Threads have no default event loop
+    2. cli.run_app() assumes it controls the main process (breaks in threads)
+    3. LiveKit internally calls asyncio.get_running_loop() which requires an active loop
+    
+    Solution: Use agents.Worker directly with loop.run_until_complete()
     """
     try:
         logger.info("[WORKER] Starting LiveKit worker thread...")
         
-        # ✅ Critical: ensure this thread has its own event loop
+        # Create and set event loop for this thread
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        # Run LiveKit worker (LiveKit internally manages its asyncio usage)
-        cli.run_app(
-            WorkerOptions(
-                entrypoint_fnc=entrypoint,
-                prewarm_fnc=prewarm,
-                agent_name=LIVEKIT_AGENT_NAME,
-                load_threshold=1.0,
+        async def _runner():
+            """Inner async function that runs the LiveKit worker."""
+            worker = agents.Worker(
+                WorkerOptions(
+                    entrypoint_fnc=entrypoint,
+                    prewarm_fnc=prewarm,
+                    agent_name=LIVEKIT_AGENT_NAME,
+                    load_threshold=1.0,
+                )
             )
-        )
+            await worker.run()
+        
+        # ✅ Critical: Run the loop until the worker completes
+        # This makes the loop "running" so asyncio.get_running_loop() works
+        loop.run_until_complete(_runner())
+        
     except SystemExit:
         logger.info("[WORKER] LiveKit worker requested exit")
     except Exception:
         logger.exception("[WORKER] LiveKit worker crashed")
+    finally:
+        # Clean up the event loop
+        try:
+            loop.close()
+            logger.info("[WORKER] Event loop closed")
+        except Exception as e:
+            logger.warning(f"[WORKER] Error closing loop: {e}")
 
 
 def start_worker_thread_once():
