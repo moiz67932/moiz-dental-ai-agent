@@ -1,9 +1,22 @@
 # =============================================================================
-# PRODUCTION Dockerfile — Optimized for Railway & LiveKit
+# PRODUCTION Dockerfile — Cloud Run Job for LiveKit Worker
 # =============================================================================
+#
+# WHY CLOUD RUN JOBS (NOT SERVICES):
+# ==================================
+# - Services are request-driven: containers killed when no HTTP traffic
+# - Jobs are task-driven: containers run until task completes
+# - LiveKit workers maintain WebSocket connections, not HTTP requests
+# - Jobs can run for hours without artificial keep-alive hacks
+#
+# USAGE:
+# ======
+# Build:  docker build -f Dockerfile.job -t dental-agent-worker .
+# Deploy: gcloud run jobs create dental-agent-worker --image <IMAGE>
+#
 
 # -----------------------------------------------------------------------------
-# Stage 1: Builder
+# Stage 1: Builder (identical to Service Dockerfile)
 # -----------------------------------------------------------------------------
 FROM python:3.10-slim-bookworm AS builder
 
@@ -19,7 +32,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 COPY requirements.txt .
 
-# FIX: Force binary-only install for livekit to ensure the .so is included
+# Force binary-only install for livekit to ensure the .so is included
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir --only-binary=:all: livekit==1.0.23 && \
     pip install --no-cache-dir -r requirements.txt
@@ -29,7 +42,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # -----------------------------------------------------------------------------
 FROM python:3.10-slim-bookworm AS runtime
 
-# FIX: libgomp1 is REQUIRED for the LiveKit binary (.so) to load
+# libgomp1 is REQUIRED for the LiveKit binary (.so) to load
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
@@ -43,8 +56,8 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy modular application structure
-COPY main.py .
+# Copy application code
+COPY worker_main.py .
 COPY agent.py .
 COPY agent_v2.py .
 COPY config.py .
@@ -53,16 +66,21 @@ COPY services/ ./services/
 COPY tools/ ./tools/
 COPY prompts/ ./prompts/
 COPY utils/ ./utils/
-
-# Copy legacy files required by agent_v2.py
 COPY supabase_calendar_store.py .
 
+# Python environment settings
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV ENVIRONMENT=production
 
 USER agent
-EXPOSE 8080
 
-# Run the new modular entry point
-CMD ["python", "main.py", "dev"]
+# NO EXPOSE — Cloud Run Jobs don't need ports
+# NO health probes — Jobs are not HTTP-based
+
+# Run the worker entry point directly
+# WHY NOT cli.run_app:
+# - CLI helpers manage their own event loops and signals
+# - They're designed for development, not containerized production
+# - worker_main.py uses asyncio.run() for clean lifecycle control
+CMD ["python", "worker_main.py"]
