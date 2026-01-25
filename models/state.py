@@ -453,10 +453,13 @@ class PatientState:
             # Contact phase not started - hide phone from prompt to prevent early mention
             lines.append("• PHONE: — (collect after time confirmed)")
         elif self.phone_e164 and self.phone_confirmed:
-            lines.append(f"• PHONE: ✓ ***{self.phone_last4}")
+            lines.append(f"• PHONE: ✓ {self.phone_e164}") # Show full confirmed number to LLM
         elif self.phone_pending or self.detected_phone:
-            # Show only last 4 digits for confirmation prompt
-            lines.append(f"• PHONE: ⏳ ***{self.phone_last4} — CONFIRM: 'I have a number ending in {self.phone_last4} — is that okay?'")
+            # PENDING implies we have a number but need confirmation
+            # If source is caller_id (inferred if detected_phone matches), we ask "save this number?"
+            # If source is user_spoken, we ask "I have [full number], is that right?"
+            # The prompt doesn't need to be micro-managed, just indicate status.
+            lines.append(f"• PHONE: ⏳ Pending Confirmation — Ask: 'Should I save the number you're calling from?'")
         else:
             lines.append("• PHONE: ? — Ask naturally")
         

@@ -201,7 +201,7 @@ class AssistantTools(_FunctionContextBase):
                     state.phone_verification_buffer += f" | {phone}"
                     # If confirmed, we could mark confirmed=True, but let's let confirm_phone tool handle explicit logic if needed.
                     # However, usually we just want to NOT wipe the state.
-                    return f"Got it. I have your number ending in {state.phone_last4 or '...'}. Is that right?"
+                    return f"Got it. I have {speakable_phone(state.phone_pending)}. Is that right?"
     
             if state.should_update_field("phone", state.phone_pending or state.phone_e164, phone):
                 
@@ -1121,7 +1121,7 @@ class AssistantTools(_FunctionContextBase):
                         _REFRESH_AGENT_MEMORY()
                     except Exception:
                         pass
-                return f"I have a number ending in {state.phone_last4} — is that okay?"
+                return f"I have {speakable_phone(state.phone_pending)} — is that okay?"
             else:
                 return f"Could not parse phone number '{new_phone}'. Ask user to repeat clearly."
         
@@ -1175,7 +1175,7 @@ class AssistantTools(_FunctionContextBase):
                     _REFRESH_AGENT_MEMORY()
                 except Exception:
                     pass
-            return "Phone cleared. Ask user: 'Could you please give me your phone number again?'"
+            return "Phone cleared. Ask: 'No problem! What number should I use instead?'"
     
     
 

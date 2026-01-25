@@ -10,7 +10,7 @@ from typing import Dict, Any, Optional
 from config import LATENCY_DEBUG, logger
 
 
-class LatencyMetrics:
+class TurnMetrics:
     """
     Lightweight latency tracker for voice agent turns.
     Logs structured timing data when LATENCY_DEBUG=1.
@@ -67,4 +67,4 @@ class LatencyMetrics:
 
 
 # Global latency tracker (reset per turn)
-_turn_metrics = LatencyMetrics()
+_turn_metrics = TurnMetrics()

@@ -404,6 +404,16 @@ class CallLogger:
         # Track for turn aggregation
         self._current_turn["user_text"] = text
         self._current_turn["stt_latency_ms"] = latency_ms
+
+    def log_stt_transcript_only(self, text: str, latency_ms: int = 0):
+        """Log STT for transcript table only (matches schema)."""
+        self.log_transcript_entry(
+            speaker="user",
+            text=text,
+            stt_latency_ms=latency_ms,
+            llm_latency_ms=0,
+            tts_latency_ms=0,
+        )
     
     # =========================================================================
     # VAD (Voice Activity Detection) LOGS
@@ -431,6 +441,18 @@ class CallLogger:
     # LLM LOGS
     # =========================================================================
     
+    def log_llm_response(self, text: str):
+        """
+        Helper to log LLM response text for transcript tracking.
+        Does not track token usage/latency (use log_llm for that).
+        """
+        self.log_transcript_entry(
+            speaker="agent",
+            text=text,
+            llm_latency_ms=0,  # Not available in this context
+            tts_latency_ms=0,
+        )
+
     def log_llm(
         self,
         model: str,
@@ -614,6 +636,172 @@ class CallLogger:
         )
         
         self._buffer_event("error", payload)
+    
+    # =========================================================================
+    # TRANSCRIPT LOGGING — Real-time transcript storage
+    # =========================================================================
+    
+    def log_transcript_entry(
+        self,
+        speaker: str,  # "user" or "agent"
+        text: str,
+        stt_latency_ms: int = 0,
+        llm_latency_ms: int = 0,
+        tts_latency_ms: int = 0,
+        vad_duration_ms: int = 0,
+    ):
+        """
+        Log individual transcript entry with latency metrics.
+        Stores to call_transcripts table.
+        
+        Args:
+            speaker: "user" or "agent"
+            text: The transcript text
+            stt_latency_ms: STT processing time (user only)
+            llm_latency_ms: LLM response time (agent only)
+            tts_latency_ms: TTS generation time (agent only)
+            vad_duration_ms: VAD speech duration (user only)
+        """
+        if not text or not text.strip():
+            return
+        
+        self._turn_index += 1
+        
+        # Calculate total latency
+        total_latency = stt_latency_ms + llm_latency_ms + tts_latency_ms
+        
+        transcript_entry = {
+            "call_id": self.call_id,
+            "turn_index": self._turn_index,
+            "speaker": speaker,
+            "text": text.strip(),
+            "latency_ms": total_latency if total_latency > 0 else None,
+            "vad_duration_ms": vad_duration_ms if vad_duration_ms > 0 else None,
+            "stt_latency_ms": stt_latency_ms if stt_latency_ms > 0 else None,
+            "llm_latency_ms": llm_latency_ms if llm_latency_ms > 0 else None,
+            "tts_latency_ms": tts_latency_ms if tts_latency_ms > 0 else None,
+            "utterance_time": datetime.utcnow().isoformat() + "Z",
+        }
+        
+        # Store transcript entry
+        if SUPABASE_LOGGING_ENABLED:
+            asyncio.create_task(self._save_transcript_entry(transcript_entry))
+        
+        # Also log to stdout with colorized output
+        self._log_transcript_terminal(speaker, text, stt_latency_ms, llm_latency_ms, tts_latency_ms, vad_duration_ms)
+    
+    async def _save_transcript_entry(self, entry: Dict[str, Any]):
+        """Save transcript entry to Supabase call_transcripts table."""
+        try:
+            if self._supabase is None:
+                from config import supabase
+                self._supabase = supabase
+            
+            await asyncio.to_thread(
+                lambda: self._supabase.table("call_transcripts").insert(entry).execute()
+            )
+        except Exception as e:
+            _structured_logger.log(
+                level="ERROR",
+                message=f"Failed to save transcript entry: {e}",
+                call_id=self.call_id,
+                speaker=entry.get("speaker"),
+                turn_index=entry.get("turn_index")
+            )
+    
+    def _log_transcript_terminal(
+        self,
+        speaker: str,
+        text: str,
+        stt_latency_ms: int = 0,
+        llm_latency_ms: int = 0,
+        tts_latency_ms: int = 0,
+        vad_duration_ms: int = 0,
+    ):
+        """Real-time colorized terminal logging."""
+        ts = datetime.utcnow().strftime("%H:%M:%S")
+        
+        if speaker == "user":
+            # User speech with VAD/STT timing
+            latency_parts = []
+            if vad_duration_ms > 0:
+                latency_parts.append(f"VAD: {vad_duration_ms}ms")
+            if stt_latency_ms > 0:
+                latency_parts.append(f"STT: {stt_latency_ms}ms")
+            
+            latency_str = " | ".join(latency_parts) if latency_parts else ""
+            
+            print(f"\n{'─'*60}")
+            print(f"📍 TURN {self._turn_index} | {ts}")
+            print(f"{'─'*60}")
+            print(f"👤 USER: \"{text}\"")
+            if latency_str:
+                print(f"   ⏱️  {latency_str}")
+        else:
+            # Agent response with LLM/TTS timing
+            latency_parts = []
+            if llm_latency_ms > 0:
+                latency_parts.append(f"LLM: {llm_latency_ms}ms")
+            if tts_latency_ms > 0:
+                latency_parts.append(f"TTS: {tts_latency_ms}ms")
+            
+            total = stt_latency_ms + llm_latency_ms + tts_latency_ms
+            if total > 0:
+                latency_parts.append(f"Total: {total}ms")
+            
+            latency_str = " | ".join(latency_parts) if latency_parts else ""
+            
+            print(f"🤖 AGENT: \"{text[:200]}{'...' if len(text) > 200 else ''}\"")
+            if latency_str:
+                print(f"   ⏱️  {latency_str}")
+    
+    def log_turn_timing(
+        self,
+        user_text: str,
+        agent_text: str,
+        vad_ms: int = 0,
+        stt_ms: int = 0,
+        llm_ms: int = 0,
+        tts_ms: int = 0,
+    ):
+        """
+        Log detailed turn timing to terminal.
+        Call this after both user and agent have completed a turn.
+        """
+        total = vad_ms + stt_ms + llm_ms + tts_ms
+        ts = datetime.utcnow().strftime("%H:%M:%S")
+        
+        print(f"\n{'═'*70}")
+        print(f"📊 TURN {self._turn_index} COMPLETE | {ts} | Total Latency: {total}ms")
+        print(f"{'─'*70}")
+        print(f"   👤 USER:  \"{user_text[:60]}{'...' if len(user_text) > 60 else ''}\"")
+        print(f"   🤖 AGENT: \"{agent_text[:60]}{'...' if len(agent_text) > 60 else ''}\"")
+        print(f"{'─'*70}")
+        print(f"   ⏱️  LATENCY BREAKDOWN:")
+        print(f"      • VAD duration:  {vad_ms:>5}ms")
+        print(f"      • STT latency:   {stt_ms:>5}ms")
+        print(f"      • LLM latency:   {llm_ms:>5}ms")
+        print(f"      • TTS latency:   {tts_ms:>5}ms")
+        print(f"      ─────────────────────")
+        print(f"      • TOTAL:         {total:>5}ms")
+        print(f"{'═'*70}\n")
+        
+        # Also log as structured JSON for Cloud Logging
+        _structured_logger.log(
+            level="INFO",
+            message=f"[TURN_TIMING] Turn {self._turn_index} completed",
+            call_id=self.call_id,
+            agent_id=self.agent_id,
+            environment=self.environment,
+            turn_index=self._turn_index,
+            vad_ms=vad_ms,
+            stt_ms=stt_ms,
+            llm_ms=llm_ms,
+            tts_ms=tts_ms,
+            total_ms=total,
+            user_text=user_text[:100],
+            agent_text=agent_text[:100],
+        )
     
     # =========================================================================
     # FLUSH TO SUPABASE

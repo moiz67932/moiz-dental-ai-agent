@@ -3,7 +3,7 @@ Utility modules for the dental AI agent.
 """
 
 from .cache import TTLCache, _clinic_cache
-from .latency_metrics import LatencyMetrics, _turn_metrics
+from .latency_metrics import TurnMetrics, _turn_metrics
 from .phone_utils import (
     _normalize_sip_user_to_e164,
     speakable_phone,
@@ -17,7 +17,7 @@ from .call_logger import CallLogger, create_call_logger
 __all__ = [
     "TTLCache",
     "_clinic_cache",
-    "LatencyMetrics",
+    "TurnMetrics",
     "_turn_metrics",
     "_normalize_sip_user_to_e164",
     "speakable_phone",

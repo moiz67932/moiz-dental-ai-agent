@@ -44,6 +44,9 @@ import signal
 import asyncio
 import logging
 
+# FORCE PORT to avoid conflict if shell env has PORT=8080
+os.environ["PORT"] = "8080"
+
 from livekit import agents
 from livekit.agents import AgentServer, JobContext, JobProcess
 from livekit.plugins import silero
@@ -55,7 +58,7 @@ from config import (
     ENVIRONMENT,
     GOOGLE_OAUTH_TOKEN_PATH,
 )
-from agent_v2 import entrypoint
+from agent import entrypoint
 
 # =============================================================================
 # SIGNAL HANDLING — Graceful shutdown for Cloud Run
@@ -122,6 +125,8 @@ def prewarm(proc: JobProcess):
 server = AgentServer(
     load_threshold=1.0,
     setup_fnc=prewarm,
+    port=8080,
+    host="0.0.0.0",
 )
 
 
@@ -140,6 +145,7 @@ async def session_entrypoint(ctx: JobContext):
     
     The agent_name parameter here is what enables explicit dispatch.
     """
+    logger.info("[RTC] session_entrypoint invoked")
     await entrypoint(ctx)
 
 

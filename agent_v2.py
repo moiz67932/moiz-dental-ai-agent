@@ -29,7 +29,7 @@ import hashlib
 import asyncio
 import logging
 import traceback
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any, List, Set, Callable, Sequence, cast
 from functools import lru_cache
@@ -247,6 +247,7 @@ from utils.contact_utils import (
     validate_email_address,
     parse_datetime_natural,
 )
+from utils.phone_utils import speakable_phone, format_phone_for_speech
 
 from utils.call_logger import CallLogger, create_call_logger
 
@@ -1775,7 +1776,7 @@ class AssistantTools:
                         _REFRESH_AGENT_MEMORY()
                     except Exception:
                         pass
-                return f"I have a number ending in {state.phone_last4} — is that okay?"
+                return f"I have {speakable_phone(state.phone_pending)} — is that correct?"
             else:
                 return f"Could not parse phone number '{new_phone}'. Ask user to repeat clearly."
         
@@ -3784,6 +3785,12 @@ async def entrypoint(ctx: JobContext):
     state = PatientState()
     _GLOBAL_STATE = state  # Set global reference for tools
 
+    # LOGGING VERIFICATION
+    print("\n" + "="*50)
+    print("🚀 LIVEKIT AGENT ENTRYPOINT STARTED")
+    print("   Logging verification check - if you see this, stdout is working")
+    print("="*50 + "\n", flush=True)
+
     active_filler_handle = {"handle": None, "is_filler": False, "start_time": None}
     active_agent_handle = {"handle": None}
     
@@ -4273,6 +4280,15 @@ async def entrypoint(ctx: JobContext):
                 confidence=confidence,
                 is_final=getattr(ev, 'is_final', True)
             )
+            
+            # 📝 LOG TRANSCRIPT — Store user speech to call_transcripts table
+            vad_duration = int(audio_duration) if audio_duration else 0
+            call_logger.log_transcript_entry(
+                speaker="user",
+                text=transcript.strip(),
+                stt_latency_ms=stt_latency,
+                vad_duration_ms=vad_duration,
+            )
         except Exception as e:
             logger.debug(f"[STT LOG] Error logging STT: {e}")
             
@@ -4478,6 +4494,21 @@ async def entrypoint(ctx: JobContext):
             logger.info(f"🤖 [AGENT RESPONSE] [{ts}] >> {text}")
             # Also log to debug for detailed tracing
             logger.debug(f"[CONVO] [{ts}] AGENT: {text}")
+            
+            # 📝 LOG TRANSCRIPT — Store agent response to call_transcripts table
+            try:
+                # Get LLM/TTS timing from turn metrics
+                llm_latency = int(_turn_metrics.get_elapsed("llm_first_token")) if "llm_first_token" in _turn_metrics._marks else 0
+                tts_latency = int(_turn_metrics.get_elapsed("audio_start")) if "audio_start" in _turn_metrics._marks else 0
+                
+                call_logger.log_transcript_entry(
+                    speaker="agent",
+                    text=text,
+                    llm_latency_ms=llm_latency,
+                    tts_latency_ms=tts_latency,
+                )
+            except Exception as e:
+                logger.debug(f"[TRANSCRIPT LOG] Error logging agent speech: {e}")
     
     # ═══════════════════════════════════════════════════════════════════════════
     # 🎯 DETERMINISTIC YES/NO ROUTING — Handle confirmations without LLM
@@ -4721,6 +4752,7 @@ async def entrypoint(ctx: JobContext):
                     "caller_name": state.full_name,
                     "outcome": outcome,
                     "duration_seconds": dur,
+                    "end_time": datetime.now(timezone.utc).isoformat(),
                 }
                 
                 # Add agent_id if available
@@ -4730,7 +4762,7 @@ async def entrypoint(ctx: JobContext):
                 await asyncio.to_thread(
                     lambda: supabase.table("call_sessions").insert(call_session_payload).execute()
                 )
-                logger.info(f"[DB] ✓ Call session saved: outcome={outcome}")
+                logger.info(f"[DB] ✓ Call session saved: outcome={outcome}, duration={dur}s")
         except Exception as e:
             logger.error(f"[DB] Call session error: {e}")
         

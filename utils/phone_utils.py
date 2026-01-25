@@ -125,6 +125,74 @@ def _ensure_phone_is_string(state: "PatientState") -> None:
         state.detected_phone = state.detected_phone[0] if state.detected_phone else None
 
 
+
+def parse_spoken_numerals(text: Optional[str]) -> str:
+    """
+    Parse spoken phone numbers, handling 'double', 'triple' and word-to-digit conversion.
+    
+    Examples:
+        "double two" -> "22"
+        "triple three" -> "333"
+        "zero three zero zero" -> "0300"
+        "plus nine two" -> "+92"
+    """
+    if not text:
+        return ""
+        
+    s = text.lower().strip()
+    
+    # word to digit map
+    w2d = {
+        "zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3", "four": "4", 
+        "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
+    }
+    
+    # Handle "plus"
+    s = s.replace("plus", "+")
+    
+    words = s.split()
+    result = []
+    i = 0
+    while i < len(words):
+        w = words[i]
+        
+        # Handle double/triple
+        multiplier = 1
+        if w in ("double", "triple"):
+            multiplier = 2 if w == "double" else 3
+            if i + 1 < len(words):
+                next_w = words[i+1]
+                # If next word is a digit word like "two"
+                if next_w in w2d:
+                    digit = w2d[next_w]
+                    result.append(digit * multiplier)
+                    i += 2
+                    continue
+                # If next word is a digit string like "2"
+                elif next_w.isdigit():
+                    result.append(next_w * multiplier)
+                    i += 2
+                    continue
+            # If "double" is at end or not followed by digit, ignore it or treat as noise?
+            # For safety, just skip it if we can't consume next token
+            i += 1
+            continue
+            
+        # Handle digit words
+        if w in w2d:
+            result.append(w2d[w])
+        # Handle existing digits/symbols
+        else:
+            # clean non-digit chars except +
+            cleaned = "".join(c for c in w if c.isdigit() or c == "+")
+            if cleaned:
+                result.append(cleaned)
+                
+        i += 1
+        
+    return "".join(result)
+
+
 def _normalize_phone_preserve_plus(raw: Optional[str], default_region: str) -> Tuple[Optional[str], str]:
     """Normalize phone while preserving explicit international '+' prefix.
     
@@ -135,15 +203,21 @@ def _normalize_phone_preserve_plus(raw: Optional[str], default_region: str) -> T
     if not raw:
         return None, ""
 
-    s = str(raw).strip()
+    # Step 1: Parse spoken numerals first (handles "double two" etc.)
+    parsed = parse_spoken_numerals(str(raw))
+    if not parsed:
+        # Fallback to basic string if parsing returns empty allowed chars (unlikely if raw had content)
+        parsed = str(raw).strip()
+
+    s = parsed
     
     # Handle local Pakistani formats (e.g., 0335xxxxxxx -> +92335xxxxxxx)
-    # Must be done BEFORE the E.164 check since local formats don't start with +
-    if default_region == "PK" and s.startswith("0") and len(s) >= 10:
-        # Pakistani local format: 0335xxxxxxx -> +92335xxxxxxx
-        local_digits = re.sub(r"\D", "", s)
-        if len(local_digits) >= 10 and local_digits.startswith("0"):
-            s = "+92" + local_digits[1:]  # Remove leading 0, add +92
+    if default_region == "PK":
+        # Remove any non-digits first for clean checking
+        clean_digits = re.sub(r"\D", "", s)
+        # Check for 03xxxxxxxxx (11 digits, starts with 03)
+        if len(clean_digits) == 11 and clean_digits.startswith("03"):
+            s = "+92" + clean_digits[1:]  # Remove leading 0, add +92
             logger.debug(f"[PHONE] Converted PK local {raw} -> {s}")
     
     # If already E.164 format with +
