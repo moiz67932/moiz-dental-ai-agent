@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 
 from livekit import rtc
-from livekit.agents import JobContext, AutoSubscribe, WorkerOptions, cli
+from livekit.agents import JobContext, AutoSubscribe
 from livekit.agents.voice import Agent as VoicePipelineAgent
 from livekit.agents import llm
 from livekit.plugins import openai as openai_plugin
@@ -34,7 +34,6 @@ from config import (
     LATENCY_DEBUG,
     map_call_outcome,
     supabase,
-    LIVEKIT_AGENT_NAME,
 )
 from models.state import PatientState
 from services.database_service import fetch_clinic_context_optimized
@@ -122,9 +121,8 @@ async def entrypoint(ctx: JobContext):
 
     # Init Resources
     initial_system_prompt = get_updated_instructions()
-    chat_context = llm.ChatContext(
-        messages=[llm.ChatMessage(content=initial_system_prompt, role=llm.ChatRole.SYSTEM)]
-    )
+    chat_context = llm.ChatContext()
+    chat_context.append(text=initial_system_prompt, role=llm.ChatRole.SYSTEM)
     fnc_ctx = AssistantTools(state)
     
     llm_instance = openai_plugin.LLM(model="gpt-4o-mini", temperature=0.7)
@@ -175,16 +173,6 @@ async def entrypoint(ctx: JobContext):
     session = agent
     session_ref["session"] = session
     session_ref["agent"] = session
-
-    # 3b. REGISTER EVENT HANDLERS (IMMEDIATELY)
-    # Ensure all internal events are physically registered so they show up in the terminal
-    agent.on("metrics_collected", _on_metrics)
-    agent.on("agent_speech_committed", _on_agent_speech_committed)
-    agent.on("agent_speech_committed", _on_agent_speech_committed_log)
-    agent.on("user_input_transcribed", _on_user_input_confirmation)
-    agent.on("user_input_transcribed", _on_user_transcribed_filler)
-    agent.on("agent_speech_started", _on_speech_started)
-    agent.on("user_speech_started", _on_user_speech_started)
 
     # 4. DEFINE HANDLERS
     
@@ -246,21 +234,6 @@ async def entrypoint(ctx: JobContext):
         print(f"👤 USER: {transcript}")
         call_logger.log_stt_transcript_only(text=transcript, latency_ms=0)
 
-        # EARLY ACCEPTANCE CHECK
-        # If user says "use this number" or similar, just auto-confirm caller ID if available
-        if state.detected_phone and not state.phone_confirmed:
-            early_accept_pat = re.compile(r"\b(use this number|save this number|this is my number|you can use this number)\b", re.IGNORECASE)
-            if early_accept_pat.search(transcript):
-                state.phone_e164 = state.detected_phone
-                state.phone_confirmed = True
-                state.phone_source = "caller_id"
-                state.pending_confirm = None
-                state.pending_confirm_field = None
-                logger.info(f"[PHONE] 🚀 Early Acceptance triggered! Confirmed {state.phone_e164}")
-                refresh_agent_memory()
-                # Optional: Say "Great, I've saved that." - but agent will likely generate a response naturally
-                return
-
         pending = state.pending_confirm_field or state.pending_confirm
         if not pending: return
         is_yes, is_no = YES_PAT.search(transcript) is not None, NO_PAT.search(transcript) is not None
@@ -272,43 +245,10 @@ async def entrypoint(ctx: JobContext):
                 await session.generate_reply()
             except Exception as e: logger.error(f"[CONFIRM] Error: {e}")
 
-        if pending == "phone":
-             # If confirming caller ID (detected_phone)
-             if state.detected_phone and state.phone_pending == state.detected_phone:
-                 if is_yes:
-                     state.phone_e164 = state.detected_phone
-                     state.phone_confirmed = True
-                     state.phone_source = "caller_id"
-                     state.pending_confirm = None
-                     logger.info(f"[PHONE] Caller ID confirmed via YES")
-                     # Clear pending so we don't loop
-                     state.pending_confirm_field = None
-                     refresh_agent_memory()
-                     # Let agent respond naturally or use tool if needed
-                     # But we don't really have a tool for "confirm_phone" that takes a boolean?
-                     # original code called "fnc_ctx.confirm_phone" but that tool ... let's check assistant_tools.
-                     # Actually, assistant_tools usually has explicit tools. 
-                     # Checking the file `assistant_tools.py`, I don't see `confirm_phone` in the outline I read earlier.
-                     # Wait, I read 1-800 of assistant_tools.py. Let me verify if `confirm_phone` exists.
-                     # If it doesn't exist, I should just set state directly here (which I did above).
-                 else:
-                     # User said NO to caller ID
-                     logger.info("[PHONE] User rejected Caller ID")
-                     state.phone_pending = None
-                     state.pending_confirm = None
-                     state.pending_confirm_field = None
-                     # Agent will likely ask "Okay, what's different number?" based on prompt
-             
-             # If confirming spoken number (handled inside update_patient_record logic mostly, but if we have a pending specific confirmation...)
-             # The tool `update_patient_record` sets `state.awaiting_slot_confirmation`.
-             # The regex logic in `state.interpret_followup_for_slot` is used there.
-             # This handler is a backup for simple yes/no if `update_patient_record` didn't catch it.
-             # But `confirm_phone` tool call in original code implies it exists.
-             # I should check if `confirm_phone` exists in `assistant_tools.py`.
-             pass 
-
-        if pending == "email" and not state.email_confirmed:
-             asyncio.create_task(_confirm(fnc_ctx.confirm_email, is_yes)) # Assuming confirming email exists
+        if pending == "phone" and state.contact_phase_started:
+            asyncio.create_task(_confirm(fnc_ctx.confirm_phone, is_yes))
+        elif pending == "email" and not state.email_confirmed:
+             asyncio.create_task(_confirm(fnc_ctx.confirm_email, is_yes))
 
     # Filler Logic
     def _interrupt_filler():
@@ -395,7 +335,13 @@ async def entrypoint(ctx: JobContext):
     logger.info("[STARTUP] ✓ Agent connected and listening!")
 
     # 6. REGISTER EVENT HANDLERS
-    # (Moved to Step 3b to ensure immediate registration)
+    agent.on("metrics_collected", _on_metrics)
+    agent.on("agent_speech_committed", _on_agent_speech_committed)
+    agent.on("agent_speech_committed", _on_agent_speech_committed_log)
+    agent.on("user_input_transcribed", _on_user_input_confirmation)
+    agent.on("user_input_transcribed", _on_user_transcribed_filler)
+    agent.on("agent_speech_started", _on_speech_started)
+    agent.on("user_speech_started", _on_user_speech_started)
 
     # 7. ASYNC CONTEXT FETCH & GREETING
     participant = await ctx.wait_for_participant()
@@ -413,9 +359,9 @@ async def entrypoint(ctx: JobContext):
         if caller_phone:
             clean_phone, last4 = _normalize_phone_preserve_plus(caller_phone, clinic_region)
             state.detected_phone = str(clean_phone)
-            # state.phone_e164 = str(clean_phone)  <-- REMOVED: Don't auto-confirm yet
+            state.phone_e164 = str(clean_phone)
             state.phone_last4 = str(last4) if last4 else ""
-            state.phone_pending = str(clean_phone) 
+            state.phone_pending = state.phone_e164 
     
     if not called_num:
         room_name = getattr(ctx.room, "name", "") or ""
@@ -458,8 +404,8 @@ async def entrypoint(ctx: JobContext):
                     greeting = f"Hi, thanks for calling {clinic_name}! How can I help you today?"
                     
                 if state.phone_pending:
-                    # speakable = speakable_phone(state.phone_pending)  <-- REMOVED
-                    greeting = f"Hi, thanks for calling {clinic_name}! Should I save the number you're calling from as your contact number for the appointment?"
+                    speakable = speakable_phone(state.phone_pending)
+                    greeting = f"Hi, thanks for calling {clinic_name}! I see you're calling from {speakable}, is that the best number to reach you at?"
                     state.pending_confirm, state.pending_confirm_field, state.contact_phase_started = "phone", "phone", True
                 logger.info(f"[DB] ✓ Context loaded for {clinic_name}")
             except asyncio.TimeoutError:
@@ -540,6 +486,3 @@ async def entrypoint(ctx: JobContext):
     def _(): disconnect_event.set()
     try: await asyncio.wait_for(disconnect_event.wait(), timeout=7200)
     except: pass
-
-if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name=LIVEKIT_AGENT_NAME, load_threshold=1.0))
