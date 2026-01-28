@@ -204,11 +204,11 @@ async def entrypoint(ctx: JobContext):
     
     # Usage metrics
     usage = lk_metrics.UsageCollector()
-    def _on_metrics(ev):
-        usage.collect(ev.metrics)
-        if ev.metrics.llm_ttft > 0 or ev.metrics.stt_latency > 0:
-             logger.info(f"📊 [METRICS] LLM TTFT: {ev.metrics.llm_ttft:.2f}s | STT Latency: {ev.metrics.stt_latency:.2f}s")
-             print(f"📊 LATENCY: LLM={ev.metrics.llm_ttft:.2f}s | STT={ev.metrics.stt_latency:.2f}s")
+    # def _on_metrics(ev):
+    #     usage.collect(ev.metrics)
+    #     if ev.metrics.llm_ttft > 0 or ev.metrics.stt_latency > 0:
+    #          logger.info(f"📊 [METRICS] LLM TTFT: {ev.metrics.llm_ttft:.2f}s | STT Latency: {ev.metrics.stt_latency:.2f}s")
+    #          print(f"📊 LATENCY: LLM={ev.metrics.llm_ttft:.2f}s | STT={ev.metrics.stt_latency:.2f}s")
     
     # Speech Committed
     def _speech_text_from_msg(msg) -> str:
@@ -359,7 +359,7 @@ async def entrypoint(ctx: JobContext):
     # ================================
     emitter = session if hasattr(session, "on") else agent
     
-    emitter.on("metrics_collected", _on_metrics)
+    #emitter.on("metrics_collected", _on_metrics)
     
     emitter.on("user_input_transcribed", lambda ev: (
         _on_user_input_confirmation(ev),
