@@ -11,15 +11,20 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 
 from livekit import rtc
-from livekit.agents import JobContext, AutoSubscribe
-from livekit.agents.voice import Agent as VoicePipelineAgent
-from livekit.agents import llm
+from livekit.agents import (
+    JobContext, 
+    AutoSubscribe, 
+    AgentSession, 
+    Agent,
+    llm
+)
 from livekit.plugins import openai as openai_plugin
 from livekit.plugins import deepgram as deepgram_plugin
 from livekit.plugins import cartesia as cartesia_plugin
 from livekit.plugins import silero
 from livekit.rtc import ParticipantKind
 from livekit.agents import metrics as lk_metrics
+import inspect
 
 from config import (
     logger,
@@ -73,12 +78,13 @@ async def entrypoint(ctx: JobContext):
         supabase_client=supabase,
     )
     call_started = time.time()
+    logger.info(f"[DEBUG] Entrypoint started. JobID: {ctx.job.id if ctx.job else 'Unknown'}")
+    logger.info(f"[DEBUG] Initializing dependencies...")
     
     active_filler_handle = {"handle": None, "is_filler": False, "start_time": None}
     active_agent_handle = {"handle": None}
 
     # 2. INITIALIZE DEPENDENCIES (VAD, STT, TTS, LLM) IMMEDIATELY
-    # This ensures no delay after connect
     
     # State Helpers
     clinic_info = None
@@ -104,35 +110,47 @@ async def entrypoint(ctx: JobContext):
     session_ref: Dict[str, Any] = {"session": None, "agent": None}
     def refresh_agent_memory():
         try:
-            session = session_ref.get("session")
-            agent = session_ref.get("agent")
-            if not session or not agent: return
+            agent_inst = session_ref.get("agent")
+            if not agent_inst: return
             new_instructions = get_updated_instructions()
-            if hasattr(agent, '_instructions'): agent._instructions = new_instructions
-            if hasattr(session, 'chat_ctx') and session.chat_ctx:
-                messages = getattr(session.chat_ctx, 'messages', None) or getattr(session.chat_ctx, 'items', None)
-                if messages and len(messages) > 0:
-                     first_msg = messages[0]
-                     if hasattr(first_msg, 'content'): first_msg.content = new_instructions
-                     elif hasattr(first_msg, 'text_content') and hasattr(first_msg, '_text_content'): first_msg._text_content = new_instructions
+            if hasattr(agent_inst, '_instructions'): 
+                agent_inst._instructions = new_instructions
+            # Also try public property if available
+            elif hasattr(agent_inst, 'instructions'):
+                agent_inst.instructions = new_instructions
         except Exception as e:
             logger.warning(f"[MEMORY] Refresh failed: {e}")
     _REFRESH_AGENT_MEMORY = refresh_agent_memory
 
     # Init Resources
     initial_system_prompt = get_updated_instructions()
-    chat_context = llm.ChatContext()
-    chat_context.append(text=initial_system_prompt, role=llm.ChatRole.SYSTEM)
-    fnc_ctx = AssistantTools(state)
+    
+    # Tools
+    assistant_tools = AssistantTools(state)
+    function_tools = llm.find_function_tools(assistant_tools)
     
     llm_instance = openai_plugin.LLM(model="gpt-4o-mini", temperature=0.7)
     
     if os.getenv("DEEPGRAM_API_KEY"):
-        stt_config = {"model": "nova-2-general", "language": agent_lang}
+        # Introspection for Deepgram config to avoid "endpointing" error
+        stt_base_config = {"model": "nova-2-general", "language": agent_lang}
+        
+        # Check what arguments deepgram_plugin.STT accepts
+        stt_sig = inspect.signature(deepgram_plugin.STT.__init__)
+        allowed_params = set(stt_sig.parameters.keys())
+        has_kwargs = any(p.kind == p.VAR_KEYWORD for p in stt_sig.parameters.values())
+
+        stt_kwargs = stt_base_config.copy()
+        
+        # Only add aggressive endpointing if supported or if kwargs allowed
         if STT_AGGRESSIVE_ENDPOINTING:
-             stt_config["endpointing"] = 300
-             stt_config["utterance_end_ms"] = 1000
-        stt_instance = deepgram_plugin.STT(**stt_config)
+            if "endpointing_ms" in allowed_params or has_kwargs:
+                stt_kwargs["endpointing_ms"] = 300
+            elif "utterance_end_ms" in allowed_params or has_kwargs:
+                 # Fallback/Alternative key if endpointing_ms isn't the one
+                 stt_kwargs["utterance_end_ms"] = 300
+        
+        stt_instance = deepgram_plugin.STT(**stt_kwargs)
     else:
         stt_instance = openai_plugin.STT(model="gpt-4o-transcribe", language="en")
         
@@ -143,36 +161,77 @@ async def entrypoint(ctx: JobContext):
     else:
         tts_instance = openai_plugin.TTS(model="tts-1", voice="alloy")
 
-    async def before_llm_cb(agent: VoicePipelineAgent, chat_ctx: llm.ChatContext):
-        if not chat_ctx.messages: return True
-        last_msg = chat_ctx.messages[-1]
-        if last_msg.role != llm.ChatRole.USER: return True
-        text = last_msg.content
-        if not isinstance(text, str): text = str(text) if text else ""
-        clean = text.strip().lower()
-        if not clean: return True
-        is_short = len(clean) < 5
-        keywords = ["yes", "no", "yep", "nope", "bye", "ok", "sure", "hi", "hey"]
-        if is_short and not any(w in clean for w in keywords):
-            state.transcript_buffer.append(clean)
-            return False 
-        if state.transcript_buffer: state.transcript_buffer.clear()
-        return True
 
-    # 3. INITIALIZE AGENT
-    agent = VoicePipelineAgent(
+    # 3. INITIALIZE AGENT & SESSION
+    session = AgentSession(
         vad=vad_instance,
         stt=stt_instance,
         llm=llm_instance,
         tts=tts_instance,
-        chat_ctx=chat_context,
-        fnc_ctx=fnc_ctx,
-        interruptible=True,
-        before_llm_cb=before_llm_cb,
     )
-    session = agent
+    
+    from livekit.agents.llm import StopResponse  # add this import
+
+    class SnappyAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage) -> None:
+            text = getattr(new_message, "text_content", None) or ""
+            clean = text.strip().lower()
+            if not clean:
+                raise StopResponse()
+
+            keywords = {"yes","yeah","yep","yup","no","nope","nah","bye","goodbye","ok","okay","sure","hi","hello","hey"}
+            is_short = len(clean) < 5
+
+            if is_short and clean not in keywords:
+                state.transcript_buffer.append(clean)
+                raise StopResponse()
+
+            if state.transcript_buffer:
+                state.transcript_buffer.clear()
+
+    agent = SnappyAgent(
+        instructions=initial_system_prompt,
+        tools=function_tools,
+        allow_interruptions=True,
+    )
+
+    
     session_ref["session"] = session
-    session_ref["agent"] = session
+    session_ref["agent"] = agent
+
+
+
+    # ================================
+    # EVENT WIRING (VERSION-SAFE)
+    # ================================
+    emitter = session if hasattr(session, "on") else agent
+    
+    emitter.on("metrics_collected", _on_metrics)
+    
+    emitter.on("user_input_transcribed", lambda ev: (
+        _on_user_input_confirmation(ev),
+        _on_user_transcribed_filler(ev),
+    ))
+    
+    emitter.on("conversation_item_added", lambda ev: (
+        _on_agent_speech_committed(ev.item)
+        if getattr(ev.item, "role", None) == "assistant"
+        else None,
+        _on_agent_speech_committed_log(ev.item)
+        if getattr(ev.item, "role", None) == "assistant"
+        else None,
+    ))
+    
+    emitter.on("speech_created", lambda ev: (
+        active_agent_handle.__setitem__("handle", getattr(ev, "speech_handle", None))
+    ))
+    
+    emitter.on("user_state_changed", lambda ev: (
+        _on_user_speech_started(ev)
+        if getattr(ev, "new_state", None) == "speaking"
+        else None
+    ))
+    
 
     # 4. DEFINE HANDLERS
     
@@ -326,22 +385,95 @@ async def entrypoint(ctx: JobContext):
         if handle and not is_filler: _interrupt_filler()
         if not is_filler: _turn_metrics.log_turn(extra=f"response='{speech_text[:50]}'")
 
-    # 5. CONNECT AND START ("INSTANT HANDSHAKE")
-    logger.info("[STARTUP] 🚀 Connecting...")
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-    
-    # Move start here for <100ms pickup
-    await agent.start(ctx.room)
-    logger.info("[STARTUP] ✓ Agent connected and listening!")
-
     # 6. REGISTER EVENT HANDLERS
-    agent.on("metrics_collected", _on_metrics)
-    agent.on("agent_speech_committed", _on_agent_speech_committed)
-    agent.on("agent_speech_committed", _on_agent_speech_committed_log)
-    agent.on("user_input_transcribed", _on_user_input_confirmation)
-    agent.on("user_input_transcribed", _on_user_transcribed_filler)
-    agent.on("agent_speech_started", _on_speech_started)
-    agent.on("user_speech_started", _on_user_speech_started)
+    # Register handlers on the AGENT (not session) where appropriate for Agent events,
+    # or Session if they are session level.
+    # Agent 1.3.x: agent.on("user_speech_committed", ...) etc.
+    # We will use the agent object for events.
+    
+    # ✅ LiveKit v1: events come from AgentSession, not Agent
+    from livekit.agents import (
+        MetricsCollectedEvent,
+        UserInputTranscribedEvent,
+        ConversationItemAddedEvent,
+        SpeechCreatedEvent,
+        UserStateChangedEvent,
+    )
+    
+    # @session.on("metrics_collected")
+    # def _on_metrics_collected(ev: MetricsCollectedEvent):
+    #     usage.collect(ev.metrics)
+    #     m = ev.metrics
+    #     # (keep your latency debug logic here if you want)
+    #     try:
+    #         if getattr(m, "llm_ttft", 0) > 0 or getattr(m, "stt_latency", 0) > 0:
+    #             logger.info(f"📊 [METRICS] LLM TTFT: {getattr(m,'llm_ttft',0):.2f}s | STT Latency: {getattr(m,'stt_latency',0):.2f}s")
+    #             print(f"📊 LATENCY: LLM={getattr(m,'llm_ttft',0):.2f}s | STT={getattr(m,'stt_latency',0):.2f}s")
+    #     except Exception:
+    #         pass
+        
+        
+    # @session.on("user_input_transcribed")
+    # def _on_user_input_transcribed(ev: UserInputTranscribedEvent):
+    #     # This replaces your old "user_speech_committed" style event
+    #     if not getattr(ev, "is_final", True):
+    #         return
+    
+    #     transcript = (getattr(ev, "transcript", "") or "").strip()
+    #     if not transcript:
+    #         return
+    
+    #     ts = datetime.now().strftime("%H:%M:%S")
+    #     logger.info(f"👤 [USER INPUT] [{ts}] << {transcript}")
+    #     print(f"👤 USER: {transcript}")
+    #     call_logger.log_stt_transcript_only(text=transcript, latency_ms=0)
+    
+    #     # run your existing confirmation + filler handlers
+    #     class _Tmp: pass
+    #     tmp = _Tmp()
+    #     tmp.is_final = True
+    #     tmp.transcript = transcript
+    #     _on_user_input_confirmation(tmp)
+    #     _on_user_transcribed_filler(tmp)
+    
+    
+    # @session.on("conversation_item_added")
+    # def _on_conversation_item_added(ev: ConversationItemAddedEvent):
+    #     # This fires when a message is committed to chat history (user or agent)
+    #     item = ev.item
+    #     role = getattr(item, "role", None)
+    
+    #     if role == "assistant":
+    #         _on_agent_speech_committed(item)
+    #         _on_agent_speech_committed_log(item)
+    
+    
+    # @session.on("speech_created")
+    # def _on_speech_created(ev: SpeechCreatedEvent):
+    #     # This is the closest equivalent to "agent_speech_started"
+    #     speech_handle = getattr(ev, "speech_handle", None)
+    #     if speech_handle:
+    #         active_agent_handle["handle"] = speech_handle
+    
+    
+    # @session.on("user_state_changed")
+    # def _on_user_state_changed(ev: UserStateChangedEvent):
+    #     # Use this to detect user started speaking (replaces user_speech_started)
+    #     if getattr(ev, "new_state", None) == "speaking":
+    #         _on_user_speech_started(ev)
+    
+
+    # 5. CONNECT AND START ("INSTANT HANDSHAKE")
+    logger.info("[STARTUP] 🚀 Connecting to Room...")
+    try:
+        await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+        # INSTANT HANDSHAKE: Start immediately after connect
+        await session.start(room=ctx.room, agent=agent)
+        logger.info(f"🚀 SARAH IS NOW LIVE IN ROOM: {ctx.room.name}")
+        logger.info("[STARTUP] ✓ AgentSession started!")
+    except Exception as e:
+        logger.error(f"[STARTUP] ❌ Connection/Start failed: {e}")
+        return
 
     # 7. ASYNC CONTEXT FETCH & GREETING
     participant = await ctx.wait_for_participant()
@@ -379,43 +511,53 @@ async def entrypoint(ctx: JobContext):
          context_task = asyncio.create_task(fetch_clinic_context_optimized(called_num))
          logger.info(f"[DB] 🚀 Backgrounding context fetch for {called_num}")
 
-    async def _handle_context_and_greeting():
-        nonlocal clinic_info, agent_info, settings, agent_name, clinic_name, clinic_tz, clinic_region, agent_lang
-        greeting = "Hello! Thanks for calling. How can I help you today?"
+    async def _update_context_background(task: asyncio.Task):
+         nonlocal clinic_info, agent_info, settings, agent_name, clinic_name, clinic_tz, clinic_region, agent_lang
+         try:
+             logger.info("[DB] ⏳ Background context fetch started...")
+             clinic_info, agent_info, settings, agent_name = await task
+             
+             _GLOBAL_CLINIC_INFO = clinic_info
+             _GLOBAL_AGENT_SETTINGS = settings
+             _GLOBAL_SCHEDULE = load_schedule_from_settings(settings or {})
+             clinic_name = (clinic_info or {}).get("name") or clinic_name
+             clinic_tz = (clinic_info or {}).get("timezone") or clinic_tz
+             state.tz = clinic_tz
+             call_logger.clinic_id = clinic_info.get("id")
+             call_logger.organization_id = clinic_info.get("organization_id")
+             refresh_agent_memory()
+             logger.info(f"[DB] ✓ Context loaded for {clinic_name} (Persona updated)")
+         except Exception as e:
+             logger.error(f"[DB] ❌ Background context fetch failed: {e}")
+
+    if context_task:
+        asyncio.create_task(_update_context_background(context_task))
+
+    async def _handle_greeting():
+        # Race Condition: Try to get context in < 500ms
+        greeting = "Hello! Please wait one moment while I pull up your records..."
         
         if context_task:
             try:
-                logger.info("[STARTUP] ⏳ Waiting for DB context to personalize greeting...")
-                clinic_info, agent_info, settings, agent_name = await asyncio.wait_for(asyncio.shield(context_task), timeout=2.0)
+                # Give the DB 500ms to be fast. If it is, great! We greet personally.
+                logger.info("[STARTUP] ⏳ Waiting up to 500ms for DB context...")
+                await asyncio.wait_for(asyncio.shield(context_task), timeout=0.5)
                 
-                _GLOBAL_CLINIC_INFO = clinic_info
-                _GLOBAL_AGENT_SETTINGS = settings
-                _GLOBAL_SCHEDULE = load_schedule_from_settings(settings or {})
-                clinic_name = (clinic_info or {}).get("name") or clinic_name
-                clinic_tz = (clinic_info or {}).get("timezone") or clinic_tz
-                state.tz = clinic_tz
-                call_logger.clinic_id = clinic_info.get("id")
-                call_logger.organization_id = clinic_info.get("organization_id")
-                refresh_agent_memory()
-
-                if settings and settings.get("greeting_text"):
-                    greeting = settings.get("greeting_text")
-                elif clinic_info:
-                    greeting = f"Hi, thanks for calling {clinic_name}! How can I help you today?"
-                    
-                if state.phone_pending:
-                    speakable = speakable_phone(state.phone_pending)
-                    greeting = f"Hi, thanks for calling {clinic_name}! I see you're calling from {speakable}, is that the best number to reach you at?"
-                    state.pending_confirm, state.pending_confirm_field, state.contact_phase_started = "phone", "phone", True
-                logger.info(f"[DB] ✓ Context loaded for {clinic_name}")
+                # If we get here, context loaded fast!
+                if clinic_info:
+                     greeting = f"Hi, thanks for calling {clinic_name}! How can I help you today?"
+                     if settings and settings.get("greeting_text"):
+                         greeting = settings.get("greeting_text")
             except asyncio.TimeoutError:
-                logger.warning("[DB] ⚠️ Context fetch timeout")
+                logger.info("[STARTUP] ⚡ DB too slow (>500ms), using fallback greeting")
+                # Context is still loading in background thanks to _update_context_background
             except Exception as e:
-                logger.warning(f"[DB] ⚠️ Context fetch failed: {e}")
-            
+                logger.error(f"[STARTUP] ⚠ Context check failed: {e}")
+
+        logger.info(f"[STARTUP] 🗣️ Saying greeting: {greeting}")
         await session.say(greeting, allow_interruptions=True)
 
-    asyncio.create_task(_handle_context_and_greeting())
+    asyncio.create_task(_handle_greeting())
 
     # Shutdown
     async def _on_shutdown():
@@ -483,6 +625,12 @@ async def entrypoint(ctx: JobContext):
     # Keep alive
     disconnect_event = asyncio.Event()
     @ctx.room.on("disconnected")
-    def _(): disconnect_event.set()
-    try: await asyncio.wait_for(disconnect_event.wait(), timeout=7200)
-    except: pass
+    def _(reason=None): 
+        logger.info(f"[LIFECYCLE] Room disconnected: {reason}")
+        disconnect_event.set()
+    
+    # Wait for disconnect
+    await disconnect_event.wait()
+    
+    # Final cleanup
+    logger.info("[LIFECYCLE] Job finished.")

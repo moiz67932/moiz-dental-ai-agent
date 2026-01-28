@@ -490,9 +490,22 @@ class AssistantTools(_FunctionContextBase):
                     updates.append(f"time_text={time_suggestion}")
                     
             except Exception as e:
-                logger.warning(f"[TOOL] Time parse deferred: {time_suggestion} ({e})")
-                state.time_status = "pending"
-                updates.append(f"time_text={time_suggestion}")
+                logger.error(f"[TOOL] ❌ Time validation failed unexpectedly: {e!r}")
+            
+                # HARD STOP — do NOT leave tool in pending state
+                state.time_status = "error"
+                state.time_error = "schedule_unavailable"
+                state.dt_local = None
+                state.slot_available = False
+            
+                # Maintain integrity (important for later turns)
+                state.assert_integrity("time_exception_fallback")
+            
+                # FINAL user-facing response (prevents tool loop)
+                return (
+                    "Hmm — I’m having trouble checking the schedule right now. "
+                    "Could you try a different time, or would you like me to take a message for the front desk?"
+                )
         
         # Start contact phase only after name + valid time + slot available
         if state.full_name and state.dt_local and state.slot_available:

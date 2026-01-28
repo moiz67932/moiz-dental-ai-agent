@@ -44,6 +44,13 @@ import signal
 import asyncio
 import logging
 
+# Configure logging for LiveKit SDK
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S"
+)
+
 # FORCE PORT to avoid conflict if shell env has PORT=8080
 os.environ["PORT"] = "8080"
 

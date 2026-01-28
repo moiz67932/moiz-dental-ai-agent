@@ -96,7 +96,7 @@ if not logger.handlers:
 ENVIRONMENT = (os.getenv("ENVIRONMENT") or "development").strip().lower()
 
 # Telephony agent identity (must match SIP trunk dispatch rules)
-LIVEKIT_AGENT_NAME = os.getenv("LIVEKIT_AGENT_NAME", "telephony_agent")
+LIVEKIT_AGENT_NAME = os.getenv("LIVEKIT_AGENT_NAME", "telephony_agent_v3")
 
 DEFAULT_TZ = os.getenv("DEFAULT_TIMEZONE", "Asia/Karachi")
 DEFAULT_MIN = int(os.getenv("DEFAULT_APPT_MINUTES", "60"))
