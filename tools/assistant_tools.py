@@ -378,7 +378,7 @@ class AssistantTools(_FunctionContextBase):
                         clinic_id = (_GLOBAL_CLINIC_INFO or {}).get("id")
                         if clinic_id:
                             slot_end = parsed + timedelta(minutes=state.duration_minutes + APPOINTMENT_BUFFER_MINUTES)
-                            slot_free = await is_slot_free_supabase(clinic_id, parsed, slot_end)
+                            slot_free = await is_slot_free_supabase(clinic_id, parsed, slot_end, clinic_info=_GLOBAL_CLINIC_INFO)
                             
                             if not slot_free:
     

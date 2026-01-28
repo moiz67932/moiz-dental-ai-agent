@@ -91,7 +91,7 @@ async def entrypoint(ctx: JobContext):
     agent_info = None
     settings = None
     agent_name = "Office Assistant"
-    clinic_name = "our clinic"
+    clinic_name = "the dental clinic"
     clinic_tz = DEFAULT_TZ
     clinic_region = DEFAULT_PHONE_REGION
     agent_lang = "en-US"
@@ -535,25 +535,12 @@ async def entrypoint(ctx: JobContext):
         asyncio.create_task(_update_context_background(context_task))
 
     async def _handle_greeting():
-        # Race Condition: Try to get context in < 500ms
-        greeting = "Hello! Please wait one moment while I pull up your records..."
+        # IMMEDIATELY greet - do not wait for DB
+        # If clinic_name hasn't been updated yet, it uses the default
+        greeting = f"Hello! Thanks for calling {clinic_name}. How can I help you today?"
         
-        if context_task:
-            try:
-                # Give the DB 500ms to be fast. If it is, great! We greet personally.
-                logger.info("[STARTUP] ⏳ Waiting up to 500ms for DB context...")
-                await asyncio.wait_for(asyncio.shield(context_task), timeout=0.5)
-                
-                # If we get here, context loaded fast!
-                if clinic_info:
-                     greeting = f"Hi, thanks for calling {clinic_name}! How can I help you today?"
-                     if settings and settings.get("greeting_text"):
-                         greeting = settings.get("greeting_text")
-            except asyncio.TimeoutError:
-                logger.info("[STARTUP] ⚡ DB too slow (>500ms), using fallback greeting")
-                # Context is still loading in background thanks to _update_context_background
-            except Exception as e:
-                logger.error(f"[STARTUP] ⚠ Context check failed: {e}")
+        if settings and settings.get("greeting_text"):
+            greeting = settings.get("greeting_text")
 
         logger.info(f"[STARTUP] 🗣️ Saying greeting: {greeting}")
         await session.say(greeting, allow_interruptions=True)
@@ -562,22 +549,39 @@ async def entrypoint(ctx: JobContext):
 
     # Shutdown
     async def _on_shutdown():
+        nonlocal clinic_info, agent_info
         dur = int(max(0, time.time() - call_started))
         logger.info(f"[LIFECYCLE] Call ended. Flushing logs to Supabase...")
         await call_logger.flush_to_supabase()
+        
         try:
-            if clinic_info:
+            # If clinic_info isn't populated (short call), try one last-ditch fetch
+            if not clinic_info and called_num:
+                try:
+                    logger.info(f"[DB] 🛡️ Short call detected. Last-ditch context fetch for {called_num}...")
+                    clinic_info, agent_info, _, _ = await fetch_clinic_context_optimized(called_num)
+                except:
+                    pass
+
+            org_id = (clinic_info or {}).get("organization_id")
+            clinic_id = (clinic_info or {}).get("id")
+            agent_id = (agent_info or {}).get("id") or "fallback_agent"
+
+            if org_id and clinic_id:
                 outcome = map_call_outcome(None, state.booking_confirmed)
                 payload = {
-                    "organization_id": clinic_info["organization_id"],
-                    "clinic_id": clinic_info["id"],
+                    "organization_id": org_id,
+                    "clinic_id": clinic_id,
+                    "agent_id": agent_id,
                     "caller_phone_masked": f"***{state.phone_last4}" if state.phone_last4 else "Unknown",
                     "caller_name": state.full_name,
                     "outcome": outcome,
                     "duration_seconds": dur,
                 }
                 await asyncio.to_thread(lambda: supabase.table("call_sessions").insert(payload).execute())
-                logger.info(f"[DB] ✓ Call session metadata saved")
+                logger.info(f"[DB] ✓ Call session metadata saved (Agent: {agent_id})")
+            else:
+                logger.warning("[DB] ⚠ Skipping call_sessions insert: organization_id or clinic_id missing")
         except Exception as e:
             logger.error(f"[DB] Call session error: {e}")
 

@@ -210,9 +210,16 @@ async def fetch_clinic_context_optimized(
         return None, None, None, "Office Assistant"
 
 
-async def is_slot_free_supabase(clinic_id: str, start_dt: datetime, end_dt: datetime) -> bool:
+async def is_slot_free_supabase(clinic_id: str, start_dt: datetime, end_dt: datetime, clinic_info: dict = None) -> bool:
     """Check if slot is free in Supabase appointments table."""
     try:
+        # Safety check for closed dates (Fix #2)
+        if clinic_info:
+            closed = clinic_info.get("closed_dates", []) or []
+            if start_dt.strftime("%Y-%m-%d") in closed:
+                logger.info(f"[DB] 🛡️ Slot rejected: {start_dt.date()} is a closed date")
+                return False
+
         res = await asyncio.to_thread(
             lambda: supabase.table("appointments")
             .select("id")
