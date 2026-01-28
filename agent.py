@@ -200,39 +200,6 @@ async def entrypoint(ctx: JobContext):
     session_ref["agent"] = agent
 
 
-
-    # ================================
-    # EVENT WIRING (VERSION-SAFE)
-    # ================================
-    emitter = session if hasattr(session, "on") else agent
-    
-    emitter.on("metrics_collected", _on_metrics)
-    
-    emitter.on("user_input_transcribed", lambda ev: (
-        _on_user_input_confirmation(ev),
-        _on_user_transcribed_filler(ev),
-    ))
-    
-    emitter.on("conversation_item_added", lambda ev: (
-        _on_agent_speech_committed(ev.item)
-        if getattr(ev.item, "role", None) == "assistant"
-        else None,
-        _on_agent_speech_committed_log(ev.item)
-        if getattr(ev.item, "role", None) == "assistant"
-        else None,
-    ))
-    
-    emitter.on("speech_created", lambda ev: (
-        active_agent_handle.__setitem__("handle", getattr(ev, "speech_handle", None))
-    ))
-    
-    emitter.on("user_state_changed", lambda ev: (
-        _on_user_speech_started(ev)
-        if getattr(ev, "new_state", None) == "speaking"
-        else None
-    ))
-    
-
     # 4. DEFINE HANDLERS
     
     # Usage metrics
@@ -384,6 +351,40 @@ async def entrypoint(ctx: JobContext):
         is_filler = speech_text and any(speech_text.strip().startswith(f) for f in FILLER_PHRASES)
         if handle and not is_filler: _interrupt_filler()
         if not is_filler: _turn_metrics.log_turn(extra=f"response='{speech_text[:50]}'")
+
+
+        
+    # ================================
+    # EVENT WIRING (VERSION-SAFE)
+    # ================================
+    emitter = session if hasattr(session, "on") else agent
+    
+    emitter.on("metrics_collected", _on_metrics)
+    
+    emitter.on("user_input_transcribed", lambda ev: (
+        _on_user_input_confirmation(ev),
+        _on_user_transcribed_filler(ev),
+    ))
+    
+    emitter.on("conversation_item_added", lambda ev: (
+        _on_agent_speech_committed(ev.item)
+        if getattr(ev.item, "role", None) == "assistant"
+        else None,
+        _on_agent_speech_committed_log(ev.item)
+        if getattr(ev.item, "role", None) == "assistant"
+        else None,
+    ))
+    
+    emitter.on("speech_created", lambda ev: (
+        active_agent_handle.__setitem__("handle", getattr(ev, "speech_handle", None))
+    ))
+    
+    emitter.on("user_state_changed", lambda ev: (
+        _on_user_speech_started(ev)
+        if getattr(ev, "new_state", None) == "speaking"
+        else None
+    ))
+    
 
     # 6. REGISTER EVENT HANDLERS
     # Register handlers on the AGENT (not session) where appropriate for Agent events,
