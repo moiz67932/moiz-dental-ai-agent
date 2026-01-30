@@ -116,79 +116,123 @@ def load_schedule_from_settings(settings: Optional[dict]) -> Dict[str, Any]:
 # Extracted: is_within_working_hours
 # ============================================================================
 
+# def is_within_working_hours(
+#     start_dt: datetime,
+#     schedule: Dict[str, Any],
+#     duration_minutes: int = 60,
+# ) -> Tuple[bool, str]:
+#     """
+#     Enhanced validation: Check if entire appointment fits within working hours.
+    
+#     Rules:
+#     A) The entire appointment (start to start + duration) must fit within working intervals
+#     B) The appointment must NOT overlap with lunch_break
+#     C) The date must not be in closed_dates (holidays)
+    
+#     Returns: (is_valid, error_message)
+#     """
+#     if start_dt.tzinfo is None:
+#         return False, "ERROR: Invalid datetime (no timezone)."
+    
+#     end_dt = start_dt + timedelta(minutes=duration_minutes)
+    
+#     # Rule C: Holiday check
+#     if start_dt.date() in schedule["closed_dates"]:
+#         return False, f"ERROR: We're closed on {start_dt.strftime('%B %d')}. Would you like to try another day?"
+    
+#     dow_key = WEEK_KEYS[start_dt.weekday()]
+#     intervals = schedule["working_hours"].get(dow_key, [])
+    
+#     if not intervals:
+#         return False, f"ERROR: We're closed on {start_dt.strftime('%A')}s. Would you like to try another day?"
+    
+#     # Rule B: Lunch break check
+#     lunch = schedule.get("lunch_break") or DEFAULT_LUNCH_BREAK
+#     try:
+#         lh_s, lm_s = map(int, lunch["start"].split(":"))
+#         lh_e, lm_e = map(int, lunch["end"].split(":"))
+#         lunch_start = start_dt.replace(hour=lh_s, minute=lm_s, second=0, microsecond=0)
+#         lunch_end = start_dt.replace(hour=lh_e, minute=lm_e, second=0, microsecond=0)
+        
+#         # Check if appointment overlaps with lunch
+#         if start_dt < lunch_end and end_dt > lunch_start:
+#             # Suggest time after lunch
+#             suggested = lunch_end + timedelta(minutes=15)
+#             return False, f"ERROR: Our team is on lunch break from {lunch_start.strftime('%I:%M %p')} to {lunch_end.strftime('%I:%M %p')}. How about {suggested.strftime('%I:%M %p')} instead?"
+#     except Exception as e:
+#         logger.warning(f"[SCHEDULE] Lunch break parse error: {e}")
+    
+#     # Rule A: Check if entire appointment fits within working hours
+#     fits_in_interval = False
+#     for interval in intervals:
+#         try:
+#             sh, sm = map(int, interval["start"].split(":"))
+#             eh, em = map(int, interval["end"].split(":"))
+#             work_start = start_dt.replace(hour=sh, minute=sm, second=0, microsecond=0)
+#             work_end = start_dt.replace(hour=eh, minute=em, second=0, microsecond=0)
+            
+#             # Both start AND end must be within working hours
+#             if work_start <= start_dt and end_dt <= work_end:
+#                 fits_in_interval = True
+#                 break
+#         except Exception:
+#             continue
+    
+#     if not fits_in_interval:
+#         # Find the clinic hours for error message
+#         if intervals:
+#             first_interval = intervals[0]
+#             clinic_open = first_interval.get("start", "09:00")
+#             clinic_close = first_interval.get("end", "17:00")
+#             return False, f"ERROR: We're open from {clinic_open} to {clinic_close} on {start_dt.strftime('%A')}s. Would you like a different time?"
+#         return False, "ERROR: That time is outside our working hours. Would you like to try a different time?"
+    
+#     return True, "OK"
+
 def is_within_working_hours(
-    start_dt: datetime,
+    dt: datetime,
     schedule: Dict[str, Any],
-    duration_minutes: int = 60,
+    duration_minutes: int = 30
 ) -> Tuple[bool, str]:
     """
-    Enhanced validation: Check if entire appointment fits within working hours.
-    
-    Rules:
-    A) The entire appointment (start to start + duration) must fit within working intervals
-    B) The appointment must NOT overlap with lunch_break
-    C) The date must not be in closed_dates (holidays)
-    
-    Returns: (is_valid, error_message)
+    STRICT working-hours validation.
+    Start + duration MUST fully fit inside an open interval.
+    Returns (is_valid, reason)
     """
-    if start_dt.tzinfo is None:
-        return False, "ERROR: Invalid datetime (no timezone)."
-    
-    end_dt = start_dt + timedelta(minutes=duration_minutes)
-    
-    # Rule C: Holiday check
-    if start_dt.date() in schedule["closed_dates"]:
-        return False, f"ERROR: We're closed on {start_dt.strftime('%B %d')}. Would you like to try another day?"
-    
-    dow_key = WEEK_KEYS[start_dt.weekday()]
-    intervals = schedule["working_hours"].get(dow_key, [])
-    
-    if not intervals:
-        return False, f"ERROR: We're closed on {start_dt.strftime('%A')}s. Would you like to try another day?"
-    
-    # Rule B: Lunch break check
-    lunch = schedule.get("lunch_break") or DEFAULT_LUNCH_BREAK
     try:
-        lh_s, lm_s = map(int, lunch["start"].split(":"))
-        lh_e, lm_e = map(int, lunch["end"].split(":"))
-        lunch_start = start_dt.replace(hour=lh_s, minute=lm_s, second=0, microsecond=0)
-        lunch_end = start_dt.replace(hour=lh_e, minute=lm_e, second=0, microsecond=0)
-        
-        # Check if appointment overlaps with lunch
-        if start_dt < lunch_end and end_dt > lunch_start:
-            # Suggest time after lunch
-            suggested = lunch_end + timedelta(minutes=15)
-            return False, f"ERROR: Our team is on lunch break from {lunch_start.strftime('%I:%M %p')} to {lunch_end.strftime('%I:%M %p')}. How about {suggested.strftime('%I:%M %p')} instead?"
-    except Exception as e:
-        logger.warning(f"[SCHEDULE] Lunch break parse error: {e}")
-    
-    # Rule A: Check if entire appointment fits within working hours
-    fits_in_interval = False
-    for interval in intervals:
-        try:
-            sh, sm = map(int, interval["start"].split(":"))
-            eh, em = map(int, interval["end"].split(":"))
-            work_start = start_dt.replace(hour=sh, minute=sm, second=0, microsecond=0)
-            work_end = start_dt.replace(hour=eh, minute=em, second=0, microsecond=0)
-            
-            # Both start AND end must be within working hours
-            if work_start <= start_dt and end_dt <= work_end:
-                fits_in_interval = True
-                break
-        except Exception:
-            continue
-    
-    if not fits_in_interval:
-        # Find the clinic hours for error message
-        if intervals:
-            first_interval = intervals[0]
-            clinic_open = first_interval.get("start", "09:00")
-            clinic_close = first_interval.get("end", "17:00")
-            return False, f"ERROR: We're open from {clinic_open} to {clinic_close} on {start_dt.strftime('%A')}s. Would you like a different time?"
-        return False, "ERROR: That time is outside our working hours. Would you like to try a different time?"
-    
-    return True, "OK"
+        weekday_map = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+        dow = weekday_map[dt.weekday()]
 
+        working_hours = schedule.get("working_hours", {})
+        if dow not in working_hours or not working_hours[dow]:
+            return False, f"We are closed on {dt.strftime('%A')}s."
+
+        appt_end = dt + timedelta(minutes=duration_minutes)
+
+        for interval in working_hours[dow]:
+            open_h, open_m = map(int, interval["start"].split(":"))
+            close_h, close_m = map(int, interval["end"].split(":"))
+
+            open_dt = dt.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+            close_dt = dt.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
+
+            # STRICT CHECK
+            if dt >= open_dt and appt_end <= close_dt:
+                return True, "Slot is valid."
+
+        close_time = working_hours[dow][-1]["end"]
+        close_nice = datetime.strptime(close_time, "%H:%M").strftime("%I:%M %p").lstrip("0")
+
+        return (
+            False,
+            f"We close at {close_nice} on {dt.strftime('%A')}s, "
+            f"so a {duration_minutes}-minute appointment can't start at "
+            f"{dt.strftime('%I:%M %p').lstrip('0')}."
+        )
+
+    except Exception as e:
+        logger.error(f"[SCHEDULE] Working hours check failed: {e}")
+        return False, "I couldn't check the clinic schedule."
 
 
 # ============================================================================
@@ -455,96 +499,124 @@ async def get_alternatives_around_datetime(
 # Extracted: get_next_available_slots
 # ============================================================================
 
-async def get_next_available_slots(
-    clinic_id: str,
+# async def get_next_available_slots(
+#     clinic_id: str,
+#     schedule: Dict[str, Any],
+#     tz_str: str,
+#     duration_minutes: int = 60,
+#     num_slots: int = 3,
+#     days_ahead: int = 14,
+# ) -> List[datetime]:
+#     """
+#     Find the next N available appointment slots.
+    
+#     Algorithm:
+#     1. Fetch all scheduled appointments from now until days_ahead
+#     2. Iterate through valid working hour slots (skipping lunch)
+#     3. Return slots that are not occupied
+#     """
+#     tz = ZoneInfo(tz_str)
+#     now = datetime.now(tz)
+    
+#     # Round up to next slot step
+#     slot_step = schedule.get("slot_step_minutes", 30)
+#     minutes_to_add = slot_step - (now.minute % slot_step)
+#     if minutes_to_add == slot_step:
+#         minutes_to_add = 0
+#     current = now.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_add)
+    
+#     end_search = now + timedelta(days=days_ahead)
+#     logger.info(f"🔍 [SLOTS] Searching window: {now.date()} to {end_search.date()}")
+    
+#     # Fetch existing appointments from Supabase
+#     existing_appointments = []
+#     try:
+#         result = await asyncio.to_thread(
+#             lambda: supabase.table("appointments")
+#             .select("start_time, end_time")
+#             .eq("clinic_id", clinic_id)
+#             .gte("start_time", now.isoformat())
+#             .lte("start_time", end_search.isoformat())
+#             .in_("status", BOOKED_STATUSES)
+#             .execute()
+#         )
+#         for appt in (result.data or []):
+#             try:
+#                 appt_start = datetime.fromisoformat(appt["start_time"].replace("Z", "+00:00"))
+#                 appt_end = datetime.fromisoformat(appt["end_time"].replace("Z", "+00:00"))
+#                 existing_appointments.append((appt_start, appt_end))
+#             except Exception:
+#                 pass
+#     except Exception as e:
+#         logger.warning(f"[SLOTS] Failed to fetch appointments: {e}")
+    
+#     available_slots = []
+    
+#     while current < end_search and len(available_slots) < num_slots:
+#         # Check if slot is valid (working hours, not lunch, not holiday)
+#         is_valid, _ = is_within_working_hours(current, schedule, duration_minutes)
+        
+#         if is_valid:
+#             # Check if slot conflicts with existing appointments
+#             slot_end = current + timedelta(minutes=duration_minutes)
+#             is_free = True
+            
+#             for appt_start, appt_end in existing_appointments:
+#                 # Check for overlap
+#                 if current < appt_end and slot_end > appt_start:
+#                     is_free = False
+#                     break
+            
+#             if is_free:
+#                 available_slots.append(current)
+        
+#         # Move to next slot
+#         current += timedelta(minutes=slot_step)
+        
+#         # Skip to next day if we've passed working hours
+#         dow_key = WEEK_KEYS[current.weekday()]
+#         intervals = schedule["working_hours"].get(dow_key, [])
+#         if intervals:
+#             last_interval = intervals[-1]
+#             try:
+#                 eh, em = map(int, last_interval["end"].split(":"))
+#                 day_end = current.replace(hour=eh, minute=em)
+#                 if current >= day_end:
+#                     # Jump to next day morning
+#                     next_day = current.date() + timedelta(days=1)
+#                     current = datetime.combine(next_day, datetime.min.time(), tzinfo=tz)
+#                     current = current.replace(hour=8, minute=0)  # Start checking from 8am
+#             except Exception:
+#                 pass
+    
+#     return available_slots
+
+def get_next_available_slots(
+    start_dt: datetime,
     schedule: Dict[str, Any],
-    tz_str: str,
-    duration_minutes: int = 60,
-    num_slots: int = 3,
-    days_ahead: int = 14,
-) -> List[datetime]:
+    duration_minutes: int = 30,
+    limit: int = 2
+):
     """
-    Find the next N available appointment slots.
-    
-    Algorithm:
-    1. Fetch all scheduled appointments from now until days_ahead
-    2. Iterate through valid working hour slots (skipping lunch)
-    3. Return slots that are not occupied
+    Finds next valid slots to break LLM retry loops.
     """
-    tz = ZoneInfo(tz_str)
-    now = datetime.now(tz)
-    
-    # Round up to next slot step
-    slot_step = schedule.get("slot_step_minutes", 30)
-    minutes_to_add = slot_step - (now.minute % slot_step)
-    if minutes_to_add == slot_step:
-        minutes_to_add = 0
-    current = now.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_add)
-    
-    end_search = now + timedelta(days=days_ahead)
-    logger.info(f"🔍 [SLOTS] Searching window: {now.date()} to {end_search.date()}")
-    
-    # Fetch existing appointments from Supabase
-    existing_appointments = []
-    try:
-        result = await asyncio.to_thread(
-            lambda: supabase.table("appointments")
-            .select("start_time, end_time")
-            .eq("clinic_id", clinic_id)
-            .gte("start_time", now.isoformat())
-            .lte("start_time", end_search.isoformat())
-            .in_("status", BOOKED_STATUSES)
-            .execute()
-        )
-        for appt in (result.data or []):
-            try:
-                appt_start = datetime.fromisoformat(appt["start_time"].replace("Z", "+00:00"))
-                appt_end = datetime.fromisoformat(appt["end_time"].replace("Z", "+00:00"))
-                existing_appointments.append((appt_start, appt_end))
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning(f"[SLOTS] Failed to fetch appointments: {e}")
-    
-    available_slots = []
-    
-    while current < end_search and len(available_slots) < num_slots:
-        # Check if slot is valid (working hours, not lunch, not holiday)
-        is_valid, _ = is_within_working_hours(current, schedule, duration_minutes)
-        
-        if is_valid:
-            # Check if slot conflicts with existing appointments
-            slot_end = current + timedelta(minutes=duration_minutes)
-            is_free = True
-            
-            for appt_start, appt_end in existing_appointments:
-                # Check for overlap
-                if current < appt_end and slot_end > appt_start:
-                    is_free = False
-                    break
-            
-            if is_free:
-                available_slots.append(current)
-        
-        # Move to next slot
-        current += timedelta(minutes=slot_step)
-        
-        # Skip to next day if we've passed working hours
-        dow_key = WEEK_KEYS[current.weekday()]
-        intervals = schedule["working_hours"].get(dow_key, [])
-        if intervals:
-            last_interval = intervals[-1]
-            try:
-                eh, em = map(int, last_interval["end"].split(":"))
-                day_end = current.replace(hour=eh, minute=em)
-                if current >= day_end:
-                    # Jump to next day morning
-                    next_day = current.date() + timedelta(days=1)
-                    current = datetime.combine(next_day, datetime.min.time(), tzinfo=tz)
-                    current = current.replace(hour=8, minute=0)  # Start checking from 8am
-            except Exception:
-                pass
-    
-    return available_slots
+    slots = []
+    cursor = start_dt
+    days_checked = 0
+
+    while len(slots) < limit and days_checked < 7:
+        valid, _ = is_within_working_hours(cursor, schedule, duration_minutes)
+
+        if valid:
+            slots.append(cursor)
+            cursor += timedelta(minutes=duration_minutes)
+        else:
+            cursor += timedelta(minutes=30)
+
+        if cursor.hour == 0 and cursor.minute == 0:
+            days_checked += 1
+            cursor = cursor.replace(hour=8, minute=0)
+
+    return slots
 
 

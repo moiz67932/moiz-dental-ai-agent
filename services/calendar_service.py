@@ -14,8 +14,9 @@ import json
 import asyncio
 from typing import Optional, Dict, Callable, Tuple
 
-from .calendar_client import CalendarAuth, set_token_refresh_callback
+from .calendar_client import CalendarAuth, set_token_refresh_callback, create_event
 from config import supabase, logger, GOOGLE_OAUTH_TOKEN_PATH, GOOGLE_CALENDAR_AUTH_MODE, GOOGLE_CALENDAR_ID_DEFAULT
+from services.extraction_service import _iso
 
 # Global to track agent settings ID for token refresh
 _GLOBAL_AGENT_SETTINGS_ID: Optional[str] = None
@@ -249,3 +250,46 @@ def resolve_calendar_auth(clinic_info: Optional[dict]) -> Tuple[Optional[Calenda
     
     logger.warning("[CALENDAR_AUTH] No OAuth token available (sync path).")
     return None, GOOGLE_CALENDAR_ID_DEFAULT
+
+async def create_calendar_event_for_appointment(clinic_info: dict, patient_state: "PatientState", oauth_token: dict) -> str | None:
+    """
+    Wrapper to create a Google Calendar event from PatientState.
+    """
+    try:
+        # Use your existing create_event logic from calendar_client.py
+        # We wrap it in to_thread because create_event might be synchronous or network heavy
+        
+        cal_id = clinic_info.get("google_calendar_id") or "primary"
+        
+        # Construct authentication object if needed, or pass token directly
+        # Based on your calendar_client.py, we need to adapt slightly:
+        from services.calendar_client import CalendarAuth
+        auth = CalendarAuth(
+            auth_type="oauth_user",
+            secret_json=oauth_token,
+            delegated_user=None
+        )
+
+        logger.info("[CALENDAR] Creating background event...")
+        
+        def _create_sync():
+            result = create_event(
+                calendar_id=cal_id,
+                service_name=patient_state.reason or "Appointment",
+                start_dt=patient_state.dt_local,
+                duration_minutes=patient_state.duration_minutes or 30,
+                tz=str(patient_state.dt_local.tzinfo),
+                patient_name=patient_state.full_name,
+                patient_phone=patient_state.phone_e164,
+                clinic_name=clinic_info.get("name", "Dental Clinic"),
+                auth=auth
+            )
+            return result.get("id")
+
+        event_id = await asyncio.to_thread(_create_sync)
+        logger.info(f"[CALENDAR] ✅ Event created: {event_id}")
+        return event_id
+
+    except Exception as e:
+        logger.error(f"[CALENDAR] Background creation failed: {e}")
+        return None

@@ -192,6 +192,20 @@ class AssistantTools(_FunctionContextBase):
         if phone:
             # CONTEXT-AWARE VERIFICATION CHECK (Fix #3)
             # If we just captured phone, treat fragments/confirmations as verification, NOT new data
+
+            if state.phone_confirmed and state.phone_e164:
+                clinic_region = (_GLOBAL_CLINIC_INFO or {}).get(
+                    "default_phone_region", DEFAULT_PHONE_REGION
+                )
+                new_norm, _ = _normalize_phone_preserve_plus(phone, clinic_region)
+
+                if new_norm == state.phone_e164:
+                    logger.info(
+                        f"[TOOL] 🛡️ Phone already confirmed ({state.phone_e164}). Ignoring redundant update."
+                    )
+                    # IMPORTANT: Do NOT return a message, just skip phone handling
+                    phone = None
+
             if state.awaiting_slot_confirmation and state.last_captured_slot == "phone" and state.last_captured_phone:
                 action, reason = interpret_followup_for_slot("phone", state.last_captured_phone, phone)
                 
@@ -460,30 +474,30 @@ class AssistantTools(_FunctionContextBase):
                         # Sonic-3 prosody: breathy confirmation with ellipses
                         # CRITICAL: Phrase forces LLM to understand booking is NOT complete yet
                         return f"... ah, perfect! {day_spoken} at {time_spoken} is open and I've noted that. I'll book it for you once we finish the rest of the details."
-                    else:
-                        # Time is invalid (lunch, after-hours, holiday)
-                        state.time_status = "invalid"
-                        state.time_error = error_msg
-                        state.dt_local = None  # Don't save invalid time
-                        
-                        logger.warning(f"[TOOL] ✗ Time rejected: {error_msg}")
-                        # Assert integration to catch partial wipe bugs
-                        state.assert_integrity("time_invalid_logic")
-                        
-                        # Check if it's a lunch break - give a helpful response with Sonic-3 prosody
-                        if "lunch" in error_msg.lower():
-                            lunch_end = schedule.get("lunch_break", {}).get("end", "14:00")
-                            lunch_time = lunch_end.replace(":00", "").lstrip("0")
-                            return f"... oh, the team is at lunch then-- but I can get you in right at {lunch_time} when they're back. How does that sound?"
-                        
-                        # After-hours or closed day
-                        if "closed" in error_msg.lower() or "sunday" in error_msg.lower():
-                            return f"... hmm, we're actually closed on {day_spoken}. Would another day work for you?"
-                        
-                        if "outside" in error_msg.lower() or "hours" in error_msg.lower():
-                            return f"... ah, {time_spoken} is outside our hours. We're open 9 to 5-- would morning or late afternoon work?"
-                        
-                        errors.append(error_msg)
+                    
+
+                    # STRICT invalid time → suggest nearby working slots
+                    state.time_status = "invalid"
+                    state.time_error = error_msg
+                    state.dt_local = None
+                    
+                    alternatives = get_next_available_slots(
+                        start_dt=parsed,
+                        schedule=schedule,
+                        duration_minutes=state.duration_minutes,
+                        limit=2,
+                    )
+                    
+                    if alternatives:
+                        times = [t.strftime("%I:%M %p").lstrip("0") for t in alternatives]
+                        return (
+                            f"{error_msg} I do have availability at {times[0]}"
+                            + (f" or {times[1]}" if len(times) > 1 else "")
+                            + ". Would you like one of those?"
+                        )
+                    
+                    return f"{error_msg} Would you like to try another time?"
+                    
                 else:
                     # Parsing failed or None result (e.g. user said "No" or "Cancel")
                     state.time_status = "pending"
@@ -1088,6 +1102,21 @@ class AssistantTools(_FunctionContextBase):
         """
         # global state removed
         state = self.state
+
+        # 🛡️ HARD GUARD — if already confirmed, do NOT re-enter verification mode
+        if state.phone_confirmed and state.phone_e164:
+            if confirmed and not new_phone:
+                logger.info("[TOOL] 🛡️ confirm_phone called again, but phone already confirmed. No-op.")
+                return "Got it — your phone number is already confirmed."
+
+            if new_phone:
+                clinic_region = (_GLOBAL_CLINIC_INFO or {}).get("default_phone_region", DEFAULT_PHONE_REGION)
+                new_norm, new_last4 = _normalize_phone_preserve_plus(new_phone, clinic_region)
+
+                if new_norm and new_norm == state.phone_e164:
+                    logger.info("[TOOL] 🛡️ confirm_phone received same number again. No-op.")
+                    return "Perfect — that phone number is already confirmed."
+
         if not state:
             return "State not initialized."
     
@@ -1331,147 +1360,257 @@ class AssistantTools(_FunctionContextBase):
     
     
 
-    @llm.function_tool(description="""
-    Finalize the appointment booking. Call this ONLY after:
-    1. You have collected ALL required information (name, phone, email, reason, time)
-    2. You have read back the summary to the patient
-    3. The patient has verbally confirmed with 'yes' or similar
-    Do NOT call this until the patient confirms the summary!
-    """)
-    async def confirm_and_book_appointment(self, ) -> str:
-        """
-        Trigger the actual booking after user confirmation.
+    # @llm.function_tool(description="""
+    # Finalize the appointment booking. Call this ONLY after:
+    # 1. You have collected ALL required information (name, phone, email, reason, time)
+    # 2. You have read back the summary to the patient
+    # 3. The patient has verbally confirmed with 'yes' or similar
+    # Do NOT call this until the patient confirms the summary!
+    # """)
+    # async def confirm_and_book_appointment(self, ) -> str:
+    #     """
+    #     Trigger the actual booking after user confirmation.
         
-        Uses DB-backed OAuth with non-blocking token refresh persistence.
-        """
-        # global state removed, _GLOBAL_CLINIC_INFO, _GLOBAL_AGENT_SETTINGS
-        state = self.state
-        clinic_info = _GLOBAL_CLINIC_INFO
-        settings = _GLOBAL_AGENT_SETTINGS
+    #     Uses DB-backed OAuth with non-blocking token refresh persistence.
+    #     """
+    #     # global state removed, _GLOBAL_CLINIC_INFO, _GLOBAL_AGENT_SETTINGS
+    #     state = self.state
+    #     clinic_info = _GLOBAL_CLINIC_INFO
+    #     settings = _GLOBAL_AGENT_SETTINGS
         
-        if not state:
-            return "State not initialized."
+    #     if not state:
+    #         return "State not initialized."
         
-        # IDEMPOTENCY CHECK
-        if state.check_tool_lock("confirm_and_book_appointment", locals()):
-            return "Booking request already processed."
+    #     # IDEMPOTENCY CHECK
+    #     if state.check_tool_lock("confirm_and_book_appointment", locals()):
+    #         return "Booking request already processed."
         
-        # FIX 3: Enhanced logging visibility for debugging false bookings
-        is_complete = state.is_complete()
-        logger.info(f"[BOOKING] Tool triggered. State complete: {is_complete}")
+    #     # FIX 3: Enhanced logging visibility for debugging false bookings
+    #     is_complete = state.is_complete()
+    #     logger.info(f"[BOOKING] Tool triggered. State complete: {is_complete}")
         
-        if not is_complete:
-            missing = state.missing_slots()
-            logger.warning(f"[BOOKING] Cannot book - missing slots: {missing}")
-            return f"Missing: {', '.join(missing)}. Continue gathering info before booking."
+    #     if not is_complete:
+    #         missing = state.missing_slots()
+    #         logger.warning(f"[BOOKING] Cannot book - missing slots: {missing}")
+    #         return f"Missing: {', '.join(missing)}. Continue gathering info before booking."
         
-        # CRITICAL SAFETY GATE: Booking REQUIRES confirmed contact details
-        if not state.phone_confirmed:
-            return "Phone number not confirmed yet. Please confirm phone before booking."
-        if not state.email_confirmed:
-            return "Email not confirmed yet. Please confirm email before booking."
+    #     # CRITICAL SAFETY GATE: Booking REQUIRES confirmed contact details
+    #     if not state.phone_confirmed:
+    #         return "Phone number not confirmed yet. Please confirm phone before booking."
+    #     if not state.email_confirmed:
+    #         return "Email not confirmed yet. Please confirm email before booking."
         
-        # DOUBLE BOOKING GUARD
-        # Create unique booking key based on time + phone
-        booking_key = f"{state.dt_local.isoformat() if state.dt_local else 'None'}:{state.phone_e164}"
+    #     # DOUBLE BOOKING GUARD
+    #     # Create unique booking key based on time + phone
+    #     booking_key = f"{state.dt_local.isoformat() if state.dt_local else 'None'}:{state.phone_e164}"
         
-        if state.booking_confirmed:
-            if state.last_booking_key == booking_key:
-                 return "Appointment already booked! Tell the user their appointment is confirmed."
-            else:
-                 return "An appointment is already confirmed. Ask if they want to book another."
+    #     if state.booking_confirmed:
+    #         if state.last_booking_key == booking_key:
+    #              return "Appointment already booked! Tell the user their appointment is confirmed."
+    #         else:
+    #              return "An appointment is already confirmed. Ask if they want to book another."
                  
-        if state.booking_in_progress:
-            return "Booking already in progress. Please wait."
+    #     if state.booking_in_progress:
+    #         return "Booking already in progress. Please wait."
         
-        if not clinic_info:
-            return "Clinic info not available. Cannot book."
+    #     if not clinic_info:
+    #         return "Clinic info not available. Cannot book."
         
-        # Mark booking in progress
-        state.booking_in_progress = True
-        state.last_booking_key = booking_key
+    #     # Mark booking in progress
+    #     state.booking_in_progress = True
+    #     state.last_booking_key = booking_key
         
+    #     try:
+    #         # Get calendar auth with DB-first priority and refresh callback
+    #         auth, calendar_id, refresh_callback = await resolve_calendar_auth_async(
+    #             clinic_info,
+    #             settings=settings
+    #         )
+    #         if not auth:
+    #             state.booking_in_progress = False
+    #             logger.error("[BOOKING] Calendar auth failed - no OAuth token available.")
+    #             return "Calendar not configured. Tell the user to call back."
+            
+    #         # Get calendar service with refresh callback for non-blocking token persistence
+    #         service = await asyncio.to_thread(
+    #             _get_calendar_service, 
+    #             auth=auth,
+    #             on_refresh_callback=refresh_callback
+    #         )
+    #         if not service:
+    #             state.booking_in_progress = False
+    #             return "Calendar unavailable. Tell the user to try again."
+            
+    #         start_dt = state.dt_local
+    #         if not start_dt:
+    #             state.booking_in_progress = False
+    #             return "No appointment time set. Please select a time first."
+    #         end_dt = start_dt + timedelta(minutes=state.duration_minutes)  # Use service-specific duration
+            
+    #         # Check availability
+    #         try:
+    #             resp = service.freebusy().query(body={
+    #                 "timeMin": start_dt.isoformat(),
+    #                 "timeMax": end_dt.isoformat(),
+    #                 "timeZone": state.tz,
+    #                 "items": [{"id": calendar_id}],
+    #             }).execute()
+    #             busy = resp.get("calendars", {}).get(calendar_id, {}).get("busy", [])
+                
+    #             if busy:
+    #                 state.booking_in_progress = False
+    #                 state.dt_local = None
+    #                 return "That time slot is now taken. Ask the user for another time."
+    #         except Exception as e:
+    #             logger.warning(f"[BOOKING] Freebusy check failed: {e}")
+            
+    #         # Create event
+    #         event = service.events().insert(
+    #             calendarId=calendar_id,
+    #             body={
+    #                 "summary": f"{state.reason or 'Appointment'} — {state.full_name}",
+    #                 "description": f"Patient: {state.full_name}\nPhone: {state.phone_e164}\nEmail: {state.email}",
+    #                 "start": {"dateTime": start_dt.isoformat(), "timeZone": state.tz},
+    #                 "end": {"dateTime": end_dt.isoformat(), "timeZone": state.tz},
+    #                 "attendees": [{"email": state.email}] if state.email else [],
+    #             },
+    #             sendUpdates="all",
+    #         ).execute()
+            
+    #         if event and event.get("id"):
+    #             state.booking_confirmed = True
+    #             state.calendar_event_id = event.get("id")
+                
+    #             # Non-blocking Supabase save
+    #             asyncio.create_task(book_to_supabase(clinic_info, state, event.get("id")))
+                
+    #             logger.info(f"[BOOKING] ✓ SUCCESS! Event ID: {event.get('id')}")
+                
+    #             # Build warm, human-sounding confirmation for TTS
+    #             spoken_confirmation = build_spoken_confirmation(state)
+    #             return f"BOOKING CONFIRMED! Read this exactly to the user: {spoken_confirmation}"
+    #         else:
+    #             state.booking_in_progress = False
+    #             return "Booking failed. Ask the user to try again."
+                
+    #     except Exception as e:
+    #         logger.error(f"[BOOKING] Error: {e}")
+    #         state.booking_in_progress = False
+    #         return f"Booking error: {str(e)}. Tell the user something went wrong."
+    #     finally:
+    #         state.booking_in_progress = False
+    
+    
+# tools/assistant_tools.py
+
+    @llm.function_tool(description="""
+    FINAL STEP: Call this IMMEDIATELY when the user confirms details.
+    Never say "I'm booking" without calling this.
+    If user says "Correct, and change reason to X", you MUST update_patient_record FIRST, then call this.
+    """)
+    
+    @llm.function_tool(description="""
+    FINAL STEP: Call this IMMEDIATELY after the user confirms details.
+    Do not say "I'm finalizing" without calling this tool.
+    """)
+    async def confirm_and_book_appointment(self) -> str:
+        """
+        Books to Supabase (fast). Calendar sync is optional and best-effort.
+        """
+        state = self.state
+
+        clinic_info = _GLOBAL_CLINIC_INFO
+        agent_settings = _GLOBAL_AGENT_SETTINGS or {}
+
+        if not state or not clinic_info:
+            return (
+                "Sorry — I’m missing clinic details on my side, so I can’t finalize the booking right now. "
+                "Could you please call back in a moment?"
+            )
+
+        # Idempotency — prevents double booking if model retries
+        if getattr(state, "appointment_booked", False):
+            # keep it natural (no headings)
+            dt = state.dt_local
+            if dt:
+                day = dt.strftime("%A, %B %d")
+                time_str = dt.strftime("%I:%M %p").lstrip("0")
+                return f"Yes — you’re already booked for {state.reason or 'your appointment'} on {day} at {time_str}."
+            return "Yes — you’re already booked."
+
+        # Basic safety: must have the key fields
+        if not state.full_name or not state.dt_local or not (state.phone_e164 or state.phone_pending):
+            return (
+                "I’m almost there — I just need your name, a confirmed time, and your phone number to finalize the booking."
+            )
+
+        # 1) Book to Supabase first
+        from services.database_service import book_to_supabase
+
         try:
-            # Get calendar auth with DB-first priority and refresh callback
-            auth, calendar_id, refresh_callback = await resolve_calendar_auth_async(
-                clinic_info,
-                settings=settings
-            )
-            if not auth:
-                state.booking_in_progress = False
-                logger.error("[BOOKING] Calendar auth failed - no OAuth token available.")
-                return "Calendar not configured. Tell the user to call back."
-            
-            # Get calendar service with refresh callback for non-blocking token persistence
-            service = await asyncio.to_thread(
-                _get_calendar_service, 
-                auth=auth,
-                on_refresh_callback=refresh_callback
-            )
-            if not service:
-                state.booking_in_progress = False
-                return "Calendar unavailable. Tell the user to try again."
-            
-            start_dt = state.dt_local
-            if not start_dt:
-                state.booking_in_progress = False
-                return "No appointment time set. Please select a time first."
-            end_dt = start_dt + timedelta(minutes=state.duration_minutes)  # Use service-specific duration
-            
-            # Check availability
-            try:
-                resp = service.freebusy().query(body={
-                    "timeMin": start_dt.isoformat(),
-                    "timeMax": end_dt.isoformat(),
-                    "timeZone": state.tz,
-                    "items": [{"id": calendar_id}],
-                }).execute()
-                busy = resp.get("calendars", {}).get(calendar_id, {}).get("busy", [])
-                
-                if busy:
-                    state.booking_in_progress = False
-                    state.dt_local = None
-                    return "That time slot is now taken. Ask the user for another time."
-            except Exception as e:
-                logger.warning(f"[BOOKING] Freebusy check failed: {e}")
-            
-            # Create event
-            event = service.events().insert(
-                calendarId=calendar_id,
-                body={
-                    "summary": f"{state.reason or 'Appointment'} — {state.full_name}",
-                    "description": f"Patient: {state.full_name}\nPhone: {state.phone_e164}\nEmail: {state.email}",
-                    "start": {"dateTime": start_dt.isoformat(), "timeZone": state.tz},
-                    "end": {"dateTime": end_dt.isoformat(), "timeZone": state.tz},
-                    "attendees": [{"email": state.email}] if state.email else [],
-                },
-                sendUpdates="all",
-            ).execute()
-            
-            if event and event.get("id"):
-                state.booking_confirmed = True
-                state.calendar_event_id = event.get("id")
-                
-                # Non-blocking Supabase save
-                asyncio.create_task(book_to_supabase(clinic_info, state, event.get("id")))
-                
-                logger.info(f"[BOOKING] ✓ SUCCESS! Event ID: {event.get('id')}")
-                
-                # Build warm, human-sounding confirmation for TTS
-                spoken_confirmation = build_spoken_confirmation(state)
-                return f"BOOKING CONFIRMED! Read this exactly to the user: {spoken_confirmation}"
-            else:
-                state.booking_in_progress = False
-                return "Booking failed. Ask the user to try again."
-                
+            ok = await book_to_supabase(clinic_info, patient_state=state, calendar_event_id=None)
         except Exception as e:
-            logger.error(f"[BOOKING] Error: {e}")
-            state.booking_in_progress = False
-            return f"Booking error: {str(e)}. Tell the user something went wrong."
-        finally:
-            state.booking_in_progress = False
-    
-    
+            logger.error(f"[BOOK] Supabase booking failed: {e!r}")
+            ok = False
+
+        if not ok:
+            return (
+                "I’m having trouble saving the appointment right now. "
+                "Could you try again in a moment, or would you like me to take a message for the front desk?"
+            )
+
+        # Mark booked
+        state.appointment_booked = True
+
+        # 2) Best-effort calendar sync (optional)
+        async def _bg_calendar_sync():
+            try:
+                # Only attempt if you actually have OAuth configured
+                token = agent_settings.get("google_oauth_token")
+                if not token:
+                    return
+            
+                from services.calendar_service import resolve_calendar_auth_async
+                from services.calendar_client import CalendarClient
+            
+                auth, calendar_id, refresh_cb = await resolve_calendar_auth_async(clinic_info)
+                if not auth or not calendar_id:
+                    return
+            
+                client = CalendarClient(auth, refresh_cb=refresh_cb)
+            
+                start_dt = state.dt_local
+                end_dt = start_dt + timedelta(minutes=(state.duration_minutes or 60))
+            
+                appt_info = {
+                    "summary": f"{state.reason or 'Appointment'} - {state.full_name}",
+                    "start_time": start_dt.isoformat(),
+                    "end_time": end_dt.isoformat(),
+                    "description": f"Phone: {state.phone_e164 or state.phone_pending}\nEmail: {state.email or ''}".strip(),
+                }
+            
+                # This creates the event in Google Calendar
+                client.book_appointment(auth, calendar_id, appt_info)
+            
+            except Exception as e:
+                logger.error(f"[BG_TASK] Calendar sync failed: {e!r}")
+            
+            asyncio.create_task(_bg_calendar_sync())
+            
+            # 3) Natural spoken confirmation (no headings / bullet list)
+            dt = state.dt_local
+            day = dt.strftime("%A, %B %d")
+            time_str = dt.strftime("%I:%M %p").lstrip("0")
+            phone_last4 = state.phone_last4 or (state.phone_e164[-4:] if state.phone_e164 else "")
+            
+            email_part = f" I’ll send a confirmation to {state.email}." if state.email else ""
+            phone_part = f" Your number ending in {phone_last4} is on file." if phone_last4 else ""
+            
+            return (
+                f"Perfect, {state.full_name} — you’re all set for {state.reason or 'your appointment'} "
+                f"on {day} at {time_str}.{phone_part}{email_part} "
+                f"Is there anything else I can help you with?"
+            )
 
     @llm.function_tool(description="""
     Search the clinic knowledge base for information about parking, pricing, insurance, 

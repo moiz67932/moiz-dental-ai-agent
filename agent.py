@@ -272,9 +272,9 @@ async def entrypoint(ctx: JobContext):
             except Exception as e: logger.error(f"[CONFIRM] Error: {e}")
 
         if pending == "phone" and state.contact_phase_started:
-            asyncio.create_task(_confirm(fnc_ctx.confirm_phone, is_yes))
+            asyncio.create_task(_confirm(assistant_tools.confirm_phone, is_yes))
         elif pending == "email" and not state.email_confirmed:
-             asyncio.create_task(_confirm(fnc_ctx.confirm_email, is_yes))
+             asyncio.create_task(_confirm(assistant_tools.confirm_email, is_yes))
 
     # Filler Logic
     def _interrupt_filler():
@@ -513,7 +513,16 @@ async def entrypoint(ctx: JobContext):
          logger.info(f"[DB] 🚀 Backgrounding context fetch for {called_num}")
 
     async def _update_context_background(task: asyncio.Task):
+         global _GLOBAL_CLINIC_INFO, _GLOBAL_AGENT_SETTINGS, _GLOBAL_SCHEDULE
          nonlocal clinic_info, agent_info, settings, agent_name, clinic_name, clinic_tz, clinic_region, agent_lang
+         import tools.assistant_tools as atools
+
+         atools._GLOBAL_STATE = state
+         atools._GLOBAL_CLINIC_INFO = clinic_info
+         atools._GLOBAL_AGENT_SETTINGS = settings
+         atools._GLOBAL_SCHEDULE = load_schedule_from_settings(settings or {})
+         atools._REFRESH_AGENT_MEMORY = refresh_agent_memory
+         
          try:
              logger.info("[DB] ⏳ Background context fetch started...")
              clinic_info, agent_info, settings, agent_name = await task
@@ -528,22 +537,32 @@ async def entrypoint(ctx: JobContext):
              call_logger.organization_id = clinic_info.get("organization_id")
              refresh_agent_memory()
              logger.info(f"[DB] ✓ Context loaded for {clinic_name} (Persona updated)")
-         except Exception as e:
+         except Exception as e:         
              logger.error(f"[DB] ❌ Background context fetch failed: {e}")
 
     if context_task:
         asyncio.create_task(_update_context_background(context_task))
 
     async def _handle_greeting():
-        # IMMEDIATELY greet - do not wait for DB
-        # If clinic_name hasn't been updated yet, it uses the default
-        greeting = f"Hello! Thanks for calling {clinic_name}. How can I help you today?"
-        
+    # If we have a DB context task, wait briefly so we can greet with the right clinic + greeting_text
+        if context_task:
+            try:
+                await asyncio.wait_for(context_task, timeout=2.5)
+            except asyncio.TimeoutError:
+                pass  # we'll greet with fallback if DB is slow
+
+        # If background updater already populated settings, use DB greeting_text first
+        greeting = None
         if settings and settings.get("greeting_text"):
-            greeting = settings.get("greeting_text")
+            greeting = settings["greeting_text"]
+        elif clinic_name:
+            greeting = f"Hello! This is {clinic_name}. How can I help you today?"
+        else:
+            greeting = "Hello! Thanks for calling. How can I help you today?"
 
         logger.info(f"[STARTUP] 🗣️ Saying greeting: {greeting}")
         await session.say(greeting, allow_interruptions=True)
+
 
     asyncio.create_task(_handle_greeting())
 

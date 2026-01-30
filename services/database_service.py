@@ -215,7 +215,10 @@ async def is_slot_free_supabase(clinic_id: str, start_dt: datetime, end_dt: date
     try:
         # Safety check for closed dates (Fix #2)
         if clinic_info:
-            closed = clinic_info.get("closed_dates", []) or []
+            try:
+                closed = schedule.get("closed_dates") or set()
+            except Exception:
+                closed = set()
             if start_dt.strftime("%Y-%m-%d") in closed:
                 logger.info(f"[DB] 🛡️ Slot rejected: {start_dt.date()} is a closed date")
                 return False
@@ -235,22 +238,66 @@ async def is_slot_free_supabase(clinic_id: str, start_dt: datetime, end_dt: date
         return False
 
 
-async def book_to_supabase(
-    clinic_info: dict,
-    patient_state: "PatientState",
-    calendar_event_id: Optional[str] = None,
-) -> bool:
-    """Insert appointment into Supabase."""
+# async def book_to_supabase(
+#     clinic_info: dict,
+#     patient_state: "PatientState",
+#     calendar_event_id: Optional[str] = None,
+# ) -> bool:
+#     """Insert appointment into Supabase."""
+#     try:
+#         start_time = patient_state.dt_local
+#         if not start_time:
+#             logger.error("[DB] Cannot book: no start_time set")
+#             return False
+#         end_time = start_time + timedelta(minutes=patient_state.duration_minutes)
+        
+#         payload = {
+#             "organization_id": clinic_info["organization_id"],
+#             "clinic_id": clinic_info["id"],
+#             "patient_name": patient_state.full_name,
+#             "patient_phone_masked": patient_state.phone_last4,
+#             "patient_email": patient_state.email,
+#             "start_time": _iso(start_time),
+#             "end_time": _iso(end_time),
+#             "status": "scheduled",
+#             "source": "ai",
+#             "reason": patient_state.reason,
+#         }
+        
+#         if calendar_event_id:
+#             payload["calendar_event_id"] = calendar_event_id
+        
+#         await asyncio.to_thread(
+#             lambda: supabase.table("appointments").insert(payload).execute()
+#         )
+#         logger.info("[DB] Appointment saved to Supabase")
+#         return True
+#     except Exception as e:
+#         logger.error(f"[DB] Booking insert error: {e}")
+#         return False
+
+
+# TUNING: Kill DB write if it takes longer than 6 seconds
+BOOKING_DB_TIMEOUT_SEC = 6.0 
+
+async def book_to_supabase(clinic_info: dict, patient_state: "PatientState", calendar_event_id: str = None) -> str | None:
+    """
+    Insert appointment row in Supabase.
+    Returns appointment_id on success, None on failure.
+    Has hard timeout so calls never hang.
+    """
     try:
         start_time = patient_state.dt_local
         if not start_time:
             logger.error("[DB] Cannot book: no start_time set")
-            return False
-        end_time = start_time + timedelta(minutes=patient_state.duration_minutes)
-        
+            return None
+
+        duration = patient_state.duration_minutes or 30
+        end_time = start_time + timedelta(minutes=duration)
+
         payload = {
-            "organization_id": clinic_info["organization_id"],
-            "clinic_id": clinic_info["id"],
+            "organization_id": clinic_info.get("organization_id"),
+            "clinic_id": clinic_info.get("id"),
             "patient_name": patient_state.full_name,
             "patient_phone_masked": patient_state.phone_last4,
             "patient_email": patient_state.email,
@@ -258,21 +305,71 @@ async def book_to_supabase(
             "end_time": _iso(end_time),
             "status": "scheduled",
             "source": "ai",
-            "reason": patient_state.reason,
+            "reason": patient_state.reason or "General Dentistry",
         }
-        
+
         if calendar_event_id:
             payload["calendar_event_id"] = calendar_event_id
+
+        # Define the sync operation
+        def _insert_sync():
+            # ask Supabase to return inserted row id
+            res = (
+                supabase.table("appointments")
+                .insert(payload)
+                .select("id")
+                .execute()
+            )
+            data = (res.data or [])
+            return data[0]["id"] if data else None
+
+        logger.info(f"[DB] Inserting appointment (timeout={BOOKING_DB_TIMEOUT_SEC}s) start={payload['start_time']}")
         
-        await asyncio.to_thread(
-            lambda: supabase.table("appointments").insert(payload).execute()
-        )
-        logger.info("[DB] Appointment saved to Supabase")
-        return True
+        # Execute with hard timeout
+        appt_id = await asyncio.wait_for(asyncio.to_thread(_insert_sync), timeout=BOOKING_DB_TIMEOUT_SEC)
+
+        if not appt_id:
+            logger.error("[DB] Insert returned no id (unexpected)")
+            return None
+
+        logger.info(f"[DB] ✅ Appointment inserted id={appt_id}")
+        return appt_id
+
+    except asyncio.TimeoutError:
+        logger.error(f"[DB] ❌ Supabase insert timed out after {BOOKING_DB_TIMEOUT_SEC}s")
+        return None
     except Exception as e:
-        logger.error(f"[DB] Booking insert error: {e}")
+        logger.error(f"[DB] ❌ Booking insert error: {e}")
+        return None
+
+async def attach_calendar_event_id(appointment_id: str, calendar_event_id: str) -> bool:
+    """
+    Updates the appointment row AFTER the call is effectively done for the user.
+    """
+    if not appointment_id or not calendar_event_id:
         return False
 
+    try:
+        def _update_sync():
+            res = (
+                supabase.table("appointments")
+                .update({"calendar_event_id": calendar_event_id})
+                .eq("id", appointment_id)
+                .select("id")
+                .execute()
+            )
+            return bool(res.data)
+
+        ok = await asyncio.to_thread(_update_sync)
+        if ok:
+            logger.info(f"[DB] ✅ Attached calendar_event_id to appt={appointment_id}")
+        else:
+            logger.warning(f"[DB] ⚠️ Could not attach calendar_event_id to appt={appointment_id}")
+        return ok
+
+    except Exception as e:
+        logger.error(f"[DB] ❌ attach_calendar_event_id failed: {e}")
+        return False
 
 # NOTE: try_book_appointment requires complex imports from calendar_service and agent
 # It's better to keep this in agent.py where it's used, as it needs:
