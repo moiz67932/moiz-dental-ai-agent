@@ -173,22 +173,48 @@ async def entrypoint(ctx: JobContext):
     from livekit.agents.llm import StopResponse  # add this import
 
     class SnappyAgent(Agent):
+        # async def on_user_turn_completed(self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage) -> None:
+        #     text = getattr(new_message, "text_content", None) or ""
+        #     clean = text.strip().lower()
+        #     if not clean:
+        #         raise StopResponse()
+
+        #     keywords = {"yes","yeah","yep","yup","no","nope","nah","bye","goodbye","ok","okay","sure","hi","hello","hey"}
+        #     is_short = len(clean) < 5
+
+        #     if is_short and clean not in keywords:
+        #         state.transcript_buffer.append(clean)
+        #         raise StopResponse()
+
+        #     if state.transcript_buffer:
+        #         state.transcript_buffer.clear()
         async def on_user_turn_completed(self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage) -> None:
             text = getattr(new_message, "text_content", None) or ""
             clean = text.strip().lower()
+    
+            # ✅ normalize: remove punctuation and collapse whitespace
+            clean = re.sub(r"[^\w\s]", "", clean)     # "yes." -> "yes"
+            clean = re.sub(r"\s+", " ", clean).strip()
+    
             if not clean:
                 raise StopResponse()
-
-            keywords = {"yes","yeah","yep","yup","no","nope","nah","bye","goodbye","ok","okay","sure","hi","hello","hey"}
+    
+            keywords = {
+                "yes","yeah","yep","yup",
+                "no","nope","nah",
+                "bye","goodbye",
+                "ok","okay","sure",
+                "correct","right", "thats right"   # optional helpful adds
+            }
+    
             is_short = len(clean) < 5
-
+    
             if is_short and clean not in keywords:
                 state.transcript_buffer.append(clean)
                 raise StopResponse()
-
+    
             if state.transcript_buffer:
                 state.transcript_buffer.clear()
-
     agent = SnappyAgent(
         instructions=initial_system_prompt,
         tools=function_tools,

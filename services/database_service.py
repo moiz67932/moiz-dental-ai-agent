@@ -313,15 +313,10 @@ async def book_to_supabase(clinic_info: dict, patient_state: "PatientState", cal
 
         # Define the sync operation
         def _insert_sync():
-            # ask Supabase to return inserted row id
-            res = (
-                supabase.table("appointments")
-                .insert(payload)
-                .select("id")
-                .execute()
-            )
-            data = (res.data or [])
-            return data[0]["id"] if data else None
+            # Supabase Python: don't chain .select() after insert()
+            res = supabase.table("appointments").insert(payload, returning="representation").execute()
+            data = res.data or []
+            return data[0].get("id") if data else None  
 
         logger.info(f"[DB] Inserting appointment (timeout={BOOKING_DB_TIMEOUT_SEC}s) start={payload['start_time']}")
         
@@ -353,12 +348,12 @@ async def attach_calendar_event_id(appointment_id: str, calendar_event_id: str) 
         def _update_sync():
             res = (
                 supabase.table("appointments")
-                .update({"calendar_event_id": calendar_event_id})
+                .update({"calendar_event_id": calendar_event_id}, returning="representation")
                 .eq("id", appointment_id)
-                .select("id")
                 .execute()
             )
             return bool(res.data)
+        
 
         ok = await asyncio.to_thread(_update_sync)
         if ok:

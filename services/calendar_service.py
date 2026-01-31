@@ -8,7 +8,7 @@ Handles:
 """
 
 from __future__ import annotations
-
+from datetime import timedelta
 import os
 import json
 import asyncio
@@ -273,15 +273,35 @@ async def create_calendar_event_for_appointment(clinic_info: dict, patient_state
         logger.info("[CALENDAR] Creating background event...")
         
         def _create_sync():
+            # 1. Calculate end time
+            start_dt = patient_state.dt_local
+            duration = patient_state.duration_minutes or 30
+            end_dt = start_dt + timedelta(minutes=duration)
+        
+            # 2. Build strings
+            reason = patient_state.reason or "Appointment"
+            patient_name = patient_state.full_name or "Patient"
+            summary = f"{reason} — {patient_name}"
+            
+            description = (
+                f"Patient: {patient_name}\n"
+                f"Phone: {patient_state.phone_e164}\n"
+                f"Clinic: {clinic_info.get('name', 'Dental Clinic')}"
+            )
+        
+            # 3. Get attendee email for the invite
+            attendee_email = getattr(patient_state, "email", None)
+        
+            # 4. Call client with CORRECT arguments
             result = create_event(
                 calendar_id=cal_id,
-                service_name=patient_state.reason or "Appointment",
-                start_dt=patient_state.dt_local,
-                duration_minutes=patient_state.duration_minutes or 30,
-                tz=str(patient_state.dt_local.tzinfo),
-                patient_name=patient_state.full_name,
-                patient_phone=patient_state.phone_e164,
-                clinic_name=clinic_info.get("name", "Dental Clinic"),
+                summary=summary,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                tz=str(start_dt.tzinfo) if start_dt.tzinfo else "UTC",
+                description=description,
+                location=clinic_info.get("address") or "",
+                attendee_email=attendee_email, # CRITICAL: Sends the email invite
                 auth=auth
             )
             return result.get("id")

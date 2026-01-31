@@ -299,6 +299,121 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                     result = result.replace(tzinfo=tz)
                 return result
         
+        # === MONTH + DAY HANDLING ===
+        # Handle patterns like "February third", "January 20th", "March 5"
+        # This MUST be before dateutil fallback to prevent misinterpretation
+        month_map = {
+            "january": 1, "jan": 1,
+            "february": 2, "feb": 2,
+            "march": 3, "mar": 3,
+            "april": 4, "apr": 4,
+            "may": 5,
+            "june": 6, "jun": 6,
+            "july": 7, "jul": 7,
+            "august": 8, "aug": 8,
+            "september": 9, "sept": 9, "sep": 9,
+            "october": 10, "oct": 10,
+            "november": 11, "nov": 11,
+            "december": 12, "dec": 12,
+        }
+        
+        # Ordinal number words
+        ordinal_map = {
+            "first": 1, "1st": 1,
+            "second": 2, "2nd": 2,
+            "third": 3, "3rd": 3,
+            "fourth": 4, "4th": 4,
+            "fifth": 5, "5th": 5,
+            "sixth": 6, "6th": 6,
+            "seventh": 7, "7th": 7,
+            "eighth": 8, "8th": 8,
+            "ninth": 9, "9th": 9,
+            "tenth": 10, "10th": 10,
+            "eleventh": 11, "11th": 11,
+            "twelfth": 12, "12th": 12,
+            "thirteenth": 13, "13th": 13,
+            "fourteenth": 14, "14th": 14,
+            "fifteenth": 15, "15th": 15,
+            "sixteenth": 16, "16th": 16,
+            "seventeenth": 17, "17th": 17,
+            "eighteenth": 18, "18th": 18,
+            "nineteenth": 19, "19th": 19,
+            "twentieth": 20, "20th": 20,
+            "twenty-first": 21, "twenty first": 21, "21st": 21,
+            "twenty-second": 22, "twenty second": 22, "22nd": 22,
+            "twenty-third": 23, "twenty third": 23, "23rd": 23,
+            "twenty-fourth": 24, "twenty fourth": 24, "24th": 24,
+            "twenty-fifth": 25, "twenty fifth": 25, "25th": 25,
+            "twenty-sixth": 26, "twenty sixth": 26, "26th": 26,
+            "twenty-seventh": 27, "twenty seventh": 27, "27th": 27,
+            "twenty-eighth": 28, "twenty eighth": 28, "28th": 28,
+            "twenty-ninth": 29, "twenty ninth": 29, "29th": 29,
+            "thirtieth": 30, "30th": 30,
+            "thirty-first": 31, "thirty first": 31, "31st": 31,
+        }
+        
+        # Try to match "Month + Day" pattern
+        for month_name, month_num in month_map.items():
+            if month_name in spoken_lower:
+                # Try to find a day number after the month
+                # Pattern: "february third" or "february 3" or "feb 20th"
+                month_pattern = rf"\b{month_name}\b"
+                match = re.search(month_pattern, spoken_lower)
+                if match:
+                    # Get text after the month name
+                    after_month = spoken_lower[match.end():].strip()
+                    
+                    # Try to extract day number (ordinal word or digit)
+                    day_num = None
+                    
+                    # Check for ordinal words first
+                    for ordinal_word, day_value in ordinal_map.items():
+                        if after_month.startswith(ordinal_word):
+                            day_num = day_value
+                            # Remove the ordinal from the string to extract time
+                            after_month = after_month[len(ordinal_word):].strip()
+                            break
+                    
+                    # If no ordinal word, try to extract numeric day
+                    if day_num is None:
+                        day_match = re.match(r"(\d+)(?:st|nd|rd|th)?\b", after_month)
+                        if day_match:
+                            day_num = int(day_match.group(1))
+                            after_month = after_month[day_match.end():].strip()
+                    
+                    if day_num and 1 <= day_num <= 31:
+                        # Determine the year - if month has passed this year, use next year
+                        year = now.year
+                        if month_num < now.month or (month_num == now.month and day_num < now.day):
+                            year += 1
+                        
+                        try:
+                            base_date = datetime(year, month_num, day_num).date()
+                            
+                            # Extract time from remaining string
+                            if after_month:
+                                try:
+                                    time_parsed = dtparser.parse(after_month, fuzzy=True)
+                                    if time_parsed:
+                                        result = datetime.combine(base_date, time_parsed.time())
+                                        if tz:
+                                            result = result.replace(tzinfo=tz)
+                                        return result
+                                except Exception:
+                                    pass
+                            
+                            # Default to 9am if no time specified
+                            result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
+                            if tz:
+                                result = result.replace(tzinfo=tz)
+                            return result
+                        except ValueError:
+                            # Invalid date (e.g., Feb 30)
+                            pass
+                
+                # If we found the month but couldn't parse day, break to avoid false matches
+                break
+        
         # === FALLBACK: Use dateutil for absolute dates ===
         parsed = dtparser.parse(spoken, fuzzy=True)
         if parsed:

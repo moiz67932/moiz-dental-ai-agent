@@ -13,14 +13,23 @@ See refactoring_guide.md for exact function list and line numbers.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+import asyncio
+import json
+from datetime import datetime, timedelta, date
+from typing import Dict, Any, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from config import DEFAULT_TREATMENT_DURATIONS, DEFAULT_LUNCH_BREAK, logger, DEFAULT_TZ
+from config import DEFAULT_TREATMENT_DURATIONS, DEFAULT_LUNCH_BREAK, logger, DEFAULT_TZ, supabase
 
 # Week day keys for schedule mapping (Monday=0 to Sunday=6)
 WEEK_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+# Appointment statuses that block a slot
+BOOKED_STATUSES = ["scheduled", "confirmed"]
+
+# Buffer time between appointments (in minutes)
+APPOINTMENT_BUFFER_MINUTES = 15
+
 
 # TODO: Extract these functions from agent_v2.py:
 # - _default_hours() (lines 2759-2768)
