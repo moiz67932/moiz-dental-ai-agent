@@ -43,7 +43,7 @@ from config import (
 from models.state import PatientState
 from services.database_service import fetch_clinic_context_optimized
 from services.scheduling_service import load_schedule_from_settings
-from tools.assistant_tools import AssistantTools
+from tools.assistant_tools import AssistantTools, update_global_clinic_info
 from prompts.agent_prompts import A_TIER_PROMPT
 from utils.phone_utils import (
     _normalize_phone_preserve_plus,
@@ -513,33 +513,53 @@ async def entrypoint(ctx: JobContext):
          logger.info(f"[DB] 🚀 Backgrounding context fetch for {called_num}")
 
     async def _update_context_background(task: asyncio.Task):
-         global _GLOBAL_CLINIC_INFO, _GLOBAL_AGENT_SETTINGS, _GLOBAL_SCHEDULE
-         nonlocal clinic_info, agent_info, settings, agent_name, clinic_name, clinic_tz, clinic_region, agent_lang
-         import tools.assistant_tools as atools
+            global _GLOBAL_CLINIC_INFO, _GLOBAL_AGENT_SETTINGS, _GLOBAL_SCHEDULE
+            nonlocal clinic_info, agent_info, settings, agent_name, clinic_name, clinic_tz, clinic_region, agent_lang
 
-         atools._GLOBAL_STATE = state
-         atools._GLOBAL_CLINIC_INFO = clinic_info
-         atools._GLOBAL_AGENT_SETTINGS = settings
-         atools._GLOBAL_SCHEDULE = load_schedule_from_settings(settings or {})
-         atools._REFRESH_AGENT_MEMORY = refresh_agent_memory
-         
-         try:
-             logger.info("[DB] ⏳ Background context fetch started...")
-             clinic_info, agent_info, settings, agent_name = await task
-             
-             _GLOBAL_CLINIC_INFO = clinic_info
-             _GLOBAL_AGENT_SETTINGS = settings
-             _GLOBAL_SCHEDULE = load_schedule_from_settings(settings or {})
-             clinic_name = (clinic_info or {}).get("name") or clinic_name
-             clinic_tz = (clinic_info or {}).get("timezone") or clinic_tz
-             state.tz = clinic_tz
-             call_logger.clinic_id = clinic_info.get("id")
-             call_logger.organization_id = clinic_info.get("organization_id")
-             refresh_agent_memory()
-             logger.info(f"[DB] ✓ Context loaded for {clinic_name} (Persona updated)")
-         except Exception as e:         
-             logger.error(f"[DB] ❌ Background context fetch failed: {e}")
+            # Import tools to inject data
+            import tools.assistant_tools as atools
 
+            # 1. Inject State & Functions immediately (safe to do now)
+            atools._GLOBAL_STATE = state
+            atools._REFRESH_AGENT_MEMORY = refresh_agent_memory
+
+            try:
+                logger.info("[DB] ⏳ Background context fetch started...")
+
+                # 2. AWAIT DATA (Critical: We must wait for this to finish)
+                clinic_info, agent_info, settings, agent_name = await task
+
+                # 3. INJECT DATA INTO TOOLS (The Fix)
+                # We explicitly update the tools module NOW, when we actually have the data.
+                if hasattr(atools, "update_global_clinic_info"):
+                    atools.update_global_clinic_info(clinic_info, settings)
+                else:
+                    # Fallback: Direct assignment if you didn't add the helper function yet
+                    atools._GLOBAL_CLINIC_INFO = clinic_info
+                    atools._GLOBAL_AGENT_SETTINGS = settings
+
+                # Also update schedule in tools if needed
+                atools._GLOBAL_SCHEDULE = load_schedule_from_settings(settings or {})
+
+                # 4. Update Local Agent State
+                _GLOBAL_CLINIC_INFO = clinic_info
+                _GLOBAL_AGENT_SETTINGS = settings
+                _GLOBAL_SCHEDULE = load_schedule_from_settings(settings or {})
+
+                clinic_name = (clinic_info or {}).get("name") or clinic_name
+                clinic_tz = (clinic_info or {}).get("timezone") or clinic_tz
+                state.tz = clinic_tz
+
+                call_logger.clinic_id = clinic_info.get("id")
+                call_logger.organization_id = clinic_info.get("organization_id")
+
+                refresh_agent_memory()
+                logger.info(f"[DB] ✓ Context loaded for {clinic_name} (Persona updated)")
+
+            except Exception as e:
+                logger.error(f"[DB] ❌ Background context fetch failed: {e}")
+
+        # START THE TASK
     if context_task:
         asyncio.create_task(_update_context_background(context_task))
 

@@ -77,6 +77,21 @@ _GLOBAL_SCHEDULE: Optional[Dict[str, Any]] = None  # Scheduling config (working 
 
 
 # ============================================================================
+# Global variables (extracted from agent.py)
+# ============================================================================
+
+_GLOBAL_CLINIC_INFO = {}
+_GLOBAL_AGENT_SETTINGS = {}
+
+def update_global_clinic_info(info: dict, settings: dict = None):
+    """Called by agent.py to inject the database context."""
+    global _GLOBAL_CLINIC_INFO, _GLOBAL_AGENT_SETTINGS
+    _GLOBAL_CLINIC_INFO = info or {}
+    if settings:
+        _GLOBAL_AGENT_SETTINGS = settings
+
+
+# ============================================================================
 # Helper functions that might be needed
 # ============================================================================
 
@@ -1503,12 +1518,115 @@ class AssistantTools(_FunctionContextBase):
     
 # tools/assistant_tools.py
 
-    @llm.function_tool(description="""
-    FINAL STEP: Call this IMMEDIATELY when the user confirms details.
-    Never say "I'm booking" without calling this.
-    If user says "Correct, and change reason to X", you MUST update_patient_record FIRST, then call this.
-    """)
+    # @llm.function_tool(description="""
+    # FINAL STEP: Call this IMMEDIATELY when the user confirms details.
+    # Never say "I'm booking" without calling this.
+    # If user says "Correct, and change reason to X", you MUST update_patient_record FIRST, then call this.
+    # """)
     
+    # @llm.function_tool(description="""
+    # FINAL STEP: Call this IMMEDIATELY after the user confirms details.
+    # Do not say "I'm finalizing" without calling this tool.
+    # """)
+    # async def confirm_and_book_appointment(self) -> str:
+    #     """
+    #     Books to Supabase (fast). Calendar sync is optional and best-effort.
+    #     """
+    #     state = self.state
+
+    #     clinic_info = _GLOBAL_CLINIC_INFO
+    #     agent_settings = _GLOBAL_AGENT_SETTINGS or {}
+
+    #     if not state or not clinic_info:
+    #         return (
+    #             "Sorry — I’m missing clinic details on my side, so I can’t finalize the booking right now. "
+    #             "Could you please call back in a moment?"
+    #         )
+
+    #     # Idempotency — prevents double booking if model retries
+    #     if getattr(state, "appointment_booked", False):
+    #         # keep it natural (no headings)
+    #         dt = state.dt_local
+    #         if dt:
+    #             day = dt.strftime("%A, %B %d")
+    #             time_str = dt.strftime("%I:%M %p").lstrip("0")
+    #             return f"Yes — you’re already booked for {state.reason or 'your appointment'} on {day} at {time_str}."
+    #         return "Yes — you’re already booked."
+
+    #     # Basic safety: must have the key fields
+    #     if not state.full_name or not state.dt_local or not (state.phone_e164 or state.phone_pending):
+    #         return (
+    #             "I’m almost there — I just need your name, a confirmed time, and your phone number to finalize the booking."
+    #         )
+
+    #     # 1) Book to Supabase first
+    #     from services.database_service import book_to_supabase
+
+    #     try:
+    #         ok = await book_to_supabase(clinic_info, patient_state=state, calendar_event_id=None)
+    #     except Exception as e:
+    #         logger.error(f"[BOOK] Supabase booking failed: {e!r}")
+    #         ok = False
+
+    #     if not ok:
+    #         return (
+    #             "I’m having trouble saving the appointment right now. "
+    #             "Could you try again in a moment, or would you like me to take a message for the front desk?"
+    #         )
+
+    #     # Mark booked
+    #     state.appointment_booked = True
+
+    #     # 2) Best-effort calendar sync (optional)
+    #     async def _bg_calendar_sync():
+    #         try:
+    #             # Only attempt if you actually have OAuth configured
+    #             token = agent_settings.get("google_oauth_token")
+    #             if not token:
+    #                 return
+            
+    #             from services.calendar_service import resolve_calendar_auth_async
+    #             from services.calendar_client import CalendarClient
+            
+    #             auth, calendar_id, refresh_cb = await resolve_calendar_auth_async(clinic_info)
+    #             if not auth or not calendar_id:
+    #                 return
+            
+    #             client = CalendarClient(auth, refresh_cb=refresh_cb)
+            
+    #             start_dt = state.dt_local
+    #             end_dt = start_dt + timedelta(minutes=(state.duration_minutes or 60))
+            
+    #             appt_info = {
+    #                 "summary": f"{state.reason or 'Appointment'} - {state.full_name}",
+    #                 "start_time": start_dt.isoformat(),
+    #                 "end_time": end_dt.isoformat(),
+    #                 "description": f"Phone: {state.phone_e164 or state.phone_pending}\nEmail: {state.email or ''}".strip(),
+    #             }
+            
+    #             # This creates the event in Google Calendar
+    #             client.book_appointment(auth, calendar_id, appt_info)
+            
+    #         except Exception as e:
+    #             logger.error(f"[BG_TASK] Calendar sync failed: {e!r}")
+            
+    #         asyncio.create_task(_bg_calendar_sync())
+            
+    #         # 3) Natural spoken confirmation (no headings / bullet list)
+    #         dt = state.dt_local
+    #         day = dt.strftime("%A, %B %d")
+    #         time_str = dt.strftime("%I:%M %p").lstrip("0")
+    #         phone_last4 = state.phone_last4 or (state.phone_e164[-4:] if state.phone_e164 else "")
+            
+    #         email_part = f" I’ll send a confirmation to {state.email}." if state.email else ""
+    #         phone_part = f" Your number ending in {phone_last4} is on file." if phone_last4 else ""
+            
+    #         return (
+    #             f"Perfect, {state.full_name} — you’re all set for {state.reason or 'your appointment'} "
+    #             f"on {day} at {time_str}.{phone_part}{email_part} "
+    #             f"Is there anything else I can help you with?"
+    #         )
+
     @llm.function_tool(description="""
     FINAL STEP: Call this IMMEDIATELY after the user confirms details.
     Do not say "I'm finalizing" without calling this tool.
@@ -1518,7 +1636,7 @@ class AssistantTools(_FunctionContextBase):
         Books to Supabase (fast). Calendar sync is optional and best-effort.
         """
         state = self.state
-
+        # Use the globals we defined
         clinic_info = _GLOBAL_CLINIC_INFO
         agent_settings = _GLOBAL_AGENT_SETTINGS or {}
 
@@ -1545,15 +1663,16 @@ class AssistantTools(_FunctionContextBase):
             )
 
         # 1) Book to Supabase first
-        from services.database_service import book_to_supabase
+        from services.database_service import book_to_supabase, attach_calendar_event_id
 
         try:
-            ok = await book_to_supabase(clinic_info, patient_state=state, calendar_event_id=None)
+            # Note: book_to_supabase returns the appointment ID (str) or None/False
+            appt_id = await book_to_supabase(clinic_info, patient_state=state, calendar_event_id=None)
         except Exception as e:
             logger.error(f"[BOOK] Supabase booking failed: {e!r}")
-            ok = False
+            appt_id = None
 
-        if not ok:
+        if not appt_id:
             return (
                 "I’m having trouble saving the appointment right now. "
                 "Could you try again in a moment, or would you like me to take a message for the front desk?"
@@ -1561,56 +1680,46 @@ class AssistantTools(_FunctionContextBase):
 
         # Mark booked
         state.appointment_booked = True
+        state.appointment_id = appt_id
 
         # 2) Best-effort calendar sync (optional)
+        # We define this inside to capture local variables easily
         async def _bg_calendar_sync():
             try:
                 # Only attempt if you actually have OAuth configured
                 token = agent_settings.get("google_oauth_token")
                 if not token:
                     return
-            
-                from services.calendar_service import resolve_calendar_auth_async
-                from services.calendar_client import CalendarClient
-            
-                auth, calendar_id, refresh_cb = await resolve_calendar_auth_async(clinic_info)
-                if not auth or not calendar_id:
-                    return
-            
-                client = CalendarClient(auth, refresh_cb=refresh_cb)
-            
-                start_dt = state.dt_local
-                end_dt = start_dt + timedelta(minutes=(state.duration_minutes or 60))
-            
-                appt_info = {
-                    "summary": f"{state.reason or 'Appointment'} - {state.full_name}",
-                    "start_time": start_dt.isoformat(),
-                    "end_time": end_dt.isoformat(),
-                    "description": f"Phone: {state.phone_e164 or state.phone_pending}\nEmail: {state.email or ''}".strip(),
-                }
-            
-                # This creates the event in Google Calendar
-                client.book_appointment(auth, calendar_id, appt_info)
+                
+                # Import here to avoid circular dependencies at top level
+                from services.calendar_service import create_calendar_event_for_appointment
+                
+                # Use the service wrapper which handles auth and client creation
+                event_id = await create_calendar_event_for_appointment(clinic_info, state, token)
+                
+                if event_id and appt_id:
+                    await attach_calendar_event_id(appt_id, event_id)
             
             except Exception as e:
                 logger.error(f"[BG_TASK] Calendar sync failed: {e!r}")
-            
-            asyncio.create_task(_bg_calendar_sync())
-            
-            # 3) Natural spoken confirmation (no headings / bullet list)
-            dt = state.dt_local
-            day = dt.strftime("%A, %B %d")
-            time_str = dt.strftime("%I:%M %p").lstrip("0")
-            phone_last4 = state.phone_last4 or (state.phone_e164[-4:] if state.phone_e164 else "")
-            
-            email_part = f" I’ll send a confirmation to {state.email}." if state.email else ""
-            phone_part = f" Your number ending in {phone_last4} is on file." if phone_last4 else ""
-            
-            return (
-                f"Perfect, {state.full_name} — you’re all set for {state.reason or 'your appointment'} "
-                f"on {day} at {time_str}.{phone_part}{email_part} "
-                f"Is there anything else I can help you with?"
-            )
+
+        # Fire and forget
+        asyncio.create_task(_bg_calendar_sync())
+
+        # 3) Natural spoken confirmation (no headings / bullet list)
+        dt = state.dt_local
+        day = dt.strftime("%A, %B %d")
+        time_str = dt.strftime("%I:%M %p").lstrip("0")
+        phone_last4 = state.phone_last4 or (state.phone_e164[-4:] if state.phone_e164 else "")
+        
+        email_part = f" I’ll send a confirmation to {state.email}." if state.email else ""
+        phone_part = f" Your number ending in {phone_last4} is on file." if phone_last4 else ""
+        
+        return (
+            f"Perfect, {state.full_name} — you’re all set for {state.reason or 'your appointment'} "
+            f"on {day} at {time_str}.{phone_part}{email_part} "
+            f"Is there anything else I can help you with?"
+        )
 
     @llm.function_tool(description="""
     Search the clinic knowledge base for information about parking, pricing, insurance, 
