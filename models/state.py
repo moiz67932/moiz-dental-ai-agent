@@ -154,16 +154,24 @@ def contact_phase_allowed(state: "PatientState") -> bool:
     SINGLE SOURCE OF TRUTH: Contact details can only be collected/confirmed
     AFTER a valid time slot has been confirmed AND is available.
     
-    Returns True only when:
+    Returns True when:
     - A datetime has been set (state.dt_local exists)
     - The time has been validated as available (state.time_status == "valid")
     - The slot availability has been confirmed (state.slot_available == True)
+    
+    OR when contact_phase_started flag is explicitly set (handles edge cases)
     """
-    return (
+    # Primary check: time validated and slot available
+    primary_check = (
         state.time_status == "valid"
         and state.dt_local is not None
         and getattr(state, "slot_available", False) is True
     )
+    
+    # Fallback: contact phase explicitly started (handles edge cases)
+    fallback_check = getattr(state, "contact_phase_started", False) is True
+    
+    return primary_check or fallback_check
 
 
 # =============================================================================
@@ -350,10 +358,21 @@ class PatientState:
 
     def should_update_field(self, field_name: str, current_value: Any, new_value: Any) -> bool:
         """
-        Write-once guard for field updates.
+        Smart field update guard with context-aware logic.
         Returns True if update allowed, False if should be skipped.
+        
+        ALLOWS updates when:
+        1. Field is empty (first-time population)
+        2. User explicitly confirms/accepts (yes, okay, sure, etc.)
+        3. User provides explicit correction markers
+        4. New value is significantly different (not a fragment)
+        
+        BLOCKS updates when:
+        1. New value is empty/None
+        2. Values are identical
+        3. New value appears to be a fragment/verification of current value
         """
-        # 1. New value is empty -> prevent clearing unless logic dictates (usually we don't clear via null)
+        # 1. New value is empty -> prevent clearing
         if not new_value:
             return False
             
@@ -365,27 +384,63 @@ class PatientState:
         if curr_str == new_str:
             return False
             
-        # 3. Current is empty -> Update allowed
+        # 3. Current is empty -> Update allowed (first-time population)
         if not current_value:
+            logger.info(f"[UPDATE] ✅ Setting {field_name}: '{new_value}' (first time)")
             return True
-            
-        # 4. Current exists and differs -> Check for explicit correction
-        # Correction markers (expanded list)
+        
+        # 4. Check user intent from last utterance
+        user_text = (self.last_user_text or "").lower()
+        
+        # 4a. Explicit confirmation/acceptance
+        confirmation_patterns = [
+            "yes", "yeah", "yep", "yup", "correct", "right", "that's right",
+            "ok", "okay", "sure", "sounds good", "perfect", "great",
+            "that works", "that's fine", "book it", "confirm"
+        ]
+        has_confirmation = any(pattern in user_text for pattern in confirmation_patterns)
+        
+        if has_confirmation:
+            logger.info(f"[UPDATE] ✅ Updating {field_name}: '{current_value}' -> '{new_value}' (User confirmed)")
+            return True
+        
+        # 4b. Explicit correction markers
         correction_markers = [
             "actually", "no", "nope", "sorry", "change", "instead", 
             "i mean", "not that", "not", "wrong", "mistake", 
-            "correct", "correction", "it's", "it is", "my name is", 
-            "my phone", "my email"
+            "correction", "it's", "it is", "my name is", 
+            "my phone", "my email", "make it", "rather"
         ]
+        has_correction = any(marker in user_text for marker in correction_markers)
         
-        user_text = (self.last_user_text or "").lower()
-        has_marker = any(m in user_text for m in correction_markers)
-        
-        if has_marker:
+        if has_correction:
             logger.info(f"[UPDATE] ✏️ Overwriting {field_name}: '{current_value}' -> '{new_value}' (Correction detected)")
             return True
+        
+        # 4c. Check if new value is a fragment/verification of current value
+        # (e.g., user saying "67932" when email is "moiz67932@gmail.com")
+        if field_name in ["phone", "email"]:
+            # For phone: check if new value is subset of current digits
+            if field_name == "phone":
+                curr_digits = re.sub(r"\D", "", curr_str)
+                new_digits = re.sub(r"\D", "", new_str)
+                if new_digits and new_digits in curr_digits and len(new_digits) < len(curr_digits):
+                    logger.info(f"[UPDATE] 🛡️ Ignoring {field_name} fragment: '{new_value}' is part of '{current_value}'")
+                    return False
             
-        logger.info(f"[UPDATE] 🛡️ Ignoring {field_name} change: '{current_value}' -> '{new_value}' (No correction marker)")
+            # For email: check if new value is substring of current
+            if field_name == "email":
+                if new_str in curr_str and len(new_str) < len(curr_str):
+                    logger.info(f"[UPDATE] 🛡️ Ignoring {field_name} fragment: '{new_value}' is part of '{current_value}'")
+                    return False
+        
+        # 5. For time field: allow updates more liberally (agent often suggests alternatives)
+        if field_name == "time":
+            logger.info(f"[UPDATE] ⏰ Updating {field_name}: '{current_value}' -> '{new_value}' (Time update allowed)")
+            return True
+        
+        # 6. Default: Block update without explicit intent
+        logger.info(f"[UPDATE] 🛡️ Ignoring {field_name} change: '{current_value}' -> '{new_value}' (No clear intent detected)")
         return False
 
     def is_complete(self) -> bool:

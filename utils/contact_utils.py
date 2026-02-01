@@ -352,6 +352,55 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
             "thirty-first": 31, "thirty first": 31, "31st": 31,
         }
         
+        # === PATTERN 1A: "ordinal + of + month" (e.g., "fourth of February") ===
+        for ordinal_word, day_num in ordinal_map.items():
+            # Match "fourth of february"
+            pattern_with_of = rf"\b{ordinal_word}\s+of\s+(\w+)\b"
+            match = re.search(pattern_with_of, spoken_lower)
+            
+            # === PATTERN 1B: "ordinal + month" (e.g., "fourth February") ===
+            # Match "fourth february" (no 'of')
+            pattern_no_of = rf"\b{ordinal_word}\s+(\w+)\b"
+            match_no_of = re.search(pattern_no_of, spoken_lower)
+            
+            final_match = match or match_no_of
+            
+            if final_match:
+                potential_month = final_match.group(1).lower()
+                # Check if the word is a valid month
+                if potential_month in month_map:
+                    month_num = month_map[potential_month]
+                    
+                    # Determine the year
+                    year = now.year
+                    if month_num < now.month or (month_num == now.month and day_num < now.day):
+                        year += 1
+                    
+                    try:
+                        base_date = datetime(year, month_num, day_num).date()
+                        
+                        # Extract time from remaining string
+                        after_pattern = spoken_lower[final_match.end():].strip()
+                        if after_pattern:
+                            try:
+                                time_parsed = dtparser.parse(after_pattern, fuzzy=True)
+                                if time_parsed:
+                                    result = datetime.combine(base_date, time_parsed.time())
+                                    if tz:
+                                        result = result.replace(tzinfo=tz)
+                                    return result
+                            except Exception:
+                                pass
+                        
+                        # Default to 9am
+                        result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
+                        if tz:
+                            result = result.replace(tzinfo=tz)
+                        return result
+                    except ValueError:
+                        pass
+        
+        # === PATTERN 2: "month + ordinal" (e.g., "February fourth", "March 3rd") ===
         # Try to match "Month + Day" pattern
         for month_name, month_num in month_map.items():
             if month_name in spoken_lower:
@@ -413,6 +462,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                 
                 # If we found the month but couldn't parse day, break to avoid false matches
                 break
+
         
         # === FALLBACK: Use dateutil for absolute dates ===
         parsed = dtparser.parse(spoken, fuzzy=True)

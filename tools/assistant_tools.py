@@ -5,6 +5,7 @@ Assistant tools for the dental AI agent.
 from __future__ import annotations
 from typing import Optional, Dict, Any, Callable
 import re
+import json
 import asyncio
 import traceback
 from datetime import datetime, timedelta
@@ -469,7 +470,7 @@ class AssistantTools(_FunctionContextBase):
                         state.time_status = "valid"
                         state.time_error = None
                         state.slot_available = True  # CRITICAL: Mark slot as confirmed available
-                        time_formatted = parsed.strftime('%B %d at %I:%M %p')
+                        time_formatted = parsed.strftime('%A, %B %d at %I:%M %p')
                         updates.append(f"time={time_formatted} ({state.duration_minutes}m slot)")
                         logger.info(f"[TOOL] ✓ Time validated and available: {parsed.isoformat()}")
     
@@ -1689,8 +1690,22 @@ class AssistantTools(_FunctionContextBase):
                 # Only attempt if you actually have OAuth configured
                 token = agent_settings.get("google_oauth_token")
                 if not token:
+                    logger.debug("[CALENDAR] No OAuth token configured, skipping calendar sync")
                     return
                 
+                # FIX: Ensure token is a dict (handle JSON string from DB)
+                if isinstance(token, str):
+                    logger.debug("[CALENDAR] Token is string, parsing JSON...")
+                    try:
+                        token = json.loads(token)
+                    except json.JSONDecodeError:
+                        logger.error("[CALENDAR] Failed to parse OAuth token JSON string")
+                        return
+                
+                # Log what we're working with
+                cal_id = clinic_info.get("google_calendar_id") or "primary"
+                logger.info(f"[CALENDAR] 🔄 Syncing to calendar: {cal_id}")
+
                 # Import here to avoid circular dependencies at top level
                 from services.calendar_service import create_calendar_event_for_appointment
                 
@@ -1699,9 +1714,13 @@ class AssistantTools(_FunctionContextBase):
                 
                 if event_id and appt_id:
                     await attach_calendar_event_id(appt_id, event_id)
+                    logger.info(f"[CALENDAR] ✅ Event synced: {event_id}")
+                elif not event_id:
+                    logger.warning("[CALENDAR] ⚠️ No event ID returned from Google")
             
             except Exception as e:
-                logger.error(f"[BG_TASK] Calendar sync failed: {e!r}")
+                logger.error(f"[CALENDAR] ❌ Sync failed: {e!r}")
+
 
         # Fire and forget
         asyncio.create_task(_bg_calendar_sync())
