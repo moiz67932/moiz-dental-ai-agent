@@ -218,6 +218,9 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
         
         spoken_lower = spoken.lower().strip()
         
+        # Clean up possessive forms (e.g., "feb's 10th" → "feb 10th")
+        spoken_lower = re.sub(r"(\w+)'s\b", r"\1", spoken_lower)
+        
         # === RELATIVE DAY HANDLING ===
         # These MUST be handled before dateutil.parse which ignores them
         
@@ -299,9 +302,8 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                     result = result.replace(tzinfo=tz)
                 return result
         
-        # === MONTH + DAY HANDLING ===
-        # Handle patterns like "February third", "January 20th", "March 5"
-        # This MUST be before dateutil fallback to prevent misinterpretation
+        # === MONTH + DAY MAPPINGS ===
+        # Define these FIRST as they're used by multiple pattern matchers
         month_map = {
             "january": 1, "jan": 1,
             "february": 2, "feb": 2,
@@ -352,8 +354,52 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
             "thirty-first": 31, "thirty first": 31, "31st": 31,
         }
         
+        # === NUMERIC-FIRST PATTERNS ===
+        # Handle patterns like "10 february", "21 march", "3 jan"
+        # Match: number (optionally with ordinal suffix) + month name
+        numeric_first_pattern = r'\b(\d+)(?:st|nd|rd|th)?\s+(' + '|'.join(month_map.keys()) + r')\b'
+        numeric_match = re.search(numeric_first_pattern, spoken_lower)
+        if numeric_match:
+            day_num = int(numeric_match.group(1))
+            month_name = numeric_match.group(2).lower()
+            
+            if 1 <= day_num <= 31 and month_name in month_map:
+                month_num = month_map[month_name]
+                
+                # Determine the year
+                year = now.year
+                if month_num < now.month or (month_num == now.month and day_num < now.day):
+                    year += 1
+                
+                try:
+                    base_date = datetime(year, month_num, day_num).date()
+                    
+                    # Extract time from remaining string
+                    after_pattern = spoken_lower[numeric_match.end():].strip()
+                    if after_pattern:
+                        try:
+                            time_parsed = dtparser.parse(after_pattern, fuzzy=True)
+                            if time_parsed:
+                                result = datetime.combine(base_date, time_parsed.time())
+                                if tz:
+                                    result = result.replace(tzinfo=tz)
+                                return result
+                        except Exception:
+                            pass
+                    
+                    # Default to 9am if no time specified
+                    result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
+                    if tz:
+                        result = result.replace(tzinfo=tz)
+                    return result
+                except ValueError:
+                    pass
+        
         # === PATTERN 1A: "ordinal + of + month" (e.g., "fourth of February") ===
-        for ordinal_word, day_num in ordinal_map.items():
+        # Sort by length (longest first) to match "twenty-first" before "first"
+        sorted_ordinals = sorted(ordinal_map.items(), key=lambda x: len(x[0]), reverse=True)
+        
+        for ordinal_word, day_num in sorted_ordinals:
             # Match "fourth of february"
             pattern_with_of = rf"\b{ordinal_word}\s+of\s+(\w+)\b"
             match = re.search(pattern_with_of, spoken_lower)

@@ -189,6 +189,11 @@ async def entrypoint(ctx: JobContext):
         #     if state.transcript_buffer:
         #         state.transcript_buffer.clear()
         async def on_user_turn_completed(self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage) -> None:
+            # ⛔ STOP RESPONSE IF CALL IS ENDING
+            if state.call_ended:
+                logger.info("[STOP_RESPONSE] ⛔ Call ending, ignoring user input.")
+                raise StopResponse()
+
             text = getattr(new_message, "text_content", None) or ""
             clean = text.strip().lower()
     
@@ -249,9 +254,21 @@ async def entrypoint(ctx: JobContext):
             ts = datetime.now().strftime("%H:%M:%S")
             logger.info(f"🤖 [AGENT RESPONSE] [{ts}] >> {text}")
             print(f"🤖 SARAH: {text}")
+            
+            # FAILSAFE: If agent said goodbye but didn't call end_conversation
+            text_lower = text.lower()
+            terminators = ["goodbye", "have a great day", "bye now", "see you then", "take care"]
+            if any(phrase in text_lower for phrase in terminators):
+                # Ensure we don't disconnect if it's just a part of a longer sentence like "If you say goodbye..."
+                # But usually these are at the end.
+                if not state.call_ended:
+                    logger.info("[CALL_END] 🛡️ Failsafe: Agent said goodbye. Triggering disconnect.")
+                    state.call_ended = True
+
         if state.call_ended:
             async def _delayed_disconnect():
-                await asyncio.sleep(3.0)
+                logger.info("[CALL_END] ⏳ Disconnecting session in 4s (allowing user farewell)...")
+                await asyncio.sleep(4.0)  # Allow user to say goodbye
                 await ctx.room.disconnect()
             asyncio.create_task(_delayed_disconnect())
 

@@ -59,6 +59,13 @@ from services.scheduling_service import (
     WEEK_KEYS,
 )
 
+from services.appointment_management_service import (
+    find_appointment_by_phone,
+    cancel_appointment,
+    reschedule_appointment,
+    find_all_appointments_by_phone,
+)
+
 # Import extraction utilities
 from services.extraction_service import _iso
 from utils.contact_utils import parse_datetime_natural
@@ -148,7 +155,9 @@ class AssistantTools(_FunctionContextBase):
     You can call this multiple times as you gather information.
     For phone: normalize spoken numbers (e.g., 'six seven nine' → '679').
     For email: normalize spoken format (e.g., 'moiz six seven nine at gmail dot com' → 'moiz679@gmail.com').
-    For time: pass natural language (e.g., 'tomorrow at 2pm', 'next Monday morning').
+    For time: pass natural language (e.g., 'tomorrow at 2pm', 'next Monday morning', 'Feb 7').
+    CRITICAL: DO NOT guess the day of the week. If user says "Feb 7", DO NOT pass "Tuesday, Feb 7". 
+    Only pass exactly what the user said regarding the date/time.
     
     NEARBY SLOTS: If the requested time is TAKEN, this tool automatically finds and returns 
     nearby alternatives (e.g., "9:00 AM or 11:30 AM"). Simply offer these to the patient!
@@ -478,14 +487,14 @@ class AssistantTools(_FunctionContextBase):
                         if state.full_name and state.dt_local and state.slot_available:
                             state.contact_phase_started = True
     
-                        # If we have a detected/pending phone now, ask for confirmation (last 4 only)
+                        # If we have a detected/pending phone now, ask for confirmation
                         if contact_phase_allowed(state) and not state.phone_confirmed:
                             if not state.phone_pending and state.detected_phone:
                                 state.phone_pending = state.detected_phone
-                            if state.phone_pending and state.phone_last4:
+                            if state.phone_pending:
                                 state.pending_confirm = "phone"
                                 state.pending_confirm_field = "phone"
-                                return f"... ah, perfect! {day_spoken} at {time_spoken} is open. I have a number ending in {state.phone_last4} — is that okay?"
+                                return f"... ah, perfect! {day_spoken} at {time_spoken} is open. Should I save the number you called from for appointment details?"
     
                         # Sonic-3 prosody: breathy confirmation with ellipses
                         # CRITICAL: Phrase forces LLM to understand booking is NOT complete yet
@@ -497,11 +506,13 @@ class AssistantTools(_FunctionContextBase):
                     state.time_error = error_msg
                     state.dt_local = None
                     
-                    alternatives = get_next_available_slots(
-                        start_dt=parsed,
+                    alternatives = await get_next_available_slots(
+                        clinic_id=(_GLOBAL_CLINIC_INFO or {}).get("id"),
                         schedule=schedule,
+                        tz_str=_GLOBAL_CLINIC_TZ,
                         duration_minutes=state.duration_minutes,
-                        limit=2,
+                        num_slots=2,
+                        days_ahead=7,
                     )
                     
                     if alternatives:
@@ -541,11 +552,11 @@ class AssistantTools(_FunctionContextBase):
         if state.full_name and state.dt_local and state.slot_available:
             state.contact_phase_started = True
     
-        # If we have a detected/pending phone and contact phase is active, prompt confirmation (last 4 only)
+        # If we have a detected/pending phone and contact phase is active, prompt confirmation
         if contact_phase_allowed(state) and not state.phone_confirmed:
             if not state.phone_pending and state.detected_phone:
                 state.phone_pending = state.detected_phone
-            if state.phone_pending and state.phone_last4 and state.pending_confirm != "phone":
+            if state.phone_pending and state.pending_confirm != "phone":
                 state.pending_confirm = "phone"
                 state.pending_confirm_field = "phone"
                 if _REFRESH_AGENT_MEMORY:
@@ -553,7 +564,7 @@ class AssistantTools(_FunctionContextBase):
                         _REFRESH_AGENT_MEMORY()
                     except Exception:
                         pass
-                return f"I have a number ending in {state.phone_last4} — is that okay?"
+                return f"Should I save the number you called from for appointment details?"
     
         # Trigger memory refresh so LLM sees updated state
         if _REFRESH_AGENT_MEMORY:
@@ -1100,7 +1111,7 @@ class AssistantTools(_FunctionContextBase):
 
     @llm.function_tool(description="""
     Confirm the phone number with the patient. Call this ONLY after the contact phase is started.
-    Example: "I have a number ending in 7839 — is that okay?"
+    Example: "Should I save the number you called from for appointment details?"
     
     IMPORTANT: When user says "yes", "yeah", "correct" etc., call confirm_phone(confirmed=True).
     When user says "no", "wrong", "incorrect", call confirm_phone(confirmed=False).
@@ -1179,7 +1190,7 @@ class AssistantTools(_FunctionContextBase):
                         _REFRESH_AGENT_MEMORY()
                     except Exception:
                         pass
-                return f"I have {speakable_phone(state.phone_pending)} — is that okay?"
+                return f"Should I save the number you called from for appointment details?"
             else:
                 return f"Could not parse phone number '{new_phone}'. Ask user to repeat clearly."
         
@@ -1316,6 +1327,62 @@ class AssistantTools(_FunctionContextBase):
             return "Email cleared. Ask for the correct email."
     
     
+    @llm.function_tool(description="""
+    Repeat the phone number back to the patient when explicitly requested.
+    ONLY call this when the user asks to repeat the phone number (e.g., "can you repeat the number?", "what's the phone number?", "say that again").
+    
+    DO NOT call this automatically - only when user explicitly asks.
+    """)
+    async def repeat_phone(self) -> str:
+        """Repeat the phone number when user requests it."""
+        state = self.state
+        if not state:
+            return "State not initialized."
+        
+        # IDEMPOTENCY CHECK
+        if state.check_tool_lock("repeat_phone", locals()):
+            return "Number noted."
+        
+        # Check if we have a phone number to repeat
+        phone_to_repeat = state.phone_e164 or state.phone_pending or state.detected_phone
+        
+        if not phone_to_repeat:
+            return "I don't have a phone number saved yet. Could you provide your phone number?"
+        
+        # Return the speakable version of the phone
+        spoken_phone = speakable_phone(phone_to_repeat)
+        logger.info(f"[TOOL] Repeating phone number: ***{phone_to_repeat[-4:] if len(phone_to_repeat) >= 4 else phone_to_repeat}")
+        
+        return f"Your phone number is {spoken_phone}."
+    
+    
+    @llm.function_tool(description="""
+    Repeat the email address back to the patient when explicitly requested.
+    ONLY call this when the user asks to repeat the email (e.g., "can you repeat the email?", "what's the email?", "say that again").
+    
+    DO NOT call this automatically - only when user explicitly asks.
+    """)
+    async def repeat_email(self) -> str:
+        """Repeat the email address when user requests it."""
+        state = self.state
+        if not state:
+            return "State not initialized."
+        
+        # IDEMPOTENCY CHECK
+        if state.check_tool_lock("repeat_email", locals()):
+            return "Email noted."
+        
+        # Check if we have an email to repeat
+        if not state.email:
+            return "I don't have an email address saved yet. Could you provide your email?"
+        
+        # Return the email formatted for speech
+        spoken_email = email_for_speech(state.email)
+        logger.info(f"[TOOL] Repeating email: {state.email}")
+        
+        return f"Your email is {spoken_email}."
+    
+
 
     @llm.function_tool(description="""
     Check the current booking status and what information is still missing.
@@ -1729,13 +1796,15 @@ class AssistantTools(_FunctionContextBase):
         dt = state.dt_local
         day = dt.strftime("%A, %B %d")
         time_str = dt.strftime("%I:%M %p").lstrip("0")
-        phone_last4 = state.phone_last4 or (state.phone_e164[-4:] if state.phone_e164 else "")
         
-        email_part = f" I’ll send a confirmation to {state.email}." if state.email else ""
-        phone_part = f" Your number ending in {phone_last4} is on file." if phone_last4 else ""
+        # Get complete phone for confirmation
+        phone_complete = state.phone_e164 or state.phone_pending
+        
+        email_part = f" I'll send a confirmation to {state.email}." if state.email else ""
+        phone_part = f" Your number {speakable_phone(phone_complete)} is on file." if phone_complete else ""
         
         return (
-            f"Perfect, {state.full_name} — you’re all set for {state.reason or 'your appointment'} "
+            f"Perfect, {state.full_name} — you're all set for {state.reason or 'your appointment'} "
             f"on {day} at {time_str}.{phone_part}{email_part} "
             f"Is there anything else I can help you with?"
         )
@@ -1821,11 +1890,394 @@ class AssistantTools(_FunctionContextBase):
             return "I'm having trouble accessing my notes right now."
 
     @llm.function_tool(description="""
-    End the conversation immediately. Call this when the user says "goodbye", "bye", "I'm done", "hang up", or expressly indicates they want to end the call.
-    """)
+Search for an existing appointment using the caller's phone number.
+Call this tool SILENTLY AND IMMEDIATELY when the user expresses intent to cancel or reschedule.
+
+Common phrases triggering this tool:
+- "I need to cancel"
+- "Cancel my appointment"
+- "Reschedule my appointment"
+- "Move my appointment"
+- "Change my appointment time"
+
+This tool will:
+1. Attempt to find an appointment using the caller's phone number from the call context
+2. Return appointment details if found
+3. Indicate if no appointment exists for that phone number
+
+DO NOT ask for the phone number first - always try the caller's number automatically.
+""")
+    async def find_existing_appointment(self) -> str:
+        """
+        Find an existing appointment using the caller's phone number.
+        Returns appointment details or indicates if none found.
+        """
+        state = self.state
+        if not state:
+            return "State not initialized."
+        
+        # IDEMPOTENCY CHECK
+        if state.check_tool_lock("find_existing_appointment", locals()):
+            return "Already searching for appointment..."
+        
+        clinic_info = _GLOBAL_CLINIC_INFO
+        if not clinic_info:
+            return "I'm having trouble accessing the system right now."
+        
+        # Get phone number from various sources
+        phone_to_search = state.phone_e164 or state.phone_pending or state.detected_phone
+        
+        if not phone_to_search:
+            logger.warning("[APPT_LOOKUP] No phone number available for appointment lookup")
+            return (
+                "I don't have a phone number to search with. "
+                "What phone number did you use when booking?"
+            )
+        
+        # Convert tuple to string if needed (safety check)
+        if isinstance(phone_to_search, tuple):
+            phone_to_search = phone_to_search[0] if phone_to_search else None
+        
+        if not phone_to_search:
+            return "What phone number did you use when booking?"
+        
+        logger.info(f"[APPT_LOOKUP] Searching for appointment with phone ***{phone_to_search[-4:]}")
+        
+        # Search for appointment
+        appointment = await find_appointment_by_phone(
+            clinic_id=clinic_info["id"],
+            phone_number=phone_to_search,
+            tz_str=_GLOBAL_CLINIC_TZ
+        )
+        
+        if appointment:
+            # Store in state for later use
+            state.found_appointment_id = appointment["id"]
+            state.found_appointment_details = appointment
+            
+            # Format for speech
+            start_time = appointment["start_time"]
+            day = start_time.strftime("%A, %B %d")
+            time_str = start_time.strftime("%I:%M %p").lstrip("0")
+            
+            logger.info(f"[APPT_LOOKUP] ✅ Found appointment id={appointment['id']}")
+            
+            return (
+                f"I found your appointment for {appointment['reason']} "
+                f"on {day} at {time_str}. Is this the appointment you'd like to modify?"
+            )
+        else:
+            logger.info(f"[APPT_LOOKUP] ❌ No appointment found for phone ***{phone_to_search[-4:]}")
+            return (
+                "I don't see an upcoming appointment with that number. "
+                "What phone number did you use when you booked?"
+            )
+
+    @llm.function_tool(description="""
+Cancel an existing appointment ONLY after the user has confirmed the appointment details.
+
+CRITICAL RULES:
+1. NEVER call this without first calling find_existing_appointment
+2. ALWAYS wait for explicit user confirmation (e.g., "yes", "correct", "that's the one")
+3. NEVER assume which appointment to cancel
+
+After cancellation:
+- Confirm the cancellation to the user
+- Use a reassuring, non-judgmental tone
+- DO NOT explain system details or errors
+
+Example flow:
+1. User: "I need to cancel my appointment"
+2. Agent calls find_existing_appointment → finds appointment
+3. Agent: "I found your appointment for cleaning on Monday at 2 PM. Is this the one you'd like to cancel?"
+4. User: "Yes"
+5. Agent calls cancel_appointment with confirmed=True
+""")
+    async def cancel_appointment_tool(self, confirmed: bool = False) -> str:
+        """
+        Cancel the found appointment after user confirmation.
+        
+        Args:
+            confirmed: True ONLY if user explicitly confirmed the appointment details
+        """
+        state = self.state
+        if not state:
+            return "State not initialized."
+        
+        # IDEMPOTENCY CHECK
+        if state.check_tool_lock("cancel_appointment_tool", locals()):
+            return "Cancellation already processed."
+        
+        # Check if we have a found appointment
+        appointment_id = getattr(state, "found_appointment_id", None)
+        appointment = getattr(state, "found_appointment_details", None)
+        
+        if not appointment_id or not appointment:
+            return (
+                "I need to find your appointment first. "
+                "Let me search for it using your phone number."
+            )
+        
+        # Require explicit confirmation
+        if not confirmed:
+            start_time = appointment["start_time"]
+            day = start_time.strftime("%A, %B %d")
+            time_str = start_time.strftime("%I:%M %p").lstrip("0")
+            
+            return (
+                f"Just to confirm - you want to cancel your {appointment['reason']} "
+                f"appointment on {day} at {time_str}. Is that correct?"
+            )
+        
+        # Perform cancellation
+        logger.info(f"[CANCEL] Cancelling appointment id={appointment_id}")
+        success = await cancel_appointment(
+            appointment_id=appointment_id,
+            reason="user_requested"
+        )
+        
+        if success:
+            # Clear the found appointment from state
+            if hasattr(state, "found_appointment_id"):
+                delattr(state, "found_appointment_id")
+            if hasattr(state, "found_appointment_details"):
+                delattr(state, "found_appointment_details")
+            
+            logger.info(f"[CANCEL] ✅ Successfully cancelled appointment id={appointment_id}")
+            
+            start_time = appointment["start_time"]
+            day = start_time.strftime("%A, %B %d")
+            time_str = start_time.strftime("%I:%M %p").lstrip("0")
+            
+            return (
+                f"All done — your {appointment['reason']} appointment on {day} at {time_str} "
+                f"has been cancelled. Is there anything else I can help you with?"
+            )
+        else:
+            logger.error(f"[CANCEL] ❌ Failed to cancel appointment id={appointment_id}")
+            return (
+                "I'm having trouble cancelling that appointment right now. "
+                "Could you try again in a moment, or would you like to speak with the office?"
+            )
+
+    @llm.function_tool(description="""
+Reschedule an existing appointment to a new time.
+
+CRITICAL WORKFLOW:
+1. NEVER call this without first calling find_existing_appointment
+2. ALWAYS get explicit user confirmation for BOTH:
+   - The appointment being rescheduled (original details)
+   - The new time slot (new details)
+3. Ask user preference: "Do you have a specific day/time in mind, or would you like me to suggest some options?"
+4. If user wants options, offer NO MORE THAN 3 available slots using get_available_slots
+5. Confirm the new time before calling this tool
+
+Args:
+    new_time: Natural language time (e.g., "tomorrow at 3pm", "next Monday at 10am")
+    confirmed: True ONLY if user has confirmed BOTH the original appointment AND the new time
+
+Example flow:
+1. User: "I need to reschedule my appointment"
+2. Agent calls find_existing_appointment → finds appointment
+3. Agent: "I found your cleaning on Monday at 2 PM. Is this the one you'd like to reschedule?"
+4. User: "Yes"
+5. Agent: "Do you have a specific time in mind, or would you like me to suggest some options?"
+6. User: "What do you have available?"
+7. Agent calls get_available_slots → returns 3 options
+8. Agent: "I have Tuesday at 10 AM, Wednesday at 2 PM, or Thursday at 9 AM."
+9. User: "Tuesday at 10 works"
+10. Agent: "Perfect! I'll move your cleaning from Monday at 2 PM to Tuesday at 10 AM. Is that correct?"
+11. User: "Yes"
+12. Agent calls reschedule_appointment_tool with new_time="Tuesday at 10 AM", confirmed=True
+""")
+    async def reschedule_appointment_tool(
+        self,
+        new_time: Optional[str] = None,
+        confirmed: bool = False
+    ) -> str:
+        """
+        Reschedule the found appointment to a new time.
+        
+        Args:
+            new_time: Natural language description of new time
+            confirmed: True ONLY if user confirmed both old and new appointment details
+        """
+        state = self.state
+        if not state:
+            return "State not initialized."
+        
+        # IDEMPOTENCY CHECK
+        if state.check_tool_lock("reschedule_appointment_tool", locals()):
+            return "Rescheduling already processed."
+        
+        # Check if we have a found appointment
+        appointment_id = getattr(state, "found_appointment_id", None)
+        appointment = getattr(state, "found_appointment_details", None)
+        
+        if not appointment_id or not appointment:
+            return (
+                "I need to find your appointment first. "
+                "Let me search for it using your phone number."
+            )
+        
+        # Require new time
+        if not new_time:
+            return (
+                "Do you have a specific day or time in mind, "
+                "or would you like me to suggest some available options?"
+            )
+        
+        # Parse the new time
+        new_time = _sanitize_tool_arg(new_time)
+        if not new_time:
+            return "What time would work better for you?"
+        
+        try:
+            from utils.contact_utils import parse_datetime_natural
+            
+            parsed_new_time = parse_datetime_natural(new_time, tz_hint=_GLOBAL_CLINIC_TZ)
+            
+            if not parsed_new_time:
+                return f"I couldn't understand '{new_time}'. Could you try a different way?"
+            
+            # Validate the new time is available
+            clinic_info = _GLOBAL_CLINIC_INFO
+            if not clinic_info:
+                return "I'm having trouble accessing the system right now."
+            
+            # Check if new slot is free
+            schedule = _GLOBAL_SCHEDULE or {}
+            duration = appointment.get("duration_minutes", 60)
+            
+            is_valid, error_msg = is_within_working_hours(
+                parsed_new_time, schedule, duration
+            )
+            
+            if not is_valid:
+                logger.warning(f"[RESCHEDULE] New time {parsed_new_time} is not within working hours")
+                return (
+                    f"{error_msg} Would you like me to suggest some available times instead?"
+                )
+            
+            # Check slot availability
+            end_time = parsed_new_time + timedelta(minutes=duration + APPOINTMENT_BUFFER_MINUTES)
+            slot_free = await is_slot_free_supabase(
+                clinic_id=clinic_info["id"],
+                start_dt=parsed_new_time,
+                end_dt=end_time,
+                clinic_info=clinic_info
+            )
+            
+            if not slot_free:
+                logger.warning(f"[RESCHEDULE] New time {parsed_new_time} is already booked")
+                
+                # Offer alternatives
+                alternatives = await suggest_slots_around(
+                    clinic_id=clinic_info["id"],
+                    requested_start_dt=parsed_new_time,
+                    duration_minutes=duration,
+                    schedule=schedule,
+                    tz_str=_GLOBAL_CLINIC_TZ,
+                    count=3,
+                    window_hours=4,
+                    step_min=15,
+                )
+                
+                if alternatives:
+                    alt_descriptions = []
+                    for alt in alternatives:
+                        alt_time_str = alt.strftime("%I:%M %p").lstrip("0")
+                        if alt.date() == parsed_new_time.date():
+                            alt_descriptions.append(alt_time_str)
+                        else:
+                            alt_descriptions.append(f"{alt.strftime('%A')} at {alt_time_str}")
+                    
+                    if len(alt_descriptions) == 1:
+                        return f"That time slot is taken. The closest I have is {alt_descriptions[0]}. Would that work?"
+                    elif len(alt_descriptions) == 2:
+                        return f"That slot is booked. I can do {alt_descriptions[0]} or {alt_descriptions[1]}. Which works for you?"
+                    else:
+                        return f"That time is taken. I have {alt_descriptions[0]}, {alt_descriptions[1]}, or {alt_descriptions[2]}. Which would you prefer?"
+                else:
+                    return "That time slot is taken and I don't see openings nearby. Would you like to try a different day?"
+            
+            # Format times for confirmation
+            old_start = appointment["start_time"]
+            old_day = old_start.strftime("%A, %B %d")
+            old_time_str = old_start.strftime("%I:%M %p").lstrip("0")
+            
+            new_day = parsed_new_time.strftime("%A, %B %d")
+            new_time_str = parsed_new_time.strftime("%I:%M %p").lstrip("0")
+            
+            # Require confirmation
+            if not confirmed:
+                return (
+                    f"Perfect! Just to confirm — I'll move your {appointment['reason']} "
+                    f"from {old_day} at {old_time_str} to {new_day} at {new_time_str}. "
+                    f"Is that correct?"
+                )
+            
+            # Perform rescheduling
+            logger.info(
+                f"[RESCHEDULE] Rescheduling appointment id={appointment_id} "
+                f"from {old_start} to {parsed_new_time}"
+            )
+            
+            end_time = parsed_new_time + timedelta(minutes=duration)
+            success = await reschedule_appointment(
+                appointment_id=appointment_id,
+                new_start_time=parsed_new_time,
+                new_end_time=end_time,
+            )
+            
+            if success:
+                # Clear the found appointment from state
+                if hasattr(state, "found_appointment_id"):
+                    delattr(state, "found_appointment_id")
+                if hasattr(state, "found_appointment_details"):
+                    delattr(state, "found_appointment_details")
+                
+                logger.info(f"[RESCHEDULE] ✅ Successfully rescheduled appointment id={appointment_id}")
+                
+                return (
+                    f"All set — your {appointment['reason']} appointment has been moved to "
+                    f"{new_day} at {new_time_str}. Is there anything else I can help you with?"
+                )
+            else:
+                logger.error(f"[RESCHEDULE] ❌ Failed to reschedule appointment id={appointment_id}")
+                return (
+                    "I'm having trouble rescheduling that appointment right now. "
+                    "Could you try again in a moment, or would you like to speak with the office?"
+                )
+                
+        except Exception as e:
+            logger.error(f"[RESCHEDULE] Error: {e}")
+            return (
+                "I'm having trouble with that request. "
+                "Would you like to speak with the office directly?"
+            )
+
+    @llm.function_tool(description="""
+End the conversation and disconnect the call immediately to save resources.
+
+Call this when:
+1. The user explicitly says goodbye: "bye", "goodbye", "hang up", "I'm done", "that's all", etc.
+2. The booking is COMPLETE and confirmed, AND you've provided the final confirmation details.
+3. The user indicates they have no more questions after you've completed their request.
+4. The conversation has naturally concluded (e.g., after giving clinic hours/info and user says "okay" or "thanks").
+
+IMPORTANT: After a successful booking confirmation, you MUST end the call to save tokens for STT, LLM, and TTS.
+After saying your farewell message, this tool will automatically disconnect within 3 seconds.
+""")
     async def end_conversation(self) -> str:
-        """End the call."""
+        """End the call to save tokens and resources."""
         if self.state:
             self.state.call_ended = True
+            
+            # Log the reason for call ending
+            if self.state.booking_confirmed:
+                logger.info("[CALL_END] 🎯 Call ending after successful booking completion")
+            else:
+                logger.info("[CALL_END] 👋 Call ending at user request or natural conclusion")
+        
         return "Goodbye! Have a great day."
-    

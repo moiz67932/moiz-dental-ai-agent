@@ -299,7 +299,7 @@ async def book_to_supabase(clinic_info: dict, patient_state: "PatientState", cal
             "organization_id": clinic_info.get("organization_id"),
             "clinic_id": clinic_info.get("id"),
             "patient_name": patient_state.full_name,
-            "patient_phone_masked": patient_state.phone_last4,
+            "patient_phone_masked": patient_state.phone_e164 or patient_state.phone_pending,
             "patient_email": patient_state.email,
             "start_time": _iso(start_time),
             "end_time": _iso(end_time),

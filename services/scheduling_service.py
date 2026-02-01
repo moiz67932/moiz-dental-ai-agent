@@ -20,6 +20,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from config import DEFAULT_TREATMENT_DURATIONS, DEFAULT_LUNCH_BREAK, logger, DEFAULT_TZ, supabase
+from services.database_service import is_slot_free_supabase
 
 # Week day keys for schedule mapping (Monday=0 to Sunday=6)
 WEEK_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
@@ -600,31 +601,78 @@ async def get_alternatives_around_datetime(
     
 #     return available_slots
 
-def get_next_available_slots(
-    start_dt: datetime,
+async def get_next_available_slots(
+    clinic_id: str,
     schedule: Dict[str, Any],
+    tz_str: str = DEFAULT_TZ,
     duration_minutes: int = 30,
-    limit: int = 2
-):
+    num_slots: int = 3,
+    days_ahead: int = 14,
+) -> List[datetime]:
     """
     Finds next valid slots to break LLM retry loops.
+    Scans ahead up to `days_ahead` days to find `num_slots` available openings.
+    Checks both business hours and actual database availability.
     """
     slots = []
-    cursor = start_dt
-    days_checked = 0
-
-    while len(slots) < limit and days_checked < 7:
-        valid, _ = is_within_working_hours(cursor, schedule, duration_minutes)
-
-        if valid:
-            slots.append(cursor)
-            cursor += timedelta(minutes=duration_minutes)
-        else:
-            cursor += timedelta(minutes=30)
-
-        if cursor.hour == 0 and cursor.minute == 0:
-            days_checked += 1
-            cursor = cursor.replace(hour=8, minute=0)
+    
+    # 1. Setup timezone and start time
+    try:
+        tz = ZoneInfo(tz_str)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TZ)
+        
+    now = datetime.now(tz)
+    
+    # Round up to next 15-minute interval
+    current = now
+    if current.minute % 15 != 0:
+        current += timedelta(minutes=(15 - current.minute % 15))
+    current = current.replace(second=0, microsecond=0)
+    
+    # Ensure we don't start in the past (if passed a specific start_dt, we might need to adjust, 
+    # but this function logic implies finding *next* slots from *now* generally, 
+    # or we should respect a start_dt if we want to change signature validation.
+    # The current signature in assistant_tools triggers this with only kwargs, so 'start_dt' 
+    # was missing from the call in assistant_tools, which passed clinic_id instead.
+    # We will assume we start searching from NOW.
+    
+    end_search = current + timedelta(days=days_ahead)
+    step_minutes = 15  # standard slot step
+    
+    while current < end_search and len(slots) < num_slots:
+        # 2. Check Business Hours
+        is_valid, _ = is_within_working_hours(current, schedule, duration_minutes)
+        
+        if is_valid:
+            # 3. Check DB Availability
+            slot_end = current + timedelta(minutes=duration_minutes)
+            is_free = await is_slot_free_supabase(
+                clinic_id=clinic_id,
+                start_dt=current,
+                end_dt=slot_end
+            )
+            
+            if is_free:
+                slots.append(current)
+                # If we found a slot, jump by duration to give varied options? 
+                # Or just next 15 min? usage implies "next available", so next 15 min is fine,
+                # but maybe we want to space them out a bit? 
+                # Let's stick to finding consecutive available slots for now.
+                # Actually, if we return 2:00, 2:15, 2:30, that's fine.
+        
+        # Increment
+        current += timedelta(minutes=step_minutes)
+        
+        # Optimize: If we pass end of day, jump to next day start
+        # strict is_within_working_hours might handle false, but we can jump to skip night checks
+        if current.hour >= 20: # simple heuristic, or check schedule
+             # This simple jump is risky if hours go late, relying on loop is safer but slower.
+             # Let's rely on the loop for now, it's 4*24*14 iterations max ~= 1300 checks. 
+             # is_within_working_hours is fast. is_slot_free_supabase includes DB call, that is slow.
+             # WAIT: is_slot_free_supabase calls DB. We should NOT call it if not within working hours.
+             # We correctly check is_valid first.
+             pass
 
     return slots
 
