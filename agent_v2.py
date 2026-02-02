@@ -291,9 +291,68 @@ calendar_store = SupabaseCalendarStore(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 BOOKED_STATUSES = ["scheduled", "confirmed"]
 
-# Duplicate execution guard: tracks which worker claimed which room
-# Key: room_name, Value: worker_id
+# duplicate execution guard global (local cache)
 _ACTIVE_ROOMS: Dict[str, str] = {}
+
+class RoomGuard:
+    """
+    Robust Room Guard - prevents duplicate execution across multiple instances.
+    Attempts to use Supabase 'room_locks' table for shared state.
+    Falls back to in-memory if table is missing or DB is down.
+    """
+    @staticmethod
+    async def claim(room_name: str, worker_id: str) -> bool:
+        if not room_name: return True
+        
+        # 1. Local check first (fast path)
+        if room_name in _ACTIVE_ROOMS:
+            return _ACTIVE_ROOMS[room_name] == worker_id
+        
+        try:
+            # 2. Shared check via Supabase
+            # NOTE: User needs to create 'room_locks' table for this to be multi-instance safe.
+            # CREATE TABLE room_locks (room_name TEXT PRIMARY KEY, worker_id TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW());
+            await asyncio.to_thread(
+                lambda: supabase.table("room_locks").insert({
+                    "room_name": room_name,
+                    "worker_id": worker_id
+                }).execute()
+            )
+            _ACTIVE_ROOMS[room_name] = worker_id
+            logger.info(f"[GUARD] ✓ Room {room_name} claimed via Supabase by {worker_id}")
+            return True
+        except Exception as e:
+            # Likely relation missing or conflict
+            err_msg = str(e).lower()
+            if "relation" in err_msg and "not exist" in err_msg:
+                # Table missing - fallback to in-memory ONLY
+                if room_name not in _ACTIVE_ROOMS:
+                    _ACTIVE_ROOMS[room_name] = worker_id
+                    logger.info(f"[GUARD] ✓ Local fallback claim for {room_name}")
+                    return True
+                return _ACTIVE_ROOMS[room_name] == worker_id
+            
+            # Likely PK violation (already exists) - check if WE own it
+            try:
+                check = await asyncio.to_thread(
+                    lambda: supabase.table("room_locks").select("worker_id").eq("room_name", room_name).execute()
+                )
+                if check.data and check.data[0]["worker_id"] == worker_id:
+                    _ACTIVE_ROOMS[room_name] = worker_id
+                    return True
+            except: pass
+            
+            logger.warning(f"[GUARD] ❌ Room {room_name} already handled by another worker.")
+            return False
+
+    @staticmethod
+    async def release(room_name: str, worker_id: str):
+        _ACTIVE_ROOMS.pop(room_name, None)
+        try:
+            await asyncio.to_thread(
+                lambda: supabase.table("room_locks").delete().eq("room_name", room_name).eq("worker_id", worker_id).execute()
+            )
+        except: pass
 
 # Valid call_sessions.outcome enum values (from Supabase schema)
 VALID_CALL_OUTCOMES = {
@@ -303,7 +362,6 @@ VALID_CALL_OUTCOMES = {
     "transferred",
     "voicemail",
 }
-
 
 def map_call_outcome(raw_outcome: Optional[str], booking_made: bool) -> str:
     """
@@ -526,6 +584,8 @@ def _normalize_phone_preserve_plus(raw: Optional[str], default_region: str) -> T
 A_TIER_PROMPT = """CRITICAL: Regardless of the language detected in the transcript, Sarah MUST always respond in clear, professional English.
 
 You are {agent_name}, a receptionist for {clinic_name}.
+Current Date: {current_date}
+Current Time: {current_time}
 
 ═══════════════════════════════════════════════════════════════════════════════
 📋 YOUR MEMORY (TRUST THIS!)
@@ -572,7 +632,7 @@ Speak like a helpful receptionist. Use brief bridge phrases like "Let me check..
 ═══════════════════════════════════════════════════════════════════════════════
 🚀 INTELLIGENT BOOKING INFERENCE (PRIORITY 1)
 ═══════════════════════════════════════════════════════════════════════════════
-• IF your memory shows all required fields are captured (Name, Time, Reason, Phone, Email)
+• IF your memory shows all required fields are captured (Name, Time, Reason, Phone)
 • AND the user has just provided the last missing piece OR confirmed details ("yes", "perfect")
 • THEN you MUST call `confirm_and_book_appointment` IMMEDIATELY.
 • DO NOT ask "Shall I book this?" if the user has already approved the details. Just book it.
@@ -2445,13 +2505,16 @@ class PatientState:
         return False
 
     def is_complete(self) -> bool:
-        """Check if we have all required info for booking."""
+        """
+        Check if we have all required info for booking.
+        EMAIL IS NOW OPTIONAL - per user request.
+        """
         return all([
             self.full_name,
             self.phone_e164,
             self.phone_confirmed,
-            self.email,
-            self.email_confirmed,
+            # self.email,  <-- OPTIONAL
+            # self.email_confirmed, <-- OPTIONAL
             self.reason,
             self.dt_local,
         ])
@@ -2465,10 +2528,7 @@ class PatientState:
             missing.append("phone")
         elif not self.phone_confirmed:
             missing.append("phone_confirmed")
-        if not self.email:
-            missing.append("email")
-        elif not self.email_confirmed:
-            missing.append("email_confirmed")
+        # Email is optional
         if not self.reason:
             missing.append("reason")
         if not self.dt_local:
@@ -3781,7 +3841,7 @@ async def entrypoint(ctx: JobContext):
     _GLOBAL_STATE = state  # Set global reference for tools
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 🛡️ DUPLICATE EXECUTION GUARD — Prevents multiple workers processing same call
+    # 🛡️ DUPLICATE EXECUTION GUARD — Robust multi-instance locking
     # ═══════════════════════════════════════════════════════════════════════════
     import uuid as _uuid_module
     _worker_id = str(_uuid_module.uuid4())[:8]
@@ -3790,15 +3850,10 @@ async def entrypoint(ctx: JobContext):
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     room_name = getattr(ctx.room, "name", "") or ""
     
-    # Check if another worker already claimed this room
-    if room_name in _ACTIVE_ROOMS:
-        existing_worker = _ACTIVE_ROOMS[room_name]
-        if existing_worker != _worker_id:
-            logger.warning(f"[GUARD] Room {room_name} already handled by worker {existing_worker}, skipping")
-            return  # Exit early - another worker has this call
-    else:
-        _ACTIVE_ROOMS[room_name] = _worker_id
-        logger.info(f"[GUARD] ✓ Worker {_worker_id} claimed room {room_name}")
+    # Check if this call is already being handled (Shared Lock)
+    if not await RoomGuard.claim(room_name, _worker_id):
+        logger.warning(f"[GUARD] Worker {_worker_id} skipping room {room_name} (shared lock active)")
+        return
 
     # LOGGING VERIFICATION
     print("\n" + "="*50)
@@ -3962,10 +4017,17 @@ async def entrypoint(ctx: JobContext):
         Generate fresh system prompt with current PatientState snapshot.
         This is the key to Dynamic Slot-Aware Prompting!
         """
+        # Get current time in clinic timezone for hallucination prevention
+        now = datetime.now(ZoneInfo(clinic_tz))
+        current_date_str = now.strftime("%A, %B %d, %Y")
+        current_time_str = now.strftime("%I:%M %p")
+
         return A_TIER_PROMPT.format(
             agent_name=agent_name,
             clinic_name=clinic_name,
             timezone=clinic_tz,
+            current_date=current_date_str,
+            current_time=current_time_str,
             state_summary=state.detailed_state_for_prompt(),  # Real-time snapshot!
         )
     
@@ -4803,10 +4865,8 @@ async def entrypoint(ctx: JobContext):
     
     @ctx.room.on("disconnected")
     def _():
-        # Clean up room guard
-        if room_name in _ACTIVE_ROOMS:
-            del _ACTIVE_ROOMS[room_name]
-            logger.info(f"[GUARD] ✓ Released room {room_name} on disconnect")
+        # Clean up room guard (Shared Release)
+        asyncio.create_task(RoomGuard.release(room_name, _worker_id))
         disconnect_event.set()
     
     @ctx.room.on("participant_disconnected")

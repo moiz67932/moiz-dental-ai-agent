@@ -3,7 +3,7 @@ Assistant tools for the dental AI agent.
 """
 
 from __future__ import annotations
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, List, Set, Any, Tuple, Callable, cast
 import re
 import json
 import asyncio
