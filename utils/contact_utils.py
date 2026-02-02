@@ -221,14 +221,112 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
         # Clean up possessive forms (e.g., "feb's 10th" → "feb 10th")
         spoken_lower = re.sub(r"(\w+)'s\b", r"\1", spoken_lower)
         
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 🛠️ FILLER WORD REMOVAL — Clean words that confuse dateutil parser
+        # ═══════════════════════════════════════════════════════════════════════════
+        _FILLER_PATTERN = r'\b(uh|um|uhh|umm|uhm|er|ah|hmm|like|you know)\b'
+        spoken_clean = re.sub(_FILLER_PATTERN, '', spoken_lower, flags=re.IGNORECASE)
+        spoken_clean = re.sub(r'\s+', ' ', spoken_clean).strip()
+        
+        # ═══════════════════════════════════════════════════════════════════════════
+        # ⏰ PRE-EXTRACT TIME COMPONENT — Handle spoken times before ordinal matching
+        # ═══════════════════════════════════════════════════════════════════════════
+        # This fixes: "third of feb at three thirty pm" → 9:00 AM (WRONG)
+        # Now correctly parses to 15:30 PM
+        
+        _WORD_TO_HOUR = {
+            'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6,
+            'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10, 'eleven': 11, 'twelve': 12,
+        }
+        _WORD_TO_MIN = {
+            'thirty': 30, 'fifteen': 15, 'forty-five': 45, 'forty five': 45,
+            'forty': 40, 'twenty': 20, 'ten': 10, 'oh five': 5, 'o five': 5,
+        }
+        
+        _extracted_time = None
+        
+        # Pattern 1: Word-based times like "three thirty pm", "two pm"
+        word_time_pattern = re.compile(
+            r'(?:at\s+)?'  # Optional "at"
+            r'(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*'
+            r'(thirty|fifteen|forty-five|forty five|forty|twenty|ten|oh five|o five)?'
+            r'\s*(am|pm|a\.m\.|p\.m\.)?',
+            re.IGNORECASE
+        )
+        word_match = word_time_pattern.search(spoken_clean)
+        
+        # Pattern 2: Numeric times like "3:30 pm", "2pm", "15:30"
+        numeric_time_pattern = re.compile(
+            r'(?:at\s+)?'  # Optional "at"
+            r'(\d{1,2})'   # Hour (1-2 digits)
+            r'(?::(\d{2}))?'  # Optional :minutes
+            r'\s*(am|pm|a\.m\.|p\.m\.)?',
+            re.IGNORECASE
+        )
+        numeric_match = numeric_time_pattern.search(spoken_clean)
+        
+        # Prefer word-based match first (more likely from speech recognition)
+        if word_match and word_match.group(1):
+            hour_word = word_match.group(1).lower()
+            min_word = (word_match.group(2) or '').lower().replace('-', ' ')
+            ampm = (word_match.group(3) or '').lower().replace('.', '')
+            
+            hour = _WORD_TO_HOUR.get(hour_word)
+            minute = _WORD_TO_MIN.get(min_word, 0)
+            
+            if hour is not None:
+                # Apply AM/PM conversion
+                if ampm == 'pm' and hour < 12:
+                    hour += 12
+                elif ampm == 'am' and hour == 12:
+                    hour = 0
+                # Infer PM for business hour times (1-6) without explicit AM/PM
+                elif not ampm and 1 <= hour <= 6:
+                    hour += 12  # Assume 1-6 without AM/PM means PM for appointments
+                
+                try:
+                    _extracted_time = datetime.min.time().replace(hour=hour, minute=minute)
+                except ValueError:
+                    pass  # Invalid time, skip
+        
+        # Fallback to numeric match
+        elif numeric_match and numeric_match.group(1):
+            hour = int(numeric_match.group(1))
+            minute = int(numeric_match.group(2)) if numeric_match.group(2) else 0
+            ampm = (numeric_match.group(3) or '').lower().replace('.', '')
+            
+            if hour <= 24 and minute < 60:
+                # Apply AM/PM conversion
+                if ampm == 'pm' and hour < 12:
+                    hour += 12
+                elif ampm == 'am' and hour == 12:
+                    hour = 0
+                # Infer PM for business hour times (1-6) without explicit AM/PM
+                elif not ampm and 1 <= hour <= 6:
+                    hour += 12
+                
+                if hour < 24:
+                    try:
+                        _extracted_time = datetime.min.time().replace(hour=hour, minute=minute)
+                    except ValueError:
+                        pass
+        
         # === RELATIVE DAY HANDLING ===
         # These MUST be handled before dateutil.parse which ignores them
         
         # Handle "tomorrow"
         if "tomorrow" in spoken_lower:
             base_date = (now + timedelta(days=1)).date()
-            # Extract time component from the rest of the string
-            time_str = re.sub(r"\btomorrow\b", "", spoken_lower, flags=re.IGNORECASE).strip()
+            
+            # Use pre-extracted time if available (more reliable)
+            if _extracted_time:
+                result = datetime.combine(base_date, _extracted_time)
+                if tz:
+                    result = result.replace(tzinfo=tz)
+                return result
+            
+            # Fallback: Extract time component from the rest of the string
+            time_str = re.sub(r"\btomorrow\b", "", spoken_clean, flags=re.IGNORECASE).strip()
             if time_str:
                 try:
                     time_parsed = dtparser.parse(time_str, fuzzy=True)
@@ -248,7 +346,16 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
         # Handle "today"
         if "today" in spoken_lower:
             base_date = now.date()
-            time_str = re.sub(r"\btoday\b", "", spoken_lower, flags=re.IGNORECASE).strip()
+            
+            # Use pre-extracted time if available (more reliable)
+            if _extracted_time:
+                result = datetime.combine(base_date, _extracted_time)
+                if tz:
+                    result = result.replace(tzinfo=tz)
+                return result
+            
+            # Fallback to dateutil parsing
+            time_str = re.sub(r"\btoday\b", "", spoken_clean, flags=re.IGNORECASE).strip()
             if time_str:
                 try:
                     time_parsed = dtparser.parse(time_str, fuzzy=True)
@@ -283,8 +390,15 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                 
                 base_date = (now + timedelta(days=days_until)).date()
                 
-                # Extract time from remaining string
-                time_str = re.sub(rf"\b(next\s+)?{day_name}\b", "", spoken_lower, flags=re.IGNORECASE).strip()
+                # Use pre-extracted time if available (more reliable)
+                if _extracted_time:
+                    result = datetime.combine(base_date, _extracted_time)
+                    if tz:
+                        result = result.replace(tzinfo=tz)
+                    return result
+                
+                # Fallback: Extract time from remaining string
+                time_str = re.sub(rf"\b(next\s+)?{day_name}\b", "", spoken_clean, flags=re.IGNORECASE).strip()
                 if time_str:
                     try:
                         time_parsed = dtparser.parse(time_str, fuzzy=True)
@@ -374,8 +488,15 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                 try:
                     base_date = datetime(year, month_num, day_num).date()
                     
-                    # Extract time from remaining string
-                    after_pattern = spoken_lower[numeric_match.end():].strip()
+                    # Use pre-extracted time if available
+                    if _extracted_time:
+                        result = datetime.combine(base_date, _extracted_time)
+                        if tz:
+                            result = result.replace(tzinfo=tz)
+                        return result
+                    
+                    # Fallback: Extract time from remaining string
+                    after_pattern = spoken_clean[numeric_match.end():].strip()
                     if after_pattern:
                         try:
                             time_parsed = dtparser.parse(after_pattern, fuzzy=True)
@@ -425,8 +546,15 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                     try:
                         base_date = datetime(year, month_num, day_num).date()
                         
-                        # Extract time from remaining string
-                        after_pattern = spoken_lower[final_match.end():].strip()
+                        # Use pre-extracted time if available (THE KEY FIX!)
+                        if _extracted_time:
+                            result = datetime.combine(base_date, _extracted_time)
+                            if tz:
+                                result = result.replace(tzinfo=tz)
+                            return result
+                        
+                        # Fallback: Extract time from remaining string
+                        after_pattern = spoken_clean[final_match.end():].strip()
                         if after_pattern:
                             try:
                                 time_parsed = dtparser.parse(after_pattern, fuzzy=True)
@@ -485,10 +613,20 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                         try:
                             base_date = datetime(year, month_num, day_num).date()
                             
-                            # Extract time from remaining string
-                            if after_month:
+                            # Use pre-extracted time if available
+                            if _extracted_time:
+                                result = datetime.combine(base_date, _extracted_time)
+                                if tz:
+                                    result = result.replace(tzinfo=tz)
+                                return result
+                            
+                            # Fallback: Extract time from remaining string
+                            # Clean filler words from the after_month portion
+                            after_month_clean = re.sub(_FILLER_PATTERN, '', after_month, flags=re.IGNORECASE)
+                            after_month_clean = re.sub(r'\s+', ' ', after_month_clean).strip()
+                            if after_month_clean:
                                 try:
-                                    time_parsed = dtparser.parse(after_month, fuzzy=True)
+                                    time_parsed = dtparser.parse(after_month_clean, fuzzy=True)
                                     if time_parsed:
                                         result = datetime.combine(base_date, time_parsed.time())
                                         if tz:

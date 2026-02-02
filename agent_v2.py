@@ -291,6 +291,10 @@ calendar_store = SupabaseCalendarStore(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 BOOKED_STATUSES = ["scheduled", "confirmed"]
 
+# Duplicate execution guard: tracks which worker claimed which room
+# Key: room_name, Value: worker_id
+_ACTIVE_ROOMS: Dict[str, str] = {}
+
 # Valid call_sessions.outcome enum values (from Supabase schema)
 VALID_CALL_OUTCOMES = {
     "booked",
@@ -3776,9 +3780,30 @@ async def entrypoint(ctx: JobContext):
     state = PatientState()
     _GLOBAL_STATE = state  # Set global reference for tools
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 🛡️ DUPLICATE EXECUTION GUARD — Prevents multiple workers processing same call
+    # ═══════════════════════════════════════════════════════════════════════════
+    import uuid as _uuid_module
+    _worker_id = str(_uuid_module.uuid4())[:8]
+    
+    # Get room name early for guard check
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    room_name = getattr(ctx.room, "name", "") or ""
+    
+    # Check if another worker already claimed this room
+    if room_name in _ACTIVE_ROOMS:
+        existing_worker = _ACTIVE_ROOMS[room_name]
+        if existing_worker != _worker_id:
+            logger.warning(f"[GUARD] Room {room_name} already handled by worker {existing_worker}, skipping")
+            return  # Exit early - another worker has this call
+    else:
+        _ACTIVE_ROOMS[room_name] = _worker_id
+        logger.info(f"[GUARD] ✓ Worker {_worker_id} claimed room {room_name}")
+
     # LOGGING VERIFICATION
     print("\n" + "="*50)
     print("🚀 LIVEKIT AGENT ENTRYPOINT STARTED")
+    print(f"   Worker ID: {_worker_id}")
     print("   Logging verification check - if you see this, stdout is working")
     print("="*50 + "\n", flush=True)
 
@@ -3805,7 +3830,7 @@ async def entrypoint(ctx: JobContext):
     call_logger = create_call_logger()
     state._call_logger = call_logger  # Attach to state for tool access
     
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    # Note: ctx.connect() was already called in the duplicate execution guard block above
     
     participant = await ctx.wait_for_participant()
     logger.info(f"[LIFECYCLE] Participant: {participant.identity}")
@@ -4778,6 +4803,10 @@ async def entrypoint(ctx: JobContext):
     
     @ctx.room.on("disconnected")
     def _():
+        # Clean up room guard
+        if room_name in _ACTIVE_ROOMS:
+            del _ACTIVE_ROOMS[room_name]
+            logger.info(f"[GUARD] ✓ Released room {room_name} on disconnect")
         disconnect_event.set()
     
     @ctx.room.on("participant_disconnected")

@@ -610,10 +610,15 @@ async def get_next_available_slots(
     days_ahead: int = 14,
 ) -> List[datetime]:
     """
-    Finds next valid slots to break LLM retry loops.
-    Scans ahead up to `days_ahead` days to find `num_slots` available openings.
-    Checks both business hours and actual database availability.
+    OPTIMIZED: Batch-fetches appointments per day instead of per-slot queries.
+    
+    This is the KEY FIX that reduces 30+ DB calls to 1-2 per day.
+    Previously: Each slot checked with is_slot_free_supabase() = 30+ queries
+    Now: One fetch_day_appointments() per day, then local checks = 1-2 queries
     """
+    from services.database_service import fetch_day_appointments
+    from utils.slot_cache import check_slot_against_appointments
+    
     slots = []
     
     # 1. Setup timezone and start time
@@ -630,49 +635,44 @@ async def get_next_available_slots(
         current += timedelta(minutes=(15 - current.minute % 15))
     current = current.replace(second=0, microsecond=0)
     
-    # Ensure we don't start in the past (if passed a specific start_dt, we might need to adjust, 
-    # but this function logic implies finding *next* slots from *now* generally, 
-    # or we should respect a start_dt if we want to change signature validation.
-    # The current signature in assistant_tools triggers this with only kwargs, so 'start_dt' 
-    # was missing from the call in assistant_tools, which passed clinic_id instead.
-    # We will assume we start searching from NOW.
-    
     end_search = current + timedelta(days=days_ahead)
-    step_minutes = 15  # standard slot step
+    step_minutes = 15
+    
+    # Cache appointments per day (LOCAL to this function, not global)
+    _day_appointments_cache: Dict[date, List[Tuple[datetime, datetime]]] = {}
+    
+    async def get_day_appointments(d: date) -> List[Tuple[datetime, datetime]]:
+        if d not in _day_appointments_cache:
+            _day_appointments_cache[d] = await fetch_day_appointments(clinic_id, d, tz_str)
+        return _day_appointments_cache[d]
     
     while current < end_search and len(slots) < num_slots:
-        # 2. Check Business Hours
+        # 2. Check Business Hours (fast, no DB)
         is_valid, _ = is_within_working_hours(current, schedule, duration_minutes)
         
         if is_valid:
-            # 3. Check DB Availability
+            # 3. Check DB Availability using BATCH-FETCHED day data
             slot_end = current + timedelta(minutes=duration_minutes)
-            is_free = await is_slot_free_supabase(
-                clinic_id=clinic_id,
-                start_dt=current,
-                end_dt=slot_end
+            
+            # Fetch all appointments for this day (cached after first call)
+            day_appts = await get_day_appointments(current.date())
+            
+            # Check slot availability locally (no DB call!)
+            is_free = check_slot_against_appointments(
+                current, slot_end, day_appts, buffer_minutes=APPOINTMENT_BUFFER_MINUTES
             )
             
             if is_free:
                 slots.append(current)
-                # If we found a slot, jump by duration to give varied options? 
-                # Or just next 15 min? usage implies "next available", so next 15 min is fine,
-                # but maybe we want to space them out a bit? 
-                # Let's stick to finding consecutive available slots for now.
-                # Actually, if we return 2:00, 2:15, 2:30, that's fine.
         
         # Increment
         current += timedelta(minutes=step_minutes)
         
-        # Optimize: If we pass end of day, jump to next day start
-        # strict is_within_working_hours might handle false, but we can jump to skip night checks
-        if current.hour >= 20: # simple heuristic, or check schedule
-             # This simple jump is risky if hours go late, relying on loop is safer but slower.
-             # Let's rely on the loop for now, it's 4*24*14 iterations max ~= 1300 checks. 
-             # is_within_working_hours is fast. is_slot_free_supabase includes DB call, that is slow.
-             # WAIT: is_slot_free_supabase calls DB. We should NOT call it if not within working hours.
-             # We correctly check is_valid first.
-             pass
+        # Optimization: Skip to next day if past working hours
+        if current.hour >= 20:
+            next_day = current.date() + timedelta(days=1)
+            current = datetime.combine(next_day, datetime.min.time(), tzinfo=tz)
+            current = current.replace(hour=8, minute=0)
 
     return slots
 

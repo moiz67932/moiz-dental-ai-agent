@@ -19,6 +19,7 @@ from config import (
     APPOINTMENT_BUFFER_MINUTES,
     supabase,
     logger,
+    openai_client,  # Required for RAG embeddings
 )
 
 # Import models

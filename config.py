@@ -34,13 +34,15 @@ LATENCY TUNING GUIDE:
 
 # Endpointing: How quickly agent detects user finished speaking
 # WARNING: Do NOT go below 0.3s unless in controlled low-noise environment
-MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "1.0"))  # 1.0s - allow breath without interruption
-MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "1.2"))   # 1.5s max wait
+# TUNED: Reduced from 1.0/1.2 to 0.7/1.0 for faster response
+MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.7"))  # 0.7s - faster response
+MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "1.0"))  # 1.0s max wait
 
 # VAD (Voice Activity Detection) tuning
 # WARNING: min_silence < 0.25s may cause premature cutoffs on pauses
-VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH", "0.1"))    # Keep at 0.1 (don't lower)
-VAD_MIN_SILENCE_DURATION = float(os.getenv("VAD_MIN_SILENCE", "0.25"))  # 0.25s (was 0.3)
+# TUNED: Slightly increased silence for more stable turn detection
+VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH", "0.08"))   # 0.08s (slightly reduced)
+VAD_MIN_SILENCE_DURATION = float(os.getenv("VAD_MIN_SILENCE", "0.30")) # 0.30s (slightly increased for stability)
 
 # Filler speech settings
 FILLER_ENABLED = os.getenv("FILLER_ENABLED", "1") == "1"

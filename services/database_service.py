@@ -13,8 +13,9 @@ import re
 import os
 import asyncio
 import traceback
-from typing import Optional, Dict, Any, Tuple
-from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, Tuple, List
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 
 from config import supabase, logger, BOOKED_STATUSES, DEFAULT_MIN, DEMO_CLINIC_ID
 
@@ -210,12 +211,32 @@ async def fetch_clinic_context_optimized(
         return None, None, None, "Office Assistant"
 
 
-async def is_slot_free_supabase(clinic_id: str, start_dt: datetime, end_dt: datetime, clinic_info: dict = None) -> bool:
-    """Check if slot is free in Supabase appointments table."""
+async def is_slot_free_supabase(
+    clinic_id: str, 
+    start_dt: datetime, 
+    end_dt: datetime, 
+    clinic_info: dict = None,
+    use_cache: bool = True
+) -> bool:
+    """
+    Check if slot is free in Supabase appointments table.
+    Uses short-lived TTL cache to avoid repeated queries during a call.
+    """
+    from utils.slot_cache import get_cached_availability, set_cached_availability
+    
+    # Check cache first
+    if use_cache:
+        cached = get_cached_availability(clinic_id, start_dt)
+        if cached is not None:
+            logger.debug(f"[DB] Cache HIT for slot {start_dt.strftime('%H:%M')}")
+            return cached
+    
     try:
         # Safety check for closed dates (Fix #2)
         if clinic_info:
             try:
+                from services.scheduling_service import load_schedule_from_settings
+                schedule = load_schedule_from_settings(clinic_info.get("settings"))
                 closed = schedule.get("closed_dates") or set()
             except Exception:
                 closed = set()
@@ -232,10 +253,71 @@ async def is_slot_free_supabase(clinic_id: str, start_dt: datetime, end_dt: date
             .in_("status", BOOKED_STATUSES)
             .execute()
         )
-        return len(res.data or []) == 0
+        is_free = len(res.data or []) == 0
+        
+        # Cache result
+        if use_cache:
+            set_cached_availability(clinic_id, start_dt, is_free)
+        
+        return is_free
+        
     except Exception as e:
         logger.error(f"[DB] Availability check error: {e}")
         return False
+
+
+async def fetch_day_appointments(
+    clinic_id: str,
+    target_date: date,
+    tz_str: str = "UTC"
+) -> List[Tuple[datetime, datetime]]:
+    """
+    Fetch ALL appointments for a date in ONE query.
+    Returns list of (start_time, end_time) tuples.
+    
+    Use this instead of calling is_slot_free_supabase() in a loop.
+    This is the KEY OPTIMIZATION to reduce 30+ DB calls to just 1-2 per day.
+    """
+    from utils.slot_cache import get_cached_day_appointments, set_cached_day_appointments
+    
+    # Check cache first
+    cached = get_cached_day_appointments(clinic_id, target_date)
+    if cached is not None:
+        return cached
+    
+    try:
+        tz = ZoneInfo(tz_str)
+        day_start = datetime.combine(target_date, datetime.min.time(), tzinfo=tz)
+        day_end = day_start + timedelta(days=1)
+        
+        result = await asyncio.to_thread(
+            lambda: supabase.table("appointments")
+            .select("start_time, end_time")
+            .eq("clinic_id", clinic_id)
+            .gte("start_time", day_start.isoformat())
+            .lt("start_time", day_end.isoformat())
+            .in_("status", BOOKED_STATUSES)
+            .execute()
+        )
+        
+        appointments = []
+        for appt in (result.data or []):
+            try:
+                start = datetime.fromisoformat(appt["start_time"].replace("Z", "+00:00"))
+                end = datetime.fromisoformat(appt["end_time"].replace("Z", "+00:00"))
+                appointments.append((start, end))
+            except Exception:
+                pass
+        
+        # Cache the result
+        set_cached_day_appointments(clinic_id, target_date, appointments)
+        
+        logger.debug(f"[DB] Fetched {len(appointments)} appointments for {target_date}")
+        return appointments
+        
+    except Exception as e:
+        logger.error(f"[DB] fetch_day_appointments failed: {e}")
+        return []
 
 
 # async def book_to_supabase(
@@ -327,6 +409,10 @@ async def book_to_supabase(clinic_info: dict, patient_state: "PatientState", cal
             logger.error("[DB] Insert returned no id (unexpected)")
             return None
 
+        # Invalidate slot cache for this clinic to ensure fresh data
+        from utils.slot_cache import invalidate_slot_cache
+        invalidate_slot_cache(clinic_info.get("id"))
+        
         logger.info(f"[DB] ✅ Appointment inserted id={appt_id}")
         return appt_id
 
