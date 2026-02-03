@@ -145,23 +145,38 @@ def has_correction_intent(text: str) -> bool:
     return any(kw in text_lower for kw in correction_keywords)
 
 class AssistantTools(_FunctionContextBase):
+    """
+    Main toolset for the Patient Receptionist agent.
+    Inherits from FunctionContext for LiveKit LLM integration.
+    """
     def __init__(self, state: PatientState):
         super().__init__()
         self.state = state
         self._rag_cache = {}
     
     @llm.function_tool(description="""
-    Update the patient record with any information heard during conversation.
-    Call this IMMEDIATELY when you hear: name, phone, email, reason for visit, or preferred time.
-    You can call this multiple times as you gather information.
-    For phone: normalize spoken numbers (e.g., 'six seven nine' → '679').
-    For email: normalize spoken format (e.g., 'moiz six seven nine at gmail dot com' → 'moiz679@gmail.com').
-    For time: pass natural language (e.g., 'tomorrow at 2pm', 'next Monday morning', 'Feb 7').
-    CRITICAL: DO NOT guess the day of the week. If user says "Feb 7", DO NOT pass "Tuesday, Feb 7". 
-    Only pass exactly what the user said regarding the date/time.
+    Set the user's preference for receiving appointment confirmations via SMS instead of WhatsApp.
+    Call this if the user says:
+    - 'I don't have WhatsApp'
+    - 'Send me a text instead'
+    - 'Can you send an SMS?'
+    """)
+    def set_sms_preference(self, prefers_sms: bool = True) -> str:
+        """Note user preference for SMS instead of WhatsApp."""
+        state = self.state
+        state.prefers_sms = prefers_sms
+        logger.info(f"[TOOL] Preference set: prefers_sms={prefers_sms}")
+        return "I've noted that you prefer SMS. We'll send your confirmation via text message instead of WhatsApp."
+
+    @llm.function_tool(description="""
+    Update the patient's record with new information. Call this IMMEDIATELY when you hear:
+    - Name (e.g., 'My name is John Doe')
+    - Reason for visit (e.g., 'I have a toothache', 'cleaning')
+    - Time/Date preference (e.g., 'tomorrow at 2pm', 'February 15th')
+    - Phone number (e.g., 'my number is 555-0123')
+    - Email address (e.g., 'my email is john@example.com')
     
-    NEARBY SLOTS: If the requested time is TAKEN, this tool automatically finds and returns 
-    nearby alternatives (e.g., "9:00 AM or 11:30 AM"). Simply offer these to the patient!
+    If multiple pieces of info are provided, pass them all to one call.
     """)
     async def update_patient_record(self, 
         name: Optional[str] = None,
@@ -216,10 +231,22 @@ class AssistantTools(_FunctionContextBase):
         # === PHONE ===
         # Only update if explicitly corrected or captured for the first time
         if phone:
+            # ═══════════════════════════════════════════════════════════════
+            # 🛡️ SLOT ISOLATION — Prevent email digits from contaminating phone
+            # ═══════════════════════════════════════════════════════════════
+            # If we're in email verification mode, ignore phone-like fragments that
+            # could be digits from the email being spelled out
+            if state.awaiting_slot_confirmation and state.last_captured_slot == "email":
+                phone_digits = re.sub(r"\D", "", str(phone))
+                email_digits = re.sub(r"\D", "", state.last_captured_email or "")
+                if phone_digits and email_digits and phone_digits in email_digits:
+                    logger.info(f"[SLOT_ISOLATION] 🛡️ Ignoring phone fragment '{phone}' - digits match ongoing email capture")
+                    phone = None  # Skip phone processing
+            
             # CONTEXT-AWARE VERIFICATION CHECK (Fix #3)
             # If we just captured phone, treat fragments/confirmations as verification, NOT new data
 
-            if state.phone_confirmed and state.phone_e164:
+            if phone and state.phone_confirmed and state.phone_e164:
                 clinic_region = (_GLOBAL_CLINIC_INFO or {}).get(
                     "default_phone_region", DEFAULT_PHONE_REGION
                 )
@@ -243,7 +270,7 @@ class AssistantTools(_FunctionContextBase):
                     # However, usually we just want to NOT wipe the state.
                     return f"Got it. I have {speakable_phone(state.phone_pending)}. Is that right?"
     
-            if state.should_update_field("phone", state.phone_pending or state.phone_e164, phone):
+            if phone and state.should_update_field("phone", state.phone_pending or state.phone_e164, phone):
                 
                 # Use proper normalization with region awareness
                 clinic_region = (_GLOBAL_CLINIC_INFO or {}).get("default_phone_region", DEFAULT_PHONE_REGION)
@@ -297,12 +324,13 @@ class AssistantTools(_FunctionContextBase):
     
                     updates.append(f"email_pending={state.email}")
                     logger.info(f"[TOOL] ⏳ Email captured (pending confirmation): {state.email}")
-                    # Only prompt confirmation if contact phase has started AND not already confirmed
-                    if state.contact_phase_started and not state.email_confirmed:
-                        state.pending_confirm = "email"
-                        state.pending_confirm_field = "email"
-                        return f"Email captured as {email_for_speech(state.email)}. Please confirm: 'Is your email {email_for_speech(state.email)}?'"
-                # Otherwise, silently store - will confirm later in contact phase
+                    # EMAIL SUPPRESSED: Store silently, do NOT prompt for confirmation
+                    # Keep confirmation code intact for future use
+                    # if state.contact_phase_started and not state.email_confirmed:
+                    #     state.pending_confirm = "email"
+                    #     state.pending_confirm_field = "email"
+                    #     return f"Email captured as {email_for_speech(state.email)}. Please confirm: 'Is your email {email_for_speech(state.email)}?'"
+                    # EMAIL is stored but NOT confirmed - booking proceeds without email confirmation
         
         # === REASON (with duration lookup) ===
         if reason and state.should_update_field("reason", state.reason, reason):
@@ -328,8 +356,18 @@ class AssistantTools(_FunctionContextBase):
                 allow_date_override = not state.date_confirmed or is_correction
     
                 # Use parse_datetime_natural for robust relative date handling
-                # Handles "tomorrow at 3:30 PM", "next Monday", etc. correctly
-                parsed = parse_datetime_natural(time_suggestion, tz_hint=_GLOBAL_CLINIC_TZ)
+                # Handles "tomorrow at 2pm", "next Monday", etc. correctly
+                result = parse_datetime_natural(time_suggestion, tz_hint=_GLOBAL_CLINIC_TZ)
+                
+                # Check for clarification request (Issue B)
+                if result.get("needs_clarification"):
+                    return f"{result.get('message', 'Could you specify the day?')}"
+                
+                parsed = result.get("datetime")
+                
+                # If parsing failed altogether
+                if not parsed:
+                    return f"Hmm, I didn't quite catch that time. Could you say something like 'tomorrow at 2pm' or 'February 15th at 3:30'?"
                 
                 if parsed:
                     # 2. REJECTION CHECK: If user is repeating a rejected time?
@@ -488,14 +526,21 @@ class AssistantTools(_FunctionContextBase):
                         if state.full_name and state.dt_local and state.slot_available:
                             state.contact_phase_started = True
     
-                        # If we have a detected/pending phone now, ask for confirmation
-                        if contact_phase_allowed(state) and not state.phone_confirmed:
+                        # ═══════════════════════════════════════════════════════════════
+                        # 🛡️ CALLER ID FLOW — Ask to use same number if detected
+                        # ═══════════════════════════════════════════════════════════════
+                        if contact_phase_allowed(state) and not state.phone_confirmed and not state.caller_id_checked:
                             if not state.phone_pending and state.detected_phone:
                                 state.phone_pending = state.detected_phone
+                            
                             if state.phone_pending:
                                 state.pending_confirm = "phone"
                                 state.pending_confirm_field = "phone"
-                                return f"... ah, perfect! {day_spoken} at {time_spoken} is open. Should I save the number you called from for appointment details?"
+                                state.caller_id_checked = True # Mark that we are asking
+                                
+                                # Improved explicit confirmation
+                                phone_speak = speakable_phone(state.phone_pending)
+                                return f"... ah, perfect! {day_spoken} at {time_spoken} is open. Just to confirm your contact info, should I use the number you're calling from, {phone_speak}?"
     
                         # Sonic-3 prosody: breathy confirmation with ellipses
                         # CRITICAL: Phrase forces LLM to understand booking is NOT complete yet
@@ -554,18 +599,22 @@ class AssistantTools(_FunctionContextBase):
             state.contact_phase_started = True
     
         # If we have a detected/pending phone and contact phase is active, prompt confirmation
-        if contact_phase_allowed(state) and not state.phone_confirmed:
+        if contact_phase_allowed(state) and not state.phone_confirmed and not state.caller_id_checked:
             if not state.phone_pending and state.detected_phone:
                 state.phone_pending = state.detected_phone
             if state.phone_pending and state.pending_confirm != "phone":
                 state.pending_confirm = "phone"
                 state.pending_confirm_field = "phone"
+                state.caller_id_checked = True
                 if _REFRESH_AGENT_MEMORY:
                     try:
                         _REFRESH_AGENT_MEMORY()
                     except Exception:
                         pass
-                return f"Should I save the number you called from for appointment details?"
+                
+                # Improved explicit confirmation
+                phone_speak = speakable_phone(state.phone_pending)
+                return f"One last thing - should I use the number you're calling from, {phone_speak}, for your appointment details?"
     
         # Trigger memory refresh so LLM sees updated state
         if _REFRESH_AGENT_MEMORY:
@@ -717,10 +766,13 @@ class AssistantTools(_FunctionContextBase):
             try:
                 # Use parse_datetime_natural for robust relative date handling
                 # Handles "tomorrow at 2pm", "next Monday morning", etc. correctly
-                parsed = parse_datetime_natural(after_datetime, tz_hint=_GLOBAL_CLINIC_TZ)
-                if parsed:
-                    search_start = parsed
+                result = parse_datetime_natural(after_datetime, tz_hint=_GLOBAL_CLINIC_TZ)
+                
+                if result.get("success") and result.get("datetime"):
+                    search_start = result.get("datetime")
                     logger.info(f"[TOOL] get_available_slots_v2: parsed '{after_datetime}' → searching after {search_start.isoformat()}")
+                else:
+                     logger.warning(f"[TOOL] get_available_slots_v2: could not parse '{after_datetime}' (result: {result})")
             except Exception as e:
                 logger.warning(f"[TOOL] Could not parse after_datetime '{after_datetime}': {e}")
         
@@ -1154,8 +1206,8 @@ class AssistantTools(_FunctionContextBase):
         
         # Gate: Do NOT confirm phone if contact phase hasn't started
         if not contact_phase_allowed(state):
-            logger.debug("[TOOL] confirm_phone blocked - contact phase not started")
-            return "Continue the conversation. Confirm the appointment time first."
+            logger.warning("[TOOL] ⚠️ confirm_phone BLOCKED - contact phase not started")
+            return "I need to confirm your appointment time before saving contact details. Let's finalize when you'd like to come in first."
         
         # Smart capture: phone_number param takes priority over new_phone for backwards compat
         new_phone = _sanitize_tool_arg(phone_number) or _sanitize_tool_arg(new_phone)
@@ -1801,13 +1853,21 @@ class AssistantTools(_FunctionContextBase):
         # Get complete phone for confirmation
         phone_complete = state.phone_e164 or state.phone_pending
         
-        email_part = f" I'll send a confirmation to {state.email}." if state.email else ""
-        phone_part = f" Your number {speakable_phone(phone_complete)} is on file." if phone_complete else ""
+        # WhatsApp/SMS confirmation
+        if phone_complete:
+            # Check preference - default to WhatsApp
+            if getattr(state, "prefers_sms", False):
+                phone_part = f" We'll send your confirmation via SMS to {speakable_phone(phone_complete)}."
+            else:
+                phone_part = f" We'll send your confirmation on WhatsApp to {speakable_phone(phone_complete)}. If you don't have WhatsApp on this number, tell me and we'll send an SMS instead."
+        else:
+            phone_part = ""
+        
+        email_part = "" # EMAIL SUPPRESSED
         
         return (
             f"Perfect, {state.full_name} — you're all set for {state.reason or 'your appointment'} "
-            f"on {day} at {time_str}.{phone_part}{email_part} "
-            f"Is there anything else I can help you with?"
+            f"on {day} at {time_str}.{phone_part}{email_part} We look forward to seeing you!"
         )
 
     @llm.function_tool(description="""

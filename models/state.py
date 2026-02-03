@@ -239,6 +239,12 @@ class PatientState:
     # Contact phase gating - phone MUST NOT be mentioned until this is True
     contact_phase_started: bool = False
     
+    # NEW: WhatsApp/SMS preference tracking
+    prefers_sms: bool = False
+    
+    # NEW: Caller ID flow tracking
+    caller_id_checked: bool = False
+    
     # Review flow tracking
     review_presented: bool = False  # True after review summary shown
     review_snapshot: Optional[Dict[str, Any]] = None  # Snapshot at review time
@@ -424,6 +430,16 @@ class PatientState:
             if field_name == "phone":
                 curr_digits = re.sub(r"\D", "", curr_str)
                 new_digits = re.sub(r"\D", "", new_str)
+                
+                # 🛡️ INTENT-BASED SLOT ISOLATION: 
+                # If we are currently capturing an email that contains these same digits,
+                # and the user hasn't expressed clear intent to give a phone number, block it.
+                if self.awaiting_slot_confirmation and self.last_captured_slot == "email":
+                    email_digits = re.sub(r"\D", "", self.last_captured_email or "")
+                    if new_digits and new_digits in email_digits and not has_correction:
+                        logger.info(f"[UPDATE] 🛡️ Blocked phone update '{new_value}' - likely digits from spelling email '{self.last_captured_email}'")
+                        return False
+
                 if new_digits and new_digits in curr_digits and len(new_digits) < len(curr_digits):
                     logger.info(f"[UPDATE] 🛡️ Ignoring {field_name} fragment: '{new_value}' is part of '{current_value}'")
                     return False
@@ -444,19 +460,20 @@ class PatientState:
         return False
 
     def is_complete(self) -> bool:
-        """Check if we have all required info for booking."""
+        """Check if we have all required info for booking (email NOT required)."""
         return all([
             self.full_name,
             self.phone_e164,
             self.phone_confirmed,
-            self.email,
-            self.email_confirmed,
+            # EMAIL SUPPRESSED — kept for future use but not required for booking
+            # self.email,
+            # self.email_confirmed,
             self.reason,
             self.dt_local,
         ])
     
     def missing_slots(self) -> List[str]:
-        """Return list of missing required slots."""
+        """Return list of missing required slots (email excluded)."""
         missing = []
         if not self.full_name:
             missing.append("full_name")
@@ -464,10 +481,11 @@ class PatientState:
             missing.append("phone")
         elif not self.phone_confirmed:
             missing.append("phone_confirmed")
-        if not self.email:
-            missing.append("email")
-        elif not self.email_confirmed:
-            missing.append("email_confirmed")
+        # EMAIL SUPPRESSED — kept for future use but not required for booking
+        # if not self.email:
+        #     missing.append("email")
+        # elif not self.email_confirmed:
+        #     missing.append("email_confirmed")
         if not self.reason:
             missing.append("reason")
         if not self.dt_local:
@@ -518,16 +536,14 @@ class PatientState:
         else:
             lines.append("• PHONE: ? — Ask naturally")
         
-        # Email - only show if contact phase started (prevents early collection)
-        if not contact_phase_allowed(self):
-            # Contact phase not started - hide email from prompt to prevent early mention
-            lines.append("• EMAIL: — (collect after time confirmed)")
-        elif self.email and self.email_confirmed:
+        # Email - SUPPRESSED: Do NOT ask for email
+        # Only show email if user voluntarily provided it (keep code intact for future)
+        if self.email and self.email_confirmed:
             lines.append(f"• EMAIL: ✓ {self.email}")
         elif self.email:
-            lines.append(f"• EMAIL: ⏳ {self.email} — CONFIRM: 'Is your email {self.email}?'")
-        else:
-            lines.append("• EMAIL: ? — Ask naturally")
+            # Email captured but not confirmed - just note it, don't prompt confirmation
+            lines.append(f"• EMAIL: {self.email} (captured)")
+        # DO NOT add "? — Ask naturally" line - email collection is suppressed
         
         # Reason (concise)
         if self.reason:

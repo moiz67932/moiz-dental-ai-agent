@@ -6,6 +6,7 @@ import os
 import re
 import json
 import time
+import uuid
 import asyncio
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -66,8 +67,80 @@ _REFRESH_AGENT_MEMORY: Optional[callable] = None
 
 _turn_metrics = TurnMetrics()
 
+# duplicate execution guard global (local cache)
+_ACTIVE_ROOMS: Dict[str, str] = {}
+
+class RoomGuard:
+    """
+    Robust Room Guard - prevents duplicate execution across multiple instances.
+    Attempts to use Supabase 'room_locks' table for shared state.
+    """
+    @staticmethod
+    async def claim(room_name: str, worker_id: str) -> bool:
+        if not room_name: return True
+        if room_name in _ACTIVE_ROOMS:
+            return _ACTIVE_ROOMS[room_name] == worker_id
+        
+        try:
+            # 2. Shared check via Supabase
+            await asyncio.to_thread(
+                lambda: supabase.table("room_locks").insert({
+                    "room_name": room_name,
+                    "worker_id": worker_id
+                }).execute()
+            )
+            _ACTIVE_ROOMS[room_name] = worker_id
+            logger.info(f"[GUARD] ✓ Room {room_name} claimed via Supabase by {worker_id}")
+            return True
+        except Exception as e:
+            err_msg = str(e).lower()
+            
+            # Case A: Table missing (404 / relation does not exist)
+            if "not found" in err_msg or "404" in err_msg or ("relation" in err_msg and "not exist" in err_msg):
+                if room_name not in _ACTIVE_ROOMS:
+                    _ACTIVE_ROOMS[room_name] = worker_id
+                    logger.warning(f"[GUARD] ⚠ 'room_locks' table missing in Supabase. Falling back to local memory-based claim for {room_name}")
+                    return True
+                return _ACTIVE_ROOMS[room_name] == worker_id
+            
+            # Case B: Already exists (409 / Primary Key Violation) - check if WE own it
+            try:
+                check = await asyncio.to_thread(
+                    lambda: supabase.table("room_locks").select("worker_id").eq("room_name", room_name).execute()
+                )
+                if check.data and check.data[0]["worker_id"] == worker_id:
+                    _ACTIVE_ROOMS[room_name] = worker_id
+                    return True
+            except: pass
+            
+            logger.warning(f"[GUARD] ❌ Room {room_name} already claimed by another worker.")
+            return False
+
+    @staticmethod
+    async def release(room_name: str, worker_id: str):
+        _ACTIVE_ROOMS.pop(room_name, None)
+        try:
+            await asyncio.to_thread(
+                lambda: supabase.table("room_locks").delete().eq("room_name", room_name).eq("worker_id", worker_id).execute()
+            )
+        except: pass
+
 async def entrypoint(ctx: JobContext):
     global _GLOBAL_STATE, _GLOBAL_CLINIC_TZ, _GLOBAL_CLINIC_INFO, _REFRESH_AGENT_MEMORY, _GLOBAL_AGENT_SETTINGS, _GLOBAL_SCHEDULE
+    
+    # Generate unique worker ID for this instance
+    worker_id = f"worker-{uuid.uuid4().hex[:8]}"
+    room_name = ctx.room.name if ctx.room else None
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 🛡️ DUPLICATE SESSION GUARD — Prevents multiple workers processing same room
+    # ═══════════════════════════════════════════════════════════════════════════
+    if room_name:
+        claimed = await RoomGuard.claim(room_name, worker_id)
+        if not claimed:
+            logger.warning(f"[GUARD] ❌ Room {room_name} already claimed by another worker. Exiting duplicate.")
+            return
+        logger.info(f"[GUARD] ✓ Room {room_name} claimed by {worker_id}")
     
     # 1. INITIALIZE STATE & LOGGER IMMEDIATELY
     state = PatientState()
@@ -666,6 +739,11 @@ async def entrypoint(ctx: JobContext):
                 logger.warning("[DB] ⚠ Skipping call_sessions insert: organization_id or clinic_id missing")
         except Exception as e:
             logger.error(f"[DB] Call session error: {e}")
+        
+        # 🛡️ RELEASE ROOM GUARD — Allow future calls to this room
+        if room_name:
+            await RoomGuard.release(room_name, worker_id)
+            logger.info(f"[GUARD] ✓ Room {room_name} released by {worker_id}")
 
     ctx.add_shutdown_callback(_on_shutdown)
     

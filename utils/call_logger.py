@@ -697,8 +697,11 @@ class CallLogger:
                 from config import supabase
                 self._supabase = supabase
             
+            # Use upsert with on_conflict to prevent duplicate entries for the same turn
             await asyncio.to_thread(
-                lambda: self._supabase.table("call_transcripts").insert(entry).execute()
+                lambda: self._supabase.table("call_transcripts")
+                    .upsert(entry, on_conflict="call_id, turn_index")
+                    .execute()
             )
         except Exception as e:
             _structured_logger.log(

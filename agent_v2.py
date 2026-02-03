@@ -310,8 +310,6 @@ class RoomGuard:
         
         try:
             # 2. Shared check via Supabase
-            # NOTE: User needs to create 'room_locks' table for this to be multi-instance safe.
-            # CREATE TABLE room_locks (room_name TEXT PRIMARY KEY, worker_id TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW());
             await asyncio.to_thread(
                 lambda: supabase.table("room_locks").insert({
                     "room_name": room_name,
@@ -322,17 +320,17 @@ class RoomGuard:
             logger.info(f"[GUARD] ✓ Room {room_name} claimed via Supabase by {worker_id}")
             return True
         except Exception as e:
-            # Likely relation missing or conflict
             err_msg = str(e).lower()
-            if "relation" in err_msg and "not exist" in err_msg:
-                # Table missing - fallback to in-memory ONLY
+            
+            # Case A: Table missing (404 / relation does not exist)
+            if "not found" in err_msg or "404" in err_msg or ("relation" in err_msg and "not exist" in err_msg):
                 if room_name not in _ACTIVE_ROOMS:
                     _ACTIVE_ROOMS[room_name] = worker_id
-                    logger.info(f"[GUARD] ✓ Local fallback claim for {room_name}")
+                    logger.warning(f"[GUARD] ⚠ 'room_locks' table missing in Supabase. Falling back to local memory-based claim for {room_name}")
                     return True
                 return _ACTIVE_ROOMS[room_name] == worker_id
             
-            # Likely PK violation (already exists) - check if WE own it
+            # Case B: Already exists (409 / Primary Key Violation) - check if WE own it
             try:
                 check = await asyncio.to_thread(
                     lambda: supabase.table("room_locks").select("worker_id").eq("room_name", room_name).execute()

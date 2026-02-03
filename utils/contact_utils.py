@@ -5,6 +5,8 @@ from email_validator import validate_email, EmailNotValidError
 from dateutil import parser as dtparser
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from typing import Dict, Any
+from config import logger
 
 _WORD_DIGITS = {
     "zero": "0", "oh": "0", "o": "0",
@@ -93,79 +95,79 @@ def _strip_email_introducer(text: str) -> str:
     - "at the rate" replacement
     - "dot" replacement
     - Space removal
-    
+
     Args:
         text: Raw user utterance containing email
-        
+
     Returns:
         Text with introducer phrases removed, preserving the email payload
     """
     if not text:
         return ""
-    
+
     result = text.strip().lower()
-    
+
     # Remove each introducer pattern
     for pattern in _EMAIL_INTRODUCER_PATTERNS:
         result = re.sub(pattern, "", result, flags=re.IGNORECASE)
-    
+
     # Clean up extra whitespace
     result = re.sub(r"\s+", " ", result).strip()
-    
+
     return result
 
 
 def _convert_spoken_digits_for_email(text: str) -> str:
     """
     Convert spoken digit words to numeric digits for email local parts.
-    
+
     "moiz six seven nine three two" → "moiz67932"
-    
+
     Only converts standalone digit words, not words containing digit words.
     """
     if not text:
         return ""
-    
+
     tokens = text.split()
     result = []
-    
+
     for token in tokens:
         if token in _EMAIL_WORD_DIGITS:
             result.append(_EMAIL_WORD_DIGITS[token])
         else:
             result.append(token)
-    
+
     return " ".join(result)
 
 
 def normalize_email(spoken: str) -> str:
     """
     Normalize spoken email to standard email format.
-    
+
     Processing order (CRITICAL - DO NOT REORDER):
     1. Strip email introducer phrases ("my email is", etc.)
     2. Convert spoken digits to numbers ("six" → "6")
     3. Replace spoken symbols ("at the rate" → "@", "dot" → ".")
     4. Remove spaces
     5. Fix common domain typos
-    
+
     Args:
         spoken: User's spoken email utterance
-        
+
     Returns:
         Normalized email string (may or may not be valid)
     """
     if not spoken:
         return ""
-    
+
     # STEP 1: Strip introducer phrases FIRST
     # This prevents "my email is" from becoming part of the local part
     s = _strip_email_introducer(spoken)
-    
+
     # STEP 2: Convert spoken digits
     # "moiz six seven nine" → "moiz 6 7 9"
     s = _convert_spoken_digits_for_email(s)
-    
+
     # STEP 3: Replace spoken symbols
     s = s.replace(" at the rate ", " @ ")
     s = s.replace(" at ", " @ ")
@@ -173,16 +175,16 @@ def normalize_email(spoken: str) -> str:
     s = s.replace(" underscore ", " _ ")
     s = s.replace(" dash ", " - ")
     s = s.replace(" hyphen ", " - ")
-    
+
     # STEP 4: Remove all spaces
     s = re.sub(r"\s+", "", s)
-    
+
     # STEP 5: Fix common domain typos
     s = s.replace("gmailcom", "gmail.com")
     s = s.replace("yahoocom", "yahoo.com")
     s = s.replace("outlookcom", "outlook.com")
     s = s.replace("hotmailcom", "hotmail.com")
-    
+
     return s
 
 def validate_email_address(addr: str) -> bool:
@@ -192,35 +194,63 @@ def validate_email_address(addr: str) -> bool:
     except EmailNotValidError:
         return False
 
-def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime | None:
+def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str, Any]:
     """
     Parse natural language datetime with proper relative date handling.
-    
+
     Handles:
     - "tomorrow at 3:30 PM" → next day at 15:30
     - "next Monday at 2pm" → upcoming Monday at 14:00
     - "this Friday afternoon" → upcoming Friday at 14:00
     - Absolute dates like "January 20 at 10am"
-    
-    Args:
-        spoken: Natural language datetime string
-        tz_hint: Timezone string (e.g., "America/New_York", "Asia/Karachi")
-        
+
     Returns:
-        Timezone-aware datetime or None if parsing fails
+        Dict[str, Any]: {
+            "success": bool,
+            "datetime": Optional[datetime],
+            "needs_clarification": bool,
+            "clarification_type": str,
+            "message": str
+        }
     """
     if not spoken:
-        return None
-    
+        return {"success": False, "datetime": None, "needs_clarification": False, "clarification_type": "", "message": "empty_input"}
+
     try:
         tz = ZoneInfo(tz_hint) if tz_hint else None
         now = datetime.now(tz) if tz else datetime.now()
-        
+
         spoken_lower = spoken.lower().strip()
-        
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 🛡️ INCOMPLETE DATE DETECTION (Issue B)
+        # ═══════════════════════════════════════════════════════════════════════════
+        month_names = ["january","february","march","april","may","june",
+                       "july","august","september","october","november","december"]
+        has_month = any(m in spoken_lower for m in month_names)
+        # Check for day numbers (1-31)
+        has_day_number = bool(re.search(r'\b([1-9]|[12][0-9]|3[01])(st|nd|rd|th)?\b', spoken_lower))
+        # Check for relative days or weekday names
+        relative_words = ["today","tomorrow","monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+        has_relative = any(w in spoken_lower for w in relative_words)
+
+        if has_month and not has_day_number and not has_relative:
+            mentioned = [m for m in month_names if m in spoken_lower][0].title()
+            return {
+                "success": False,
+                "datetime": None,
+                "needs_clarification": True,
+                "clarification_type": "missing_day",
+                "month_mentioned": mentioned,
+                "message": f"Which day in {mentioned} would you prefer?"
+            }
+
+        # Original parsing logic continues, but wrapping results in success dict
+        # ... (rest of function will need to be wrapped or updated) ...
+
         # Clean up possessive forms (e.g., "feb's 10th" → "feb 10th")
         spoken_lower = re.sub(r"(\w+)'s\b", r"\1", spoken_lower)
-        
+
         # ═══════════════════════════════════════════════════════════════════════════
         # 🛠️ FILLER WORD REMOVAL — Clean words that confuse dateutil parser
         # ═══════════════════════════════════════════════════════════════════════════
@@ -323,7 +353,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                 result = datetime.combine(base_date, _extracted_time)
                 if tz:
                     result = result.replace(tzinfo=tz)
-                return result
+                return {"success": True, "datetime": result}
             
             # Fallback: Extract time component from the rest of the string
             time_str = re.sub(r"\btomorrow\b", "", spoken_clean, flags=re.IGNORECASE).strip()
@@ -334,14 +364,14 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                         result = datetime.combine(base_date, time_parsed.time())
                         if tz:
                             result = result.replace(tzinfo=tz)
-                        return result
+                        return {"success": True, "datetime": result}
                 except Exception:
                     pass
             # Default to 9am if no time specified
             result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
             if tz:
                 result = result.replace(tzinfo=tz)
-            return result
+            return {"success": True, "datetime": result}
         
         # Handle "today"
         if "today" in spoken_lower:
@@ -352,7 +382,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                 result = datetime.combine(base_date, _extracted_time)
                 if tz:
                     result = result.replace(tzinfo=tz)
-                return result
+                return {"success": True, "datetime": result}
             
             # Fallback to dateutil parsing
             time_str = re.sub(r"\btoday\b", "", spoken_clean, flags=re.IGNORECASE).strip()
@@ -363,14 +393,14 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                         result = datetime.combine(base_date, time_parsed.time())
                         if tz:
                             result = result.replace(tzinfo=tz)
-                        return result
+                        return {"success": True, "datetime": result}
                 except Exception:
                     pass
             # Default to next hour if no time specified
             result = datetime.combine(base_date, now.time().replace(minute=0, second=0, microsecond=0))
             if tz:
                 result = result.replace(tzinfo=tz)
-            return result
+            return {"success": True, "datetime": result}
         
         # Handle "next [weekday]" or standalone weekday names
         day_map = {
@@ -395,7 +425,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                     result = datetime.combine(base_date, _extracted_time)
                     if tz:
                         result = result.replace(tzinfo=tz)
-                    return result
+                    return {"success": True, "datetime": result}
                 
                 # Fallback: Extract time from remaining string
                 time_str = re.sub(rf"\b(next\s+)?{day_name}\b", "", spoken_clean, flags=re.IGNORECASE).strip()
@@ -406,7 +436,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                             result = datetime.combine(base_date, time_parsed.time())
                             if tz:
                                 result = result.replace(tzinfo=tz)
-                            return result
+                            return {"success": True, "datetime": result}
                     except Exception:
                         pass
                 
@@ -414,7 +444,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                 result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
                 if tz:
                     result = result.replace(tzinfo=tz)
-                return result
+                return {"success": True, "datetime": result}
         
         # === MONTH + DAY MAPPINGS ===
         # Define these FIRST as they're used by multiple pattern matchers
@@ -493,7 +523,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                         result = datetime.combine(base_date, _extracted_time)
                         if tz:
                             result = result.replace(tzinfo=tz)
-                        return result
+                        return {"success": True, "datetime": result}
                     
                     # Fallback: Extract time from remaining string
                     after_pattern = spoken_clean[numeric_match.end():].strip()
@@ -504,7 +534,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                                 result = datetime.combine(base_date, time_parsed.time())
                                 if tz:
                                     result = result.replace(tzinfo=tz)
-                                return result
+                                return {"success": True, "datetime": result}
                         except Exception:
                             pass
                     
@@ -512,7 +542,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                     result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
                     if tz:
                         result = result.replace(tzinfo=tz)
-                    return result
+                    return {"success": True, "datetime": result}
                 except ValueError:
                     pass
         
@@ -551,7 +581,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                             result = datetime.combine(base_date, _extracted_time)
                             if tz:
                                 result = result.replace(tzinfo=tz)
-                            return result
+                            return {"success": True, "datetime": result}
                         
                         # Fallback: Extract time from remaining string
                         after_pattern = spoken_clean[final_match.end():].strip()
@@ -562,7 +592,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                                     result = datetime.combine(base_date, time_parsed.time())
                                     if tz:
                                         result = result.replace(tzinfo=tz)
-                                    return result
+                                    return {"success": True, "datetime": result}
                             except Exception:
                                 pass
                         
@@ -570,7 +600,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                         result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
                         if tz:
                             result = result.replace(tzinfo=tz)
-                        return result
+                        return {"success": True, "datetime": result}
                     except ValueError:
                         pass
         
@@ -618,7 +648,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                                 result = datetime.combine(base_date, _extracted_time)
                                 if tz:
                                     result = result.replace(tzinfo=tz)
-                                return result
+                                return {"success": True, "datetime": result}
                             
                             # Fallback: Extract time from remaining string
                             # Clean filler words from the after_month portion
@@ -631,7 +661,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                                         result = datetime.combine(base_date, time_parsed.time())
                                         if tz:
                                             result = result.replace(tzinfo=tz)
-                                        return result
+                                        return {"success": True, "datetime": result}
                                 except Exception:
                                     pass
                             
@@ -639,7 +669,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                             result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
                             if tz:
                                 result = result.replace(tzinfo=tz)
-                            return result
+                            return {"success": True, "datetime": result}
                         except ValueError:
                             # Invalid date (e.g., Feb 30)
                             pass
@@ -648,14 +678,43 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> datetime 
                 break
 
         
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 🛡️ INCOMPLETE DATE DETECTION — Prevent dateutil from guessing the day
+        # ═══════════════════════════════════════════════════════════════════════════
+        # If user mentions a month but no day number or relative day, return None
+        # to let the caller ask for clarification instead of guessing.
+        month_names_full = ["january", "february", "march", "april", "may", "june",
+                           "july", "august", "september", "october", "november", "december",
+                           "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec"]
+        relative_days = ["today", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        
+        has_month = any(m in spoken_lower for m in month_names_full)
+        has_day_number = bool(re.search(r'\b(\d{1,2})(st|nd|rd|th)?\b', spoken_lower))
+        has_ordinal_word = any(ord_word in spoken_lower for ord_word in ordinal_map.keys())
+        has_relative_day = any(rday in spoken_lower for rday in relative_days)
+        
+        if has_month and not has_day_number and not has_ordinal_word and not has_relative_day:
+            # User said something like "February at 3:30 PM" without specifying the day
+            # Return failure dict to signal incomplete date; caller should ask for clarification
+            logger.debug(f"[DATE_PARSE] Incomplete date: month mentioned but no day. Input: '{spoken}'")
+            return {
+                "success": False, 
+                "datetime": None, 
+                "needs_clarification": True, 
+                "clarification_type": "missing_day", 
+                "message": "Please specify the day."
+            }
+        
+        
         # === FALLBACK: Use dateutil for absolute dates ===
         parsed = dtparser.parse(spoken, fuzzy=True)
         if parsed:
             if tz and parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=tz)
-            return parsed
+            return {"success": True, "datetime": parsed}
         
-        return None
+        return {"success": False, "datetime": None, "needs_clarification": False, "clarification_type": "", "message": "parse_failed"}
         
-    except Exception:
-        return None
+    except Exception as e:
+        logger.error(f"[DATE_PARSE] Error parsing '{spoken}': {e}")
+        return {"success": False, "datetime": None, "needs_clarification": False, "clarification_type": "", "message": "exception"}
