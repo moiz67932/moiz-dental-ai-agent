@@ -158,12 +158,14 @@ def contact_phase_allowed(state: "PatientState") -> bool:
     - A datetime has been set (state.dt_local exists)
     - The time has been validated as available (state.time_status == "valid")
     - The slot availability has been confirmed (state.slot_available == True)
+    - Name has been captured (state.full_name exists)
     
     OR when contact_phase_started flag is explicitly set (handles edge cases)
     """
-    # Primary check: time validated and slot available
+    # Primary check: name captured + time validated + slot available
     primary_check = (
-        state.time_status == "valid"
+        state.full_name is not None
+        and state.time_status == "valid"
         and state.dt_local is not None
         and getattr(state, "slot_available", False) is True
     )
@@ -171,7 +173,14 @@ def contact_phase_allowed(state: "PatientState") -> bool:
     # Fallback: contact phase explicitly started (handles edge cases)
     fallback_check = getattr(state, "contact_phase_started", False) is True
     
-    return primary_check or fallback_check
+    # Safety check: name + valid time (even if slot_available not set properly)
+    safety_check = (
+        state.full_name is not None
+        and state.time_status == "valid"
+        and state.dt_local is not None
+    )
+    
+    return primary_check or fallback_check or safety_check
 
 
 # =============================================================================

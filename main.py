@@ -33,7 +33,7 @@ from config import (
     ENVIRONMENT,
     GOOGLE_OAUTH_TOKEN_PATH,
 )
-from agent_v2 import entrypoint
+from agent_v2 import entrypoint, prewarm  # Use agent_v2.py for better performance
 from models.state import PatientState
 from utils.phone_utils import _normalize_phone_preserve_plus, speakable_phone
 
@@ -48,31 +48,6 @@ app = FastAPI(docs_url=None, redoc_url=None)  # Disable docs in prod for slight 
 def health_check():
     """Health check endpoint for Cloud Run."""
     return {"status": "ok"}
-
-
-# ============================================================================
-# Extracted: prewarm function
-# ============================================================================
-# =============================================================================
-
-def prewarm(proc: agents.JobProcess):
-    logger.info(f"[TELEPHONY] Worker identity set to: {LIVEKIT_AGENT_NAME}")
-    
-    try:
-        silero.VAD.load()
-        logger.info("[PREWARM] ✓ VAD loaded")
-    except Exception as e:
-        logger.error(f"[PREWARM] Error: {e}")
-    
-    # Verify calendar
-    logger.info("[CONFIG] Verifying calendar...")
-    if ENVIRONMENT == "production":
-        logger.info("[CONFIG] ✓ Production: using Supabase-backed OAuth token (skipping local file check)")
-    else:
-        if GOOGLE_OAUTH_TOKEN_PATH and os.path.exists(GOOGLE_OAUTH_TOKEN_PATH):
-            logger.info(f"[CONFIG] ✓ OAuth token: {GOOGLE_OAUTH_TOKEN_PATH}")
-        else:
-            logger.warning(f"[CONFIG] ❌ OAuth token missing")
 
 
 # ============================================================================

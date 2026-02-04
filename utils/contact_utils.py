@@ -285,12 +285,13 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str,
         )
         word_match = word_time_pattern.search(spoken_clean)
         
-        # Pattern 2: Numeric times like "3:30 pm", "2pm", "15:30"
+        # Pattern 2: Numeric times like "3:30 pm", "2pm", "at 10 am", "15:30"
+        # IMPORTANT: Require either "at" prefix, colon for minutes, or am/pm suffix
+        # to avoid matching day numbers like "6th" in "february 6th"
         numeric_time_pattern = re.compile(
-            r'(?:at\s+)?'  # Optional "at"
-            r'(\d{1,2})'   # Hour (1-2 digits)
-            r'(?::(\d{2}))?'  # Optional :minutes
-            r'\s*(am|pm|a\.m\.|p\.m\.)?',
+            r'(?:at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?'  # "at 10 am" pattern (requires "at")
+            r'|(\d{1,2}):(\d{2})\s*(am|pm|a\.m\.|p\.m\.)?'              # "3:30 pm" pattern (requires colon)
+            r'|(\d{1,2})\s+(am|pm|a\.m\.|p\.m\.))',                     # "2pm" pattern (requires am/pm)
             re.IGNORECASE
         )
         numeric_match = numeric_time_pattern.search(spoken_clean)
@@ -320,12 +321,28 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str,
                     pass  # Invalid time, skip
         
         # Fallback to numeric match
-        elif numeric_match and numeric_match.group(1):
-            hour = int(numeric_match.group(1))
-            minute = int(numeric_match.group(2)) if numeric_match.group(2) else 0
-            ampm = (numeric_match.group(3) or '').lower().replace('.', '')
+        # New pattern has 3 alternatives with different group positions:
+        # Alt 1 (at N am): groups 1,2,3 = hour, minute, ampm
+        # Alt 2 (N:MM am): groups 4,5,6 = hour, minute, ampm  
+        # Alt 3 (N am):    groups 7,8 = hour, ampm (no minute)
+        elif numeric_match:
+            # Find which alternative matched
+            if numeric_match.group(1):  # "at 10 am" pattern
+                hour = int(numeric_match.group(1))
+                minute = int(numeric_match.group(2)) if numeric_match.group(2) else 0
+                ampm = (numeric_match.group(3) or '').lower().replace('.', '')
+            elif numeric_match.group(4):  # "3:30 pm" pattern
+                hour = int(numeric_match.group(4))
+                minute = int(numeric_match.group(5)) if numeric_match.group(5) else 0
+                ampm = (numeric_match.group(6) or '').lower().replace('.', '')
+            elif numeric_match.group(7):  # "2pm" pattern
+                hour = int(numeric_match.group(7))
+                minute = 0
+                ampm = (numeric_match.group(8) or '').lower().replace('.', '')
+            else:
+                hour, minute, ampm = None, 0, ''
             
-            if hour <= 24 and minute < 60:
+            if hour is not None and hour <= 24 and minute < 60:
                 # Apply AM/PM conversion
                 if ampm == 'pm' and hour < 12:
                     hour += 12

@@ -608,6 +608,7 @@ async def get_next_available_slots(
     duration_minutes: int = 30,
     num_slots: int = 3,
     days_ahead: int = 14,
+    start_from_date: date = None,  # NEW: Optional start date (defaults to today)
 ) -> List[datetime]:
     """
     OPTIMIZED: Batch-fetches appointments per day instead of per-slot queries.
@@ -615,6 +616,10 @@ async def get_next_available_slots(
     This is the KEY FIX that reduces 30+ DB calls to 1-2 per day.
     Previously: Each slot checked with is_slot_free_supabase() = 30+ queries
     Now: One fetch_day_appointments() per day, then local checks = 1-2 queries
+    
+    Args:
+        start_from_date: Optional date to start searching from. If None, uses today.
+                         Use this when suggesting alternatives for a FUTURE date request.
     """
     from services.database_service import fetch_day_appointments
     from utils.slot_cache import check_slot_against_appointments
@@ -629,11 +634,20 @@ async def get_next_available_slots(
         
     now = datetime.now(tz)
     
-    # Round up to next 15-minute interval
-    current = now
-    if current.minute % 15 != 0:
-        current += timedelta(minutes=(15 - current.minute % 15))
-    current = current.replace(second=0, microsecond=0)
+    # FIX: If a start_from_date is provided, use that instead of "now"
+    # This ensures we search for alternatives around the REQUESTED date, not today
+    if start_from_date:
+        # Start from beginning of the requested day
+        current = datetime.combine(start_from_date, datetime.min.time(), tzinfo=tz)
+        # Start from first business hour (e.g., 8 AM)
+        current = current.replace(hour=8, minute=0, second=0, microsecond=0)
+        logger.info(f"[SLOTS] Searching from requested date: {start_from_date}")
+    else:
+        # Round up to next 15-minute interval from now
+        current = now
+        if current.minute % 15 != 0:
+            current += timedelta(minutes=(15 - current.minute % 15))
+        current = current.replace(second=0, microsecond=0)
     
     end_search = current + timedelta(days=days_ahead)
     step_minutes = 15

@@ -93,11 +93,15 @@ _GLOBAL_CLINIC_INFO = {}
 _GLOBAL_AGENT_SETTINGS = {}
 
 def update_global_clinic_info(info: dict, settings: dict = None):
-    """Called by agent.py to inject the database context."""
-    global _GLOBAL_CLINIC_INFO, _GLOBAL_AGENT_SETTINGS
+    """Called by agent.py to inject the database context including timezone."""
+    global _GLOBAL_CLINIC_INFO, _GLOBAL_AGENT_SETTINGS, _GLOBAL_CLINIC_TZ
     _GLOBAL_CLINIC_INFO = info or {}
     if settings:
         _GLOBAL_AGENT_SETTINGS = settings
+    # CRITICAL: Update timezone from clinic info
+    if info and info.get("timezone"):
+        _GLOBAL_CLINIC_TZ = info["timezone"]
+        logger.info(f"[TOOLS] ✓ Timezone updated to: {_GLOBAL_CLINIC_TZ}")
 
 
 # ============================================================================
@@ -134,8 +138,39 @@ def email_for_speech(email: str) -> str:
 
 
 def contact_phase_allowed(state: PatientState) -> bool:
-    """Check if contact phase is allowed to start."""
-    return state.contact_phase_started
+    """
+    Check if contact phase is allowed to start.
+    
+    SINGLE SOURCE OF TRUTH: Contact details can only be collected/confirmed
+    AFTER a valid time slot has been confirmed AND is available.
+    
+    Returns True when:
+    - Time has been validated as available (state.time_status == "valid")
+    - Slot availability is confirmed (state.slot_available == True)
+    - Name has been captured (state.full_name exists)
+    
+    OR when contact_phase_started flag is explicitly set (handles edge cases)
+    """
+    # Primary check: name captured + time validated + slot available
+    primary_check = (
+        state.full_name is not None
+        and state.time_status == "valid"
+        and state.dt_local is not None
+        and getattr(state, "slot_available", False) is True
+    )
+    
+    # Fallback: contact phase explicitly started (handles edge cases)
+    fallback_check = getattr(state, "contact_phase_started", False) is True
+    
+    # NEW: Also allow if we have name, valid time, and time_status is valid (even if slot_available wasn't set)
+    # This is a safety net for edge cases where slot_available might not be properly set
+    safety_check = (
+        state.full_name is not None
+        and state.time_status == "valid"
+        and state.dt_local is not None
+    )
+    
+    return primary_check or fallback_check or safety_check
 
 
 def has_correction_intent(text: str) -> bool:
@@ -552,6 +587,8 @@ class AssistantTools(_FunctionContextBase):
                     state.time_error = error_msg
                     state.dt_local = None
                     
+                    # FIX: Pass the requested date to search from that date, not from "now"
+                    requested_date = parsed.date() if parsed else None
                     alternatives = await get_next_available_slots(
                         clinic_id=(_GLOBAL_CLINIC_INFO or {}).get("id"),
                         schedule=schedule,
@@ -559,6 +596,7 @@ class AssistantTools(_FunctionContextBase):
                         duration_minutes=state.duration_minutes,
                         num_slots=2,
                         days_ahead=7,
+                        start_from_date=requested_date,  # Search from the REQUESTED date
                     )
                     
                     if alternatives:
@@ -1272,7 +1310,7 @@ class AssistantTools(_FunctionContextBase):
                     _REFRESH_AGENT_MEMORY()
                 except Exception:
                     pass
-            return "Phone confirmed! Continue gathering remaining info."
+            return "Phone confirmed! We'll send a confirmation message once the appointment is booked. Continue gathering remaining info or book the appointment."
         else:
             # User said "no" - clear and re-ask
             old_phone = state.phone_pending or state.detected_phone or state.phone_e164

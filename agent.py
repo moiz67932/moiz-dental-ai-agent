@@ -41,7 +41,7 @@ from config import (
     map_call_outcome,
     supabase,
 )
-from models.state import PatientState
+from models.state import PatientState, contact_phase_allowed
 from services.database_service import fetch_clinic_context_optimized
 from services.scheduling_service import load_schedule_from_settings
 from tools.assistant_tools import AssistantTools, update_global_clinic_info
@@ -387,7 +387,8 @@ async def entrypoint(ctx: JobContext):
                 await session.generate_reply()
             except Exception as e: logger.error(f"[CONFIRM] Error: {e}")
 
-        if pending == "phone" and state.contact_phase_started:
+        # Use contact_phase_allowed for comprehensive check (includes safety fallbacks)
+        if pending == "phone" and contact_phase_allowed(state):
             asyncio.create_task(_confirm(assistant_tools.confirm_phone, is_yes))
         elif pending == "email" and not state.email_confirmed:
              asyncio.create_task(_confirm(assistant_tools.confirm_email, is_yes))
