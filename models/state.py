@@ -161,6 +161,7 @@ def contact_phase_allowed(state: "PatientState") -> bool:
     - Name has been captured (state.full_name exists)
     
     OR when contact_phase_started flag is explicitly set (handles edge cases)
+    OR when caller_id_accepted is True (user confirmed their caller ID)
     """
     # Primary check: name captured + time validated + slot available
     primary_check = (
@@ -180,7 +181,10 @@ def contact_phase_allowed(state: "PatientState") -> bool:
         and state.dt_local is not None
     )
     
-    return primary_check or fallback_check or safety_check
+    # Caller ID accepted: user said "yes" to using their calling number
+    caller_id_accepted = getattr(state, "caller_id_accepted", False) is True
+    
+    return primary_check or fallback_check or safety_check or caller_id_accepted
 
 
 # =============================================================================
@@ -253,6 +257,7 @@ class PatientState:
     
     # NEW: Caller ID flow tracking
     caller_id_checked: bool = False
+    caller_id_accepted: bool = False  # True when user confirms to use their calling number
     
     # Review flow tracking
     review_presented: bool = False  # True after review summary shown

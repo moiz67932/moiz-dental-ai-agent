@@ -150,6 +150,7 @@ def contact_phase_allowed(state: PatientState) -> bool:
     - Name has been captured (state.full_name exists)
     
     OR when contact_phase_started flag is explicitly set (handles edge cases)
+    OR when caller_id_accepted is True (user confirmed their caller ID)
     """
     # Primary check: name captured + time validated + slot available
     primary_check = (
@@ -170,7 +171,10 @@ def contact_phase_allowed(state: PatientState) -> bool:
         and state.dt_local is not None
     )
     
-    return primary_check or fallback_check or safety_check
+    # Caller ID accepted: user said "yes" to using their calling number
+    caller_id_accepted = getattr(state, "caller_id_accepted", False) is True
+    
+    return primary_check or fallback_check or safety_check or caller_id_accepted
 
 
 def has_correction_intent(text: str) -> bool:
@@ -1201,10 +1205,12 @@ class AssistantTools(_FunctionContextBase):
     
 
     @llm.function_tool(description="""
-    Confirm the phone number with the patient. Call this ONLY after the contact phase is started.
-    Example: "Should I save the number you called from for appointment details?"
+    Confirm the phone number with the patient. Call this when:
+    - User says "yes", "yeah", "sure", "that's fine", "correct" to use their caller ID
+    - User says "use the number I'm calling from" or similar
+    - User explicitly confirms the phone number
     
-    IMPORTANT: When user says "yes", "yeah", "correct" etc., call confirm_phone(confirmed=True).
+    IMPORTANT: When user says "yes" or "use the number I'm calling from", call confirm_phone(confirmed=True) IMMEDIATELY.
     When user says "no", "wrong", "incorrect", call confirm_phone(confirmed=False).
     
     SMART CAPTURE: You can also pass a phone_number to save it before confirming.
@@ -1242,9 +1248,22 @@ class AssistantTools(_FunctionContextBase):
         if state.check_tool_lock("confirm_phone", locals()):
             return "Phone confirmation noted."
         
-        # Gate: Do NOT confirm phone if contact phase hasn't started
-        if not contact_phase_allowed(state):
-            logger.warning("[TOOL] ⚠️ confirm_phone BLOCKED - contact phase not started")
+        # RELAXED GATE: Allow confirm_phone if:
+        # 1. Contact phase is allowed (full check), OR
+        # 2. We have a detected caller ID AND user is confirming it (caller_id_flow)
+        # 3. We have name and are in the process of confirming time (allow early caller ID acceptance)
+        caller_id_flow = (
+            confirmed and 
+            state.detected_phone and 
+            not new_phone and 
+            not phone_number
+        )
+        
+        # Allow if we have name and detected phone (user is confirming caller ID)
+        has_basic_info = state.full_name is not None and state.detected_phone is not None
+        
+        if not contact_phase_allowed(state) and not caller_id_flow and not has_basic_info:
+            logger.warning("[TOOL] ⚠️ confirm_phone BLOCKED - contact phase not started and no caller ID flow")
             return "I need to confirm your appointment time before saving contact details. Let's finalize when you'd like to come in first."
         
         # Smart capture: phone_number param takes priority over new_phone for backwards compat
@@ -1294,6 +1313,8 @@ class AssistantTools(_FunctionContextBase):
             _ensure_phone_is_string(state)
             state.phone_e164 = str(state.phone_pending)  # Enforce string type - prevents tuple DB/calendar errors
             state.phone_confirmed = True
+            state.caller_id_accepted = True  # Mark that caller ID was accepted
+            state.contact_phase_started = True  # Enable contact phase for booking
             state.pending_confirm = None if state.pending_confirm == "phone" else state.pending_confirm
             state.pending_confirm_field = None if state.pending_confirm_field == "phone" else state.pending_confirm_field
             
@@ -1303,7 +1324,7 @@ class AssistantTools(_FunctionContextBase):
             state.slot_confirm_turns_left = 0
             logger.info(f"[SLOT_CONFIRM] ✅ Phone CONFIRMED by tool - Exiting verification mode")
             
-            logger.info(f"[TOOL] ✓ Phone CONFIRMED: {state.phone_e164}")
+            logger.info(f"[TOOL] ✓ Phone CONFIRMED (caller_id_accepted=True): {state.phone_e164}")
             # Trigger memory refresh
             if _REFRESH_AGENT_MEMORY:
                 try:
