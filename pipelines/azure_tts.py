@@ -16,6 +16,11 @@ from __future__ import annotations
 import os
 import logging
 
+try:
+    from livekit.plugins import azure as azure_plugin
+except ImportError:
+    azure_plugin = None
+
 logger = logging.getLogger("snappy_agent")
 
 
@@ -44,9 +49,7 @@ def create_azure_tts(voice: str = "ur-PK-UzmaNeural"):
             "Get them from https://portal.azure.com → Speech Services."
         )
 
-    try:
-        from livekit.plugins import azure as azure_plugin
-    except ImportError:
+    if azure_plugin is None:
         raise ImportError(
             "livekit-plugins-azure is not installed. "
             "Run: pip install livekit-plugins-azure==1.3.11"

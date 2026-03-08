@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timedelta, date
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, cast
 from zoneinfo import ZoneInfo
 
 from config import DEFAULT_TREATMENT_DURATIONS, DEFAULT_LUNCH_BREAK, logger, DEFAULT_TZ, supabase
@@ -64,7 +64,7 @@ def _default_hours() -> Dict[str, List[Dict[str, str]]]:
 # Extracted: load_schedule_from_settings
 # ============================================================================
 
-def load_schedule_from_settings(settings: Optional[dict]) -> Dict[str, Any]:
+def load_schedule_from_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Load comprehensive scheduling config from agent_settings.config_json.
     
@@ -336,8 +336,9 @@ async def suggest_slots_around(
         )
         for appt in (result.data or []):
             try:
-                appt_start = datetime.fromisoformat(appt["start_time"].replace("Z", "+00:00"))
-                appt_end = datetime.fromisoformat(appt["end_time"].replace("Z", "+00:00"))
+                appt_dict = cast(Dict[str, Any], appt)
+                appt_start = datetime.fromisoformat(str(appt_dict["start_time"]).replace("Z", "+00:00"))
+                appt_end = datetime.fromisoformat(str(appt_dict["end_time"]).replace("Z", "+00:00"))
                 existing_appointments.append((appt_start, appt_end))
             except Exception:
                 pass
@@ -447,8 +448,9 @@ async def get_alternatives_around_datetime(
         )
         for appt in (result.data or []):
             try:
-                appt_start = datetime.fromisoformat(appt["start_time"].replace("Z", "+00:00"))
-                appt_end = datetime.fromisoformat(appt["end_time"].replace("Z", "+00:00"))
+                appt_dict = cast(Dict[str, Any], appt)
+                appt_start = datetime.fromisoformat(str(appt_dict["start_time"]).replace("Z", "+00:00"))
+                appt_end = datetime.fromisoformat(str(appt_dict["end_time"]).replace("Z", "+00:00"))
                 existing_appointments.append((appt_start, appt_end))
             except Exception:
                 pass
@@ -608,7 +610,7 @@ async def get_next_available_slots(
     duration_minutes: int = 30,
     num_slots: int = 3,
     days_ahead: int = 14,
-    start_from_date: date = None,  # NEW: Optional start date (defaults to today)
+    start_from_date: Optional[date] = None,  # NEW: Optional start date (defaults to today)
 ) -> List[datetime]:
     """
     OPTIMIZED: Batch-fetches appointments per day instead of per-slot queries.

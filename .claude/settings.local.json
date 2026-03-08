@@ -1,0 +1,11 @@
+{
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "supabase"
+  ],
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python -m unittest tests/test_latency_paths.py -v)"
+    ]
+  }
+}

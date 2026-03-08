@@ -11,10 +11,7 @@ import logging
 from typing import Dict
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
-from openai import AsyncOpenAI
 from supabase import create_client
-
-from supabase_calendar_store import SupabaseCalendarStore
 
 # =============================================================================
 # Load Environment
@@ -33,21 +30,27 @@ LATENCY TUNING GUIDE:
 """
 
 # Endpointing: How quickly agent detects user finished speaking
-# WARNING: Do NOT go below 0.3s unless in controlled low-noise environment
-# TUNED: Reduced from 1.0/1.2 to 0.7/1.0 for faster response
-MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.7"))  # 0.7s - faster response
-MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "1.0"))  # 1.0s max wait
+# TELEPHONY TUNING (2026-03-08):
+#   Reduced from 0.7/1.0 to 0.4/0.7 — phone calls have lower latency tolerance
+#   than browser meetings. Do NOT go below 0.35s on lossy lines.
+MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.4"))  # 0.4s — faster telephony response
+MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "0.7"))  # 0.7s — reduced from 1.0s
 
 # VAD (Voice Activity Detection) tuning
-# WARNING: min_silence < 0.25s may cause premature cutoffs on pauses
-# TUNED: Slightly increased silence for more stable turn detection
-VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH", "0.08"))   # 0.08s (slightly reduced)
-VAD_MIN_SILENCE_DURATION = float(os.getenv("VAD_MIN_SILENCE", "0.30")) # 0.30s (slightly increased for stability)
+# TELEPHONY TUNING: reduced silence from 0.30 to 0.25s for snappier turn detection
+# 0.25s is safe for phone calls; only reduce further if seeing false cutoffs.
+VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH", "0.08"))   # 0.08s — unchanged
+VAD_MIN_SILENCE_DURATION = float(os.getenv("VAD_MIN_SILENCE", "0.25")) # 0.25s — reduced from 0.30s
 
 # Filler speech settings
 FILLER_ENABLED = os.getenv("FILLER_ENABLED", "1") == "1"
-FILLER_MAX_DURATION_MS = int(os.getenv("FILLER_MAX_MS", "700"))  # Hard cap on filler playback
-FILLER_PHRASES = ["Okay…", "One moment…", "Got it…", "Hmm…"]  # Short phrases < 400ms spoken
+# Reduced from 700ms to 400ms: filler should bridge the gap, not compete with the real response.
+# LLM typically responds in 600-900ms; filler just needs to cover the first 300-400ms.
+FILLER_MAX_DURATION_MS = int(os.getenv("FILLER_MAX_MS", "400"))
+# Debounce before sending filler — reduced from 250ms to 120ms so filler fires earlier.
+# This gives the filler more audible time before the LLM response arrives.
+FILLER_DEBOUNCE_MS = int(os.getenv("FILLER_DEBOUNCE_MS", "120"))
+FILLER_PHRASES = ["Okay.", "One moment.", "Got it.", "Let me check."]  # Short phrases < 400ms spoken
 
 # STT aggressive endpointing (Deepgram-specific)
 STT_AGGRESSIVE_ENDPOINTING = os.getenv("STT_AGGRESSIVE", "1") == "1"
@@ -119,20 +122,6 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 # =============================================================================
 # OPENAI CONFIGURATION
 # =============================================================================
-
-# Async OpenAI client for RAG embeddings (text-embedding-3-small for speed)
-openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# =============================================================================
-# CALENDAR CONFIGURATION
-# =============================================================================
-
-calendar_store = SupabaseCalendarStore(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
-# Google Calendar Config
-GOOGLE_CALENDAR_AUTH_MODE = os.getenv("GOOGLE_CALENDAR_AUTH", "oauth")
-GOOGLE_OAUTH_TOKEN_PATH = os.getenv("GOOGLE_OAUTH_TOKEN", "./google_token.json")
-GOOGLE_CALENDAR_ID_DEFAULT = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 
 # =============================================================================
 # DATABASE CONSTANTS

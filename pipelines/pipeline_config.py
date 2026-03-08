@@ -23,6 +23,16 @@ import inspect
 import logging
 from typing import Dict, Any, Optional
 
+from livekit.plugins import (
+    openai as openai_plugin,
+    deepgram as deepgram_plugin,
+    cartesia as cartesia_plugin,
+)
+
+from .azure_tts import create_azure_tts
+from .urdu_prompt import URDU_SYSTEM_PROMPT, URDU_FILLER_PHRASES
+from config import FILLER_PHRASES
+
 logger = logging.getLogger("snappy_agent")
 
 
@@ -37,12 +47,6 @@ def build_english_pipeline(
     Returns dict with keys: stt, llm, tts, system_prompt_template, filler_phrases, pipeline_name
     This is the EXACT same logic previously in entrypoint(), just extracted.
     """
-    from livekit.plugins import (
-        openai as openai_plugin,
-        deepgram as deepgram_plugin,
-        cartesia as cartesia_plugin,
-    )
-
     # --- STT (Deepgram English) ---
     if os.getenv("DEEPGRAM_API_KEY"):
         stt_config: Dict[str, Any] = {
@@ -54,10 +58,15 @@ def build_english_pipeline(
                 stt_sig = inspect.signature(deepgram_plugin.STT.__init__)
                 stt_params = set(stt_sig.parameters.keys())
                 if "endpointing" in stt_params or "kwargs" in str(stt_sig):
-                    stt_config["endpointing"] = 300
-                    stt_config["utterance_end_ms"] = 1000
+                    # TELEPHONY TUNING (2026-03-08):
+                    # endpointing: 300ms → 200ms (how long Deepgram waits after
+                    # silence before emitting a final transcript).
+                    # utterance_end_ms: 1000ms → 800ms (inter-utterance gap).
+                    # Increase back toward 300/1000 if callers get cut off mid-sentence.
+                    stt_config["endpointing"] = 200
+                    stt_config["utterance_end_ms"] = 800
                     if latency_debug:
-                        logger.debug("[STT-EN] Deepgram aggressive endpointing enabled: 300ms")
+                        logger.debug("[STT-EN] Deepgram telephony endpointing: 200ms / utt_end=800ms")
             except Exception:
                 pass
         stt_instance = deepgram_plugin.STT(**stt_config)
@@ -86,7 +95,7 @@ def build_english_pipeline(
         "llm": llm_instance,
         "tts": tts_instance,
         "system_prompt_template": None,  # Use existing A_TIER_PROMPT in agent_v2.py
-        "filler_phrases": ["Okay…", "One moment…", "Got it…", "Hmm…"],
+        "filler_phrases": FILLER_PHRASES,
         "pipeline_name": "english",
     }
 
@@ -103,13 +112,6 @@ def build_urdu_pipeline(
 
     Returns dict with keys: stt, llm, tts, system_prompt_template, filler_phrases, pipeline_name
     """
-    from livekit.plugins import (
-        openai as openai_plugin,
-        deepgram as deepgram_plugin,
-    )
-    from .azure_tts import create_azure_tts
-    from .urdu_prompt import URDU_SYSTEM_PROMPT, URDU_FILLER_PHRASES
-
     urdu_stt_lang = os.getenv("URDU_STT_LANGUAGE", "hi")
     urdu_llm_model = os.getenv("URDU_LLM_MODEL", "gpt-4o-mini")
     urdu_tts_voice = os.getenv("URDU_TTS_VOICE", "ur-PK-UzmaNeural")
@@ -131,15 +133,15 @@ def build_urdu_pipeline(
     else:
         stt_config["language"] = urdu_stt_lang
 
-    # Aggressive endpointing for Urdu too
+    # Telephony endpointing for Urdu (same tuning as English)
     try:
         stt_sig = inspect.signature(deepgram_plugin.STT.__init__)
         stt_params = set(stt_sig.parameters.keys())
         if "endpointing" in stt_params or "kwargs" in str(stt_sig):
-            stt_config["endpointing"] = 300
-            stt_config["utterance_end_ms"] = 1000
+            stt_config["endpointing"] = 200
+            stt_config["utterance_end_ms"] = 800
             if latency_debug:
-                logger.debug("[STT-UR] Deepgram Urdu endpointing enabled: 300ms")
+                logger.debug("[STT-UR] Deepgram Urdu telephony endpointing: 200ms / utt_end=800ms")
     except Exception:
         pass
 

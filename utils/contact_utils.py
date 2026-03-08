@@ -230,11 +230,21 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str,
         has_month = any(m in spoken_lower for m in month_names)
         # Check for day numbers (1-31)
         has_day_number = bool(re.search(r'\b([1-9]|[12][0-9]|3[01])(st|nd|rd|th)?\b', spoken_lower))
+        has_ordinal_word = bool(re.search(
+            r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|"
+            r"eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|"
+            r"seventeenth|eighteenth|nineteenth|twentieth|twenty[\s-]first|"
+            r"twenty[\s-]second|twenty[\s-]third|twenty[\s-]fourth|"
+            r"twenty[\s-]fifth|twenty[\s-]sixth|twenty[\s-]seventh|"
+            r"twenty[\s-]eighth|twenty[\s-]ninth|thirtieth|thirty[\s-]first)\b",
+            spoken_lower,
+            flags=re.IGNORECASE,
+        ))
         # Check for relative days or weekday names
-        relative_words = ["today","tomorrow","monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+        relative_words = ["today","tomorrow","day after tomorrow","monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
         has_relative = any(w in spoken_lower for w in relative_words)
 
-        if has_month and not has_day_number and not has_relative:
+        if has_month and not has_day_number and not has_ordinal_word and not has_relative:
             mentioned = [m for m in month_names if m in spoken_lower][0].title()
             return {
                 "success": False,
@@ -278,8 +288,8 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str,
         # Pattern 1: Word-based times like "three thirty pm", "two pm"
         word_time_pattern = re.compile(
             r'(?:at\s+)?'  # Optional "at"
-            r'(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*'
-            r'(thirty|fifteen|forty-five|forty five|forty|twenty|ten|oh five|o five)?'
+            r'\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b\s*'
+            r'\b(thirty|fifteen|forty-five|forty five|forty|twenty|ten|oh five|o five)?\b'
             r'\s*(am|pm|a\.m\.|p\.m\.)?',
             re.IGNORECASE
         )
@@ -361,6 +371,39 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str,
         # === RELATIVE DAY HANDLING ===
         # These MUST be handled before dateutil.parse which ignores them
         
+        # Handle "day after tomorrow" before plain "tomorrow"
+        if "day after tomorrow" in spoken_lower:
+            base_date = (now + timedelta(days=2)).date()
+
+            if _extracted_time:
+                result = datetime.combine(base_date, _extracted_time)
+                if tz:
+                    result = result.replace(tzinfo=tz)
+                return {"success": True, "datetime": result}
+
+            time_str = re.sub(r"\bday after tomorrow\b", "", spoken_clean, flags=re.IGNORECASE).strip()
+            if time_str:
+                try:
+                    time_parsed = dtparser.parse(time_str, fuzzy=True)
+                    if time_parsed:
+                        result = datetime.combine(base_date, time_parsed.time())
+                        if tz:
+                            result = result.replace(tzinfo=tz)
+                        return {"success": True, "datetime": result}
+                except Exception:
+                    pass
+
+            day_spoken = base_date.strftime("%A, %B %d")
+            return {
+                "success": True,
+                "datetime": datetime.combine(base_date, datetime.min.time().replace(hour=9), tzinfo=tz) if tz else datetime.combine(base_date, datetime.min.time().replace(hour=9)),
+                "date_only": True,
+                "needs_clarification": True,
+                "clarification_type": "time_missing",
+                "message": f"What time on {day_spoken} works for you?",
+                "parsed_date": base_date,
+            }
+
         # Handle "tomorrow"
         if "tomorrow" in spoken_lower:
             base_date = (now + timedelta(days=1)).date()
@@ -384,12 +427,18 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str,
                         return {"success": True, "datetime": result}
                 except Exception:
                     pass
-            # Default to 9am if no time specified
-            result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
-            if tz:
-                result = result.replace(tzinfo=tz)
-            return {"success": True, "datetime": result}
-        
+            # Date parsed but no time — ask the user what time works
+            day_spoken = base_date.strftime("%A, %B %d")
+            return {
+                "success": True,
+                "datetime": datetime.combine(base_date, datetime.min.time().replace(hour=9), tzinfo=tz) if tz else datetime.combine(base_date, datetime.min.time().replace(hour=9)),
+                "date_only": True,
+                "needs_clarification": True,
+                "clarification_type": "time_missing",
+                "message": f"What time on {day_spoken} works for you?",
+                "parsed_date": base_date,
+            }
+
         # Handle "today"
         if "today" in spoken_lower:
             base_date = now.date()
@@ -419,21 +468,34 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str,
                 result = result.replace(tzinfo=tz)
             return {"success": True, "datetime": result}
         
-        # Handle "next [weekday]" or standalone weekday names
+        # Handle "this/next [weekday]" or standalone weekday names
         day_map = {
             "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
             "friday": 4, "saturday": 5, "sunday": 6,
         }
         
         for day_name, weekday_num in day_map.items():
-            if day_name in spoken_lower or f"next {day_name}" in spoken_lower:
+            if day_name in spoken_lower:
+                qualifier = None
+                if f"this {day_name}" in spoken_lower:
+                    qualifier = "this"
+                elif f"next {day_name}" in spoken_lower:
+                    qualifier = "next"
+
                 # Calculate days until that weekday
                 days_until = (weekday_num - now.weekday()) % 7
-                if days_until == 0:  # Same day - go to next week
-                    days_until = 7
-                # If "next" is explicit, always go to next week occurrence
-                if f"next {day_name}" in spoken_lower and days_until < 7:
-                    days_until = 7 if days_until == 0 else days_until
+                if qualifier == "this":
+                    # "this Monday" means the upcoming occurrence in the current week,
+                    # or today when the weekday already matches.
+                    days_until = days_until
+                elif qualifier == "next":
+                    # "next Saturday" on Saturday should mean one week later.
+                    if days_until == 0:
+                        days_until = 7
+                else:
+                    # Bare weekday names default to the next occurrence, not today.
+                    if days_until == 0:
+                        days_until = 7
                 
                 base_date = (now + timedelta(days=days_until)).date()
                 
@@ -445,7 +507,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str,
                     return {"success": True, "datetime": result}
                 
                 # Fallback: Extract time from remaining string
-                time_str = re.sub(rf"\b(next\s+)?{day_name}\b", "", spoken_clean, flags=re.IGNORECASE).strip()
+                time_str = re.sub(rf"\b(?:(?:this|next)\s+)?{day_name}\b", "", spoken_clean, flags=re.IGNORECASE).strip()
                 if time_str:
                     try:
                         time_parsed = dtparser.parse(time_str, fuzzy=True)
@@ -457,12 +519,18 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str,
                     except Exception:
                         pass
                 
-                # Default to 9am if no time specified
-                result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
-                if tz:
-                    result = result.replace(tzinfo=tz)
-                return {"success": True, "datetime": result}
-        
+                # Date parsed but no time — ask the user what time works
+                day_spoken = base_date.strftime("%A, %B %d")
+                return {
+                    "success": True,
+                    "datetime": datetime.combine(base_date, datetime.min.time().replace(hour=9), tzinfo=tz) if tz else datetime.combine(base_date, datetime.min.time().replace(hour=9)),
+                    "date_only": True,
+                    "needs_clarification": True,
+                    "clarification_type": "time_missing",
+                    "message": f"What time on {day_spoken} works for you?",
+                    "parsed_date": base_date,
+                }
+
         # === MONTH + DAY MAPPINGS ===
         # Define these FIRST as they're used by multiple pattern matchers
         month_map = {
@@ -555,14 +623,20 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str,
                         except Exception:
                             pass
                     
-                    # Default to 9am if no time specified
-                    result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
-                    if tz:
-                        result = result.replace(tzinfo=tz)
-                    return {"success": True, "datetime": result}
+                    # Date parsed but no time — ask the user what time works
+                    day_spoken = base_date.strftime("%A, %B %d")
+                    return {
+                        "success": True,
+                        "datetime": datetime.combine(base_date, datetime.min.time().replace(hour=9), tzinfo=tz) if tz else datetime.combine(base_date, datetime.min.time().replace(hour=9)),
+                        "date_only": True,
+                        "needs_clarification": True,
+                        "clarification_type": "time_missing",
+                        "message": f"What time on {day_spoken} works for you?",
+                        "parsed_date": base_date,
+                    }
                 except ValueError:
                     pass
-        
+
         # === PATTERN 1A: "ordinal + of + month" (e.g., "fourth of February") ===
         # Sort by length (longest first) to match "twenty-first" before "first"
         sorted_ordinals = sorted(ordinal_map.items(), key=lambda x: len(x[0]), reverse=True)
@@ -613,14 +687,20 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str,
                             except Exception:
                                 pass
                         
-                        # Default to 9am
-                        result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
-                        if tz:
-                            result = result.replace(tzinfo=tz)
-                        return {"success": True, "datetime": result}
+                        # Date parsed but no time — ask the user what time works
+                        day_spoken = base_date.strftime("%A, %B %d")
+                        return {
+                            "success": True,
+                            "datetime": datetime.combine(base_date, datetime.min.time().replace(hour=9), tzinfo=tz) if tz else datetime.combine(base_date, datetime.min.time().replace(hour=9)),
+                            "date_only": True,
+                            "needs_clarification": True,
+                            "clarification_type": "time_missing",
+                            "message": f"What time on {day_spoken} works for you?",
+                            "parsed_date": base_date,
+                        }
                     except ValueError:
                         pass
-        
+
         # === PATTERN 2: "month + ordinal" (e.g., "February fourth", "March 3rd") ===
         # Try to match "Month + Day" pattern
         for month_name, month_num in month_map.items():
@@ -682,11 +762,17 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str,
                                 except Exception:
                                     pass
                             
-                            # Default to 9am if no time specified
-                            result = datetime.combine(base_date, datetime.min.time().replace(hour=9))
-                            if tz:
-                                result = result.replace(tzinfo=tz)
-                            return {"success": True, "datetime": result}
+                            # Date parsed but no time — ask the user what time works
+                            day_spoken = base_date.strftime("%A, %B %d")
+                            return {
+                                "success": True,
+                                "datetime": datetime.combine(base_date, datetime.min.time().replace(hour=9), tzinfo=tz) if tz else datetime.combine(base_date, datetime.min.time().replace(hour=9)),
+                                "date_only": True,
+                                "needs_clarification": True,
+                                "clarification_type": "time_missing",
+                                "message": f"What time on {day_spoken} works for you?",
+                                "parsed_date": base_date,
+                            }
                         except ValueError:
                             # Invalid date (e.g., Feb 30)
                             pass
@@ -724,7 +810,7 @@ def parse_datetime_natural(spoken: str, tz_hint: str | None = None) -> Dict[str,
         
         
         # === FALLBACK: Use dateutil for absolute dates ===
-        parsed = dtparser.parse(spoken, fuzzy=True)
+        parsed = dtparser.parse(spoken_clean, fuzzy=True)
         if parsed:
             if tz and parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=tz)

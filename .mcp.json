@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "supabase": {
+      "type": "http",
+      "url": "https://mcp.supabase.com/mcp?project_ref=seanzbqtziullcmfwamn",
+      "headers": {
+        "Authorization": "Bearer sbp_2092db213a156aa17c8815e090de1d8cde653496"
+      }
+    },
+    "context7": {
+      "command": "npx",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "@upstash/context7-mcp",
+        "--api-key",
+        "ctx7sk-f76ca78f-e71f-4a60-98b8-9e55c621dbe7"
+      ]
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest"]
+    }
+  }
+}

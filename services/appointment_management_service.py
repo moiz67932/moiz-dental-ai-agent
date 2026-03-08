@@ -10,7 +10,7 @@ Handles:
 from __future__ import annotations
 
 import asyncio
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, cast
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -58,11 +58,11 @@ async def find_appointment_by_phone(
         result = await asyncio.to_thread(_query)
         
         if result.data and len(result.data) > 0:
-            appt = result.data[0]
+            appt = cast(Dict[str, Any], result.data[0])
             logger.info(f"[APPT_MGMT] Found appointment id={appt['id']} for phone={phone_number[-4:]}")
             
             # Parse the datetime for easy formatting
-            start_dt = datetime.fromisoformat(appt["start_time"].replace("Z", "+00:00"))
+            start_dt = datetime.fromisoformat(str(appt["start_time"]).replace("Z", "+00:00"))
             if start_dt.tzinfo is None:
                 start_dt = start_dt.replace(tzinfo=ZoneInfo("UTC"))
             
@@ -219,18 +219,19 @@ async def find_all_appointments_by_phone(
         
         appointments = []
         for appt in (result.data or []):
-            start_dt = datetime.fromisoformat(appt["start_time"].replace("Z", "+00:00"))
+            appt_dict = cast(Dict[str, Any], appt)
+            start_dt = datetime.fromisoformat(str(appt_dict["start_time"]).replace("Z", "+00:00"))
             if start_dt.tzinfo is None:
                 start_dt = start_dt.replace(tzinfo=ZoneInfo("UTC"))
             start_dt = start_dt.astimezone(ZoneInfo(tz_str))
             
             appointments.append({
-                "id": appt["id"],
-                "patient_name": appt["patient_name"],
-                "reason": appt.get("reason", "appointment"),
+                "id": appt_dict["id"],
+                "patient_name": appt_dict["patient_name"],
+                "reason": appt_dict.get("reason", "appointment"),
                 "start_time": start_dt,
-                "status": appt["status"],
-                "calendar_event_id": appt.get("calendar_event_id"),
+                "status": appt_dict["status"],
+                "calendar_event_id": appt_dict.get("calendar_event_id"),
             })
         
         logger.info(f"[APPT_MGMT] Found {len(appointments)} appointments for phone=***{phone_number[-4:]}")

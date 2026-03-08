@@ -76,7 +76,6 @@ from config import (
     logger,
     LIVEKIT_AGENT_NAME,
     ENVIRONMENT,
-    GOOGLE_OAUTH_TOKEN_PATH,
 )
 from agent import entrypoint
 
@@ -129,14 +128,6 @@ def prewarm(proc: JobProcess):
     except Exception as e:
         logger.error(f"[PREWARM] ✗ VAD load failed: {e}")
     
-    # Verify calendar credentials
-    if ENVIRONMENT == "production":
-        logger.info("[PREWARM] ✓ Production mode: using Supabase OAuth tokens")
-    else:
-        if GOOGLE_OAUTH_TOKEN_PATH and os.path.exists(GOOGLE_OAUTH_TOKEN_PATH):
-            logger.info(f"[PREWARM] ✓ OAuth token found: {GOOGLE_OAUTH_TOKEN_PATH}")
-        else:
-            logger.warning("[PREWARM] ⚠ OAuth token not found (calendar features may fail)")
 
 
 # =============================================================================

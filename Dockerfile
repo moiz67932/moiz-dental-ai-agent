@@ -59,14 +59,12 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Copy application code
 COPY worker_main.py .
 COPY agent.py .
-COPY agent_v2.py .
 COPY config.py .
 COPY models/ ./models/
 COPY services/ ./services/
 COPY tools/ ./tools/
-COPY prompts/ ./prompts/
 COPY utils/ ./utils/
-COPY supabase_calendar_store.py .
+COPY pipelines/ ./pipelines/
 
 # Python environment settings
 ENV PYTHONUNBUFFERED=1
@@ -75,8 +73,8 @@ ENV ENVIRONMENT=production
 
 USER agent
 
-# NO EXPOSE — Cloud Run Jobs don't need ports
-# NO health probes — Jobs are not HTTP-based
+# AgentServer HTTP endpoint (used by LiveKit for worker health)
+EXPOSE 8080
 
 # Run the worker entry point directly
 # WHY NOT cli.run_app:

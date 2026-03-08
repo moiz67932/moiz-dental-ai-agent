@@ -13,7 +13,7 @@ import re
 import os
 import asyncio
 import traceback
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, cast
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
@@ -27,17 +27,15 @@ from services.extraction_service import _iso
 # from models.state import PatientState
 # from livekit.agents.voice import Agent as VoicePipelineAgent
 
-# For now, use TYPE_CHECKING
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from models.state import PatientState
-    from livekit.agents.voice import Agent as VoicePipelineAgent
     
 
 async def fetch_clinic_context_optimized(
     called_number: str,
     use_cache: bool = True,
-) -> Tuple[Optional[dict], Optional[dict], Optional[dict], str]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]], str]:
     """
     A-TIER: Robust clinic lookup with fuzzy suffix matching and demo fallback.
     
@@ -57,7 +55,10 @@ async def fetch_clinic_context_optimized(
     """
     
     # Helper: Build stable cache key from fetched data
-    def _build_cache_key(clinic: Optional[dict], agent: Optional[dict]) -> Optional[str]:
+    def _build_cache_key(
+        clinic: Optional[Dict[str, Any]],
+        agent: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
         """Build deterministic cache key from clinic_id:agent_id."""
         clinic_id = (clinic or {}).get("id")
         agent_id = (agent or {}).get("id")
@@ -66,21 +67,25 @@ async def fetch_clinic_context_optimized(
         return None
     
     # Helper: Extract nested settings from agent_info
-    def _extract_settings(agent_info: Optional[dict]) -> Tuple[Optional[dict], Optional[dict]]:
+    def _extract_settings(
+        agent_info: Optional[Dict[str, Any]]
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
         """Extract agent_settings and clean agent_info dict."""
-        if not agent_info:
+        if not agent_info or not isinstance(agent_info, dict):
             return None, None
-        settings = None
+        settings: Optional[Dict[str, Any]] = None
         nested_settings = agent_info.get("agent_settings")
         if isinstance(nested_settings, list) and nested_settings:
-            settings = nested_settings[0]
+            first_setting = nested_settings[0]
+            if isinstance(first_setting, dict):
+                settings = cast(Dict[str, Any], first_setting)
         elif isinstance(nested_settings, dict):
-            settings = nested_settings
+            settings = cast(Dict[str, Any], nested_settings)
         clean_agent = {k: v for k, v in agent_info.items() if k != "agent_settings"}
         return clean_agent, settings
     
     # Helper: Fetch agent by clinic_id (used when phone_numbers lacks agent link)
-    async def _fetch_agent_for_clinic(clinic_id: str) -> Optional[dict]:
+    async def _fetch_agent_for_clinic(clinic_id: str) -> Optional[Dict[str, Any]]:
         """Fetch agent and settings for a given clinic_id."""
         try:
             agent_res = await asyncio.to_thread(
@@ -95,7 +100,7 @@ async def fetch_clinic_context_optimized(
                 .limit(1)
                 .execute()
             )
-            return agent_res.data[0] if agent_res.data else None
+            return cast(Dict[str, Any], agent_res.data[0]) if agent_res.data else None
         except Exception as e:
             logger.warning(f"[DB] Agent fetch for clinic {clinic_id} failed: {e}")
             return None
@@ -131,12 +136,17 @@ async def fetch_clinic_context_optimized(
         result = await asyncio.to_thread(_query_phone_numbers)
         
         if result.data:
-            row = result.data[0]
+            row = cast(Dict[str, Any], result.data[0])
             clinic_info = row.get("clinics")
             agent_info = row.get("agents")
+
+            if not isinstance(clinic_info, dict):
+                clinic_info = None
+            if not isinstance(agent_info, dict):
+                agent_info = None
             
             if not agent_info and clinic_info:
-                agent_info = await _fetch_agent_for_clinic(clinic_info["id"])
+                agent_info = await _fetch_agent_for_clinic(str(clinic_info["id"]))
             
             agent_info, settings = _extract_settings(agent_info)
             agent_name = (agent_info or {}).get("name") or "Office Assistant"
@@ -164,8 +174,8 @@ async def fetch_clinic_context_optimized(
         clinic_result = await asyncio.to_thread(_query_clinics_direct)
         
         if clinic_result.data:
-            clinic_info = clinic_result.data[0]
-            agent_info = await _fetch_agent_for_clinic(clinic_info["id"])
+            clinic_info = cast(Dict[str, Any], clinic_result.data[0])
+            agent_info = await _fetch_agent_for_clinic(str(clinic_info["id"]))
             agent_info, settings = _extract_settings(agent_info)
             agent_name = (agent_info or {}).get("name") or "Office Assistant"
             
@@ -189,7 +199,7 @@ async def fetch_clinic_context_optimized(
         demo_result = await asyncio.to_thread(_fetch_demo_clinic)
         
         if demo_result.data:
-            clinic_info = demo_result.data[0]
+            clinic_info = cast(Dict[str, Any], demo_result.data[0])
             agent_info = await _fetch_agent_for_clinic(DEMO_CLINIC_ID)
             agent_info, settings = _extract_settings(agent_info)
             agent_name = (agent_info or {}).get("name") or "Office Assistant"
@@ -215,7 +225,7 @@ async def is_slot_free_supabase(
     clinic_id: str, 
     start_dt: datetime, 
     end_dt: datetime, 
-    clinic_info: dict = None,
+    clinic_info: Optional[Dict[str, Any]] = None,
     use_cache: bool = True
 ) -> bool:
     """
@@ -263,7 +273,9 @@ async def is_slot_free_supabase(
         
     except Exception as e:
         logger.error(f"[DB] Availability check error: {e}")
-        return False
+        # CRITICAL: Return True on DB error — a network error is NOT "slot taken"
+        # Better to double-book than to reject every slot when DB is unreachable
+        return True
 
 
 async def fetch_day_appointments(
@@ -303,8 +315,9 @@ async def fetch_day_appointments(
         appointments = []
         for appt in (result.data or []):
             try:
-                start = datetime.fromisoformat(appt["start_time"].replace("Z", "+00:00"))
-                end = datetime.fromisoformat(appt["end_time"].replace("Z", "+00:00"))
+                appt_dict = cast(Dict[str, Any], appt)
+                start = datetime.fromisoformat(str(appt_dict["start_time"]).replace("Z", "+00:00"))
+                end = datetime.fromisoformat(str(appt_dict["end_time"]).replace("Z", "+00:00"))
                 appointments.append((start, end))
             except Exception:
                 pass
@@ -362,7 +375,11 @@ async def fetch_day_appointments(
 # TUNING: Kill DB write if it takes longer than 6 seconds
 BOOKING_DB_TIMEOUT_SEC = 6.0 
 
-async def book_to_supabase(clinic_info: dict, patient_state: "PatientState", calendar_event_id: str = None) -> str | None:
+async def book_to_supabase(
+    clinic_info: Dict[str, Any],
+    patient_state: "PatientState",
+    calendar_event_id: Optional[str] = None,
+) -> Optional[str]:
     """
     Insert appointment row in Supabase.
     Returns appointment_id on success, None on failure.
@@ -394,11 +411,14 @@ async def book_to_supabase(clinic_info: dict, patient_state: "PatientState", cal
             payload["calendar_event_id"] = calendar_event_id
 
         # Define the sync operation
-        def _insert_sync():
+        def _insert_sync() -> Optional[str]:
             # Supabase Python: don't chain .select() after insert()
-            res = supabase.table("appointments").insert(payload, returning="representation").execute()
+            res = supabase.table("appointments").insert(payload).execute()
             data = res.data or []
-            return data[0].get("id") if data else None  
+            if data:
+                first = cast(Dict[str, Any], data[0])
+                return str(first.get("id", ""))
+            return None
 
         logger.info(f"[DB] Inserting appointment (timeout={BOOKING_DB_TIMEOUT_SEC}s) start={payload['start_time']}")
         
@@ -434,7 +454,7 @@ async def attach_calendar_event_id(appointment_id: str, calendar_event_id: str) 
         def _update_sync():
             res = (
                 supabase.table("appointments")
-                .update({"calendar_event_id": calendar_event_id}, returning="representation")
+                .update({"calendar_event_id": calendar_event_id})
                 .eq("id", appointment_id)
                 .execute()
             )
@@ -452,9 +472,3 @@ async def attach_calendar_event_id(appointment_id: str, calendar_event_id: str) 
         logger.error(f"[DB] ❌ attach_calendar_event_id failed: {e}")
         return False
 
-# NOTE: try_book_appointment requires complex imports from calendar_service and agent
-# It's better to keep this in agent.py where it's used, as it needs:
-# - VoicePipelineAgent (session param)
-# - resolve_calendar_auth_async from calendar_service  
-# - _get_calendar_service from calendar_client
-# Moving it here would create circular dependencies

@@ -1,0 +1,14 @@
+agent_v2.py
+supabase_calendar_store.py
+services/calendar_client.py
+services/calendar_service.py
+prompts/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.env*
+.git/
+.gitignore
+tests/
+*.md
