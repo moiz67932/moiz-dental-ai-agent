@@ -61,6 +61,7 @@ class StructuredLogger:
     def __init__(self, name: str = "call_logger"):
         self._logger = logging.getLogger(name)
         self._logger.setLevel(logging.INFO)
+        self._logger.propagate = False
         
         # Avoid duplicate handlers
         if not self._logger.handlers:
@@ -255,6 +256,13 @@ class CallLogger:
         # Auto-flush if buffer is full
         if len(self._event_buffer) >= MAX_BUFFER_SIZE:
             asyncio.create_task(self._async_flush_events())
+
+    def _get_supabase(self) -> Optional[Any]:
+        """Resolve the Supabase client lazily and keep None handling explicit."""
+        if self._supabase is None:
+            from config import supabase
+            self._supabase = supabase
+        return self._supabase
     
     async def _async_flush_events(self):
         """Flush buffered events to Supabase (non-blocking)."""
@@ -269,14 +277,13 @@ class CallLogger:
             return
         
         try:
-            # Lazy-load Supabase client
-            if self._supabase is None:
-                from config import supabase
-                self._supabase = supabase
+            supabase = self._get_supabase()
+            if supabase is None:
+                return
             
             # Batch insert to call_events table
             await asyncio.to_thread(
-                lambda: self._supabase.table("call_events").insert(events_to_flush).execute()
+                lambda: supabase.table("call_events").insert(events_to_flush).execute()
             )
         except Exception as e:
             # Log error but don't crash the call
@@ -309,9 +316,9 @@ class CallLogger:
     async def _create_call_record(self, from_number: Optional[str], to_number: Optional[str]):
         """Create initial call record in Supabase calls table."""
         try:
-            if self._supabase is None:
-                from config import supabase
-                self._supabase = supabase
+            supabase = self._get_supabase()
+            if supabase is None:
+                return
             
             call_record = {
                 "call_id": self.call_id,
@@ -328,7 +335,7 @@ class CallLogger:
                 call_record["organization_id"] = self.organization_id
             
             await asyncio.to_thread(
-                lambda: self._supabase.table("calls").insert(call_record).execute()
+                lambda: supabase.table("calls").insert(call_record).execute()
             )
         except Exception as e:
             _structured_logger.log(
@@ -354,12 +361,12 @@ class CallLogger:
     async def _update_call_record(self, duration_seconds: int, end_reason: str):
         """Update call record with end time and duration."""
         try:
-            if self._supabase is None:
-                from config import supabase
-                self._supabase = supabase
+            supabase = self._get_supabase()
+            if supabase is None:
+                return
             
             await asyncio.to_thread(
-                lambda: self._supabase.table("calls").update({
+                lambda: supabase.table("calls").update({
                     "end_time": datetime.utcnow().isoformat() + "Z",
                     "duration_seconds": duration_seconds,
                     "end_reason": end_reason,
@@ -427,7 +434,7 @@ class CallLogger:
             event: "speech_start" or "speech_end"
             duration_ms: Speech duration (for speech_end events)
         """
-        payload = {
+        payload: Dict[str, Any] = {
             "event": event,
         }
         
@@ -535,12 +542,12 @@ class CallLogger:
     async def _save_turn(self, turn: Dict[str, Any]):
         """Save turn to Supabase call_turns table."""
         try:
-            if self._supabase is None:
-                from config import supabase
-                self._supabase = supabase
+            supabase = self._get_supabase()
+            if supabase is None:
+                return
             
             await asyncio.to_thread(
-                lambda: self._supabase.table("call_turns").insert(turn).execute()
+                lambda: supabase.table("call_turns").insert(turn).execute()
             )
         except Exception as e:
             _structured_logger.log(
@@ -693,13 +700,13 @@ class CallLogger:
     async def _save_transcript_entry(self, entry: Dict[str, Any]):
         """Save transcript entry to Supabase call_transcripts table."""
         try:
-            if self._supabase is None:
-                from config import supabase
-                self._supabase = supabase
+            supabase = self._get_supabase()
+            if supabase is None:
+                return
             
             # Use upsert with on_conflict to prevent duplicate entries for the same turn
             await asyncio.to_thread(
-                lambda: self._supabase.table("call_transcripts")
+                lambda: supabase.table("call_transcripts")
                     .upsert(entry, on_conflict="call_id, turn_index")
                     .execute()
             )

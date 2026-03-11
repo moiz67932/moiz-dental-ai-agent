@@ -24,7 +24,6 @@ from livekit.agents import llm
 
 from utils.phone_utils import (
     _normalize_phone_preserve_plus,
-    speakable_phone,
 )
 from utils.agent_flow import (
     build_time_parse_candidates,
@@ -107,6 +106,57 @@ def _refresh_memory():
             _REFRESH_AGENT_MEMORY()
         except Exception:
             pass
+
+
+def _contact_reference(state: PatientState) -> str:
+    if state.using_caller_number or state.confirmed_contact_number_source == "caller_id":
+        return "this number"
+    if state.phone_last4:
+        return f"your number ending in {state.phone_last4}"
+    return "your number"
+
+
+def _phone_confirmation_question(state: PatientState, phone_candidate: str) -> str:
+    if (state.phone_source or "").lower() == "user_spoken":
+        if state.phone_last4:
+            return f"I have your number ending in {state.phone_last4}. Is that right?"
+        return "I have your number. Is that right?"
+    return "Can I use the number you're calling from?"
+
+
+def _booking_sentence(state: PatientState) -> str:
+    dt = state.dt_local
+    if not dt:
+        return "You're all set for your appointment."
+    day = dt.strftime("%A, %B %d")
+    time_str = dt.strftime("%I:%M %p").lstrip("0")
+    reason = state.reason or "your appointment"
+    if state.full_name:
+        return f"{state.full_name}, you're all set for your {reason} on {day} at {time_str}."
+    return f"You're all set for your {reason} on {day} at {time_str}."
+
+
+def _delivery_question_text(state: PatientState) -> str:
+    target = _contact_reference(state)
+    if target == "this number":
+        return "I'll send your confirmation to this number. Would you like that on WhatsApp, or by SMS on this number?"
+    return f"I'll send your confirmation to {target}. Would you like that on WhatsApp, or by SMS instead?"
+
+
+def _apply_delivery_preference(state: PatientState, channel: str) -> str:
+    normalized = str(channel).strip().lower()
+    if normalized not in {"whatsapp", "sms"}:
+        raise ValueError(f"Unsupported delivery channel: {channel}")
+
+    state.delivery_channel = normalized
+    state.prefers_sms = normalized == "sms"
+    state.delivery_preference_pending = False
+    state.delivery_preference_asked = True
+    logger.info(f"[TOOL] Delivery preference: {normalized}")
+
+    if normalized == "sms":
+        return "No problem, I'll send it by SMS."
+    return "Perfect, I'll send it on WhatsApp."
 
 
 # ============================================================================
@@ -328,9 +378,9 @@ class AssistantTools:
                             state.pending_confirm = "phone"
                             state.pending_confirm_field = "phone"
                             state.caller_id_checked = True
-                            phone_speak = speakable_phone(phone_candidate)
                             _refresh_memory()
-                            return f"Perfect! {day_spoken} at {time_spoken} is open. Should I use the number you're calling from, {phone_speak}?"
+                            phone_prompt = _phone_confirmation_question(state, phone_candidate)
+                            return f"Perfect. {day_spoken} at {time_spoken} is open. {phone_prompt}"
 
                     _refresh_memory()
                     return f"Got it — {day_spoken} at {time_spoken} is available. Continue gathering remaining info."
@@ -375,9 +425,8 @@ class AssistantTools:
                 state.pending_confirm = "phone"
                 state.pending_confirm_field = "phone"
                 state.caller_id_checked = True
-                phone_speak = speakable_phone(phone_candidate)
                 _refresh_memory()
-                return f"Should I use the number you're calling from, {phone_speak}?"
+                return _phone_confirmation_question(state, phone_candidate)
 
         _refresh_memory()
         _ms = (time.perf_counter() - _t0) * 1000
@@ -413,11 +462,13 @@ class AssistantTools:
                 state.phone_last4 = str(last4) if last4 else ""
                 state.phone_confirmed = False
                 state.phone_source = "user_spoken"
+                state.using_caller_number = False
+                state.confirmed_contact_number_source = None
                 state.pending_confirm = "phone"
                 state.pending_confirm_field = "phone"
                 logger.info(f"[TOOL] Phone updated: ***{state.phone_last4}")
                 _refresh_memory()
-                return f"I have ***{state.phone_last4}. Is that right?"
+                return _phone_confirmation_question(state, str(clean_phone))
             return f"Couldn't parse '{new_phone}'. Could you repeat the number?"
 
         if confirmed:
@@ -426,7 +477,10 @@ class AssistantTools:
                 return "No phone number to confirm. Ask for the number first."
             state.phone_e164 = str(phone_candidate)
             state.phone_confirmed = True
-            state.caller_id_accepted = True
+            using_caller_number = (state.phone_source or "").lower() == "sip"
+            state.caller_id_accepted = using_caller_number
+            state.using_caller_number = using_caller_number
+            state.confirmed_contact_number_source = "caller_id" if using_caller_number else "user_provided"
             state.contact_phase_started = True
             state.pending_confirm = None if state.pending_confirm == "phone" else state.pending_confirm
             state.pending_confirm_field = None if state.pending_confirm_field == "phone" else state.pending_confirm_field
@@ -443,11 +497,39 @@ class AssistantTools:
             state.phone_last4 = None
             state.phone_confirmed = False
             state.phone_source = None
+            state.using_caller_number = False
+            state.confirmed_contact_number_source = None
+            state.caller_id_accepted = False
             state.pending_confirm = None if state.pending_confirm == "phone" else state.pending_confirm
             state.pending_confirm_field = None if state.pending_confirm_field == "phone" else state.pending_confirm_field
             logger.info(f"[TOOL] Phone rejected (was {old})")
             _refresh_memory()
             return "Phone cleared. Ask: 'What number should I use instead?'"
+
+    @llm.function_tool(description="Save whether appointment confirmation should be sent on WhatsApp or SMS.")
+    async def set_delivery_preference(self, channel: str) -> str:
+        state = self.state
+        if not state:
+            return "State not initialized."
+
+        try:
+            acknowledgement = _apply_delivery_preference(state, channel)
+        except ValueError:
+            return "Please choose either WhatsApp or SMS."
+
+        if state.appointment_booked:
+            state.anything_else_pending = True
+            state.anything_else_asked = True
+            state.user_declined_more_help = False
+            state.final_goodbye_sent = False
+            state.user_goodbye_detected = False
+            state.closing_state = "anything_else_pending"
+            _refresh_memory()
+            return f"{acknowledgement} Is there anything else I can help you with today?"
+
+        state.closing_state = "open"
+        _refresh_memory()
+        return acknowledgement
 
     @llm.function_tool(description="Confirm or reject patient's email address.")
     async def confirm_email(self, confirmed: bool, email_address: Optional[str] = None) -> str:
@@ -695,28 +777,37 @@ class AssistantTools:
         state.appointment_booked = True
         state.booking_confirmed = True
         state.appointment_id = appt_id
-
-        dt = state.dt_local
-        day = dt.strftime("%A, %B %d")
-        time_str = dt.strftime("%I:%M %p").lstrip("0")
-        phone_complete = state.phone_e164 or state.phone_pending
-
-        if phone_complete:
-            if getattr(state, "prefers_sms", False):
-                phone_part = f" We'll send your confirmation via SMS to {speakable_phone(phone_complete)}."
-            else:
-                phone_part = f" We'll send your confirmation on WhatsApp to {speakable_phone(phone_complete)}. If you don't have WhatsApp on this number, let me know and we'll send an SMS instead."
-        else:
-            phone_part = ""
+        state.user_declined_more_help = False
+        state.final_goodbye_sent = False
+        state.user_goodbye_detected = False
 
         _ms = (time.perf_counter() - _t0) * 1000
         logger.info(f"[PERF] confirm_and_book: {_ms:.0f}ms, appt_id={appt_id}")
+        booking_sentence = _booking_sentence(state)
+        if state.delivery_channel not in {"whatsapp", "sms"} and state.prefers_sms:
+            state.delivery_channel = "sms"
 
-        message = (
-            f"Perfect, {state.full_name} — you're all set for {state.reason or 'your appointment'} "
-            f"on {day} at {time_str}.{phone_part} We look forward to seeing you!"
-        )
-        return message
+        if state.delivery_channel in {"whatsapp", "sms"}:
+            target = _contact_reference(state)
+            if state.delivery_channel == "sms":
+                delivery_part = f" I'll send your confirmation by SMS to {target}."
+            else:
+                delivery_part = f" I'll send your confirmation on WhatsApp to {target}."
+            state.delivery_preference_pending = False
+            state.delivery_preference_asked = True
+            state.anything_else_pending = True
+            state.anything_else_asked = True
+            state.closing_state = "anything_else_pending"
+            _refresh_memory()
+            return f"{booking_sentence}{delivery_part} Is there anything else I can help you with today?"
+
+        state.delivery_preference_pending = True
+        state.delivery_preference_asked = True
+        state.anything_else_pending = False
+        state.anything_else_asked = False
+        state.closing_state = "delivery_pending"
+        _refresh_memory()
+        return f"{booking_sentence} {_delivery_question_text(state)}"
 
     @llm.function_tool(description="Find existing appointment for cancel/reschedule. Call silently when user mentions cancelling or rescheduling.")
     async def find_existing_appointment(self) -> str:
@@ -880,6 +971,10 @@ class AssistantTools:
     @llm.function_tool(description="End the call when the user says goodbye or conversation is complete.")
     async def end_conversation(self) -> str:
         if self.state:
+            if self.state.booking_confirmed and self.state.delivery_preference_pending:
+                return "Before ending the call, ask whether they'd like the confirmation on WhatsApp or by SMS."
+            if self.state.booking_confirmed and not self.state.user_declined_more_help:
+                return "Before ending the call, ask if there is anything else you can help with today."
             self.state.call_ended = True
             if self.state.booking_confirmed:
                 logger.info("[CALL_END] Call ending after successful booking")

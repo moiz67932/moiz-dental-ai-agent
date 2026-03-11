@@ -35,11 +35,10 @@ import os
 import re
 import json
 import time
-import random
 import asyncio
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable, Awaitable, Literal
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -85,7 +84,6 @@ from config import (
     FILLER_ENABLED,
     FILLER_MAX_DURATION_MS,
     FILLER_DEBOUNCE_MS,
-    FILLER_PHRASES,
     VAD_MIN_SPEECH_DURATION,
     VAD_MIN_SILENCE_DURATION,
     MIN_ENDPOINTING_DELAY,
@@ -97,14 +95,17 @@ from models.state import PatientState, YES_PAT, NO_PAT
 from pipelines.pipeline_config import get_pipeline_components
 from pipelines.urdu_prompt import URDU_SYSTEM_PROMPT
 from services.database_service import fetch_clinic_context_optimized
-from services.scheduling_service import load_schedule_from_settings
+from services.scheduling_service import load_schedule_from_settings, get_duration_for_service
+from services.extraction_service import extract_name_quick, extract_reason_quick
 from utils.agent_flow import (
     has_date_reference,
     has_time_reference,
-    is_active_filler_event,
     resolve_confirmation_intent,
+    resolve_delivery_preference,
     store_detected_phone,
     time_expression_score,
+    user_declined_anything_else,
+    user_said_goodbye,
 )
 from tools.assistant_tools import AssistantTools, update_global_clinic_info
 
@@ -214,15 +215,19 @@ WORKFLOW — 1 question at a time, 1-2 sentences max:
    - "no" or gives different number -> call update_patient_record(phone=...).
 6. All required fields captured -> call confirm_and_book_appointment IMMEDIATELY. Don't ask "shall I book?".
 7. Read the booking confirmation EXACTLY as the tool returns it. Do not rephrase.
-8. Ask "Is there anything else I can help with?" — if no -> say goodbye -> call end_conversation.
+8. If the booking message asks WhatsApp or SMS, ask that exact question and WAIT for the caller's answer.
+9. After delivery preference is settled, ask "Is there anything else I can help you with today?"
+10. Only after the caller is done, give a brief closing and end the call.
 
 RULES:
 - Call update_patient_record IMMEDIATELY when you hear any info. Never wait.
 - Normalize spoken input before saving: "three one zero" -> "310", "at gmail dot com" -> "@gmail.com".
+- Once caller ID is confirmed, refer to it as "the number you're calling from", "this number", or "your number" — do not repeat the full digits unless the caller asks.
 - Never say "booked" until the tool confirms it.
 - Never admit you are AI — say "I'm the office assistant."
 - Never offer callbacks (you cannot dial out).
 - Keep every response to 1-2 short sentences. This is a phone call.
+- If you need a tiny bridge while waiting, use only a very short acknowledgement like "Sure." or "Of course." Never pad confirmation or slot-capture turns.
 - Sound warm and natural: "Of course!", "Perfect!", "Got it!" — not robotic.
 - For cancel/reschedule requests: call find_existing_appointment first, confirm details with user, then act.
 - For emergencies (severe pain, bleeding, swelling): express concern, direct to ER, offer follow-up booking.
@@ -316,25 +321,169 @@ SLOT_VALUE_RE = re.compile(
 FILLER_THINKING = ["One moment.", "Let me check."]
 FILLER_ACKNOWLEDGE = ["Got it.", "Sure thing."]
 FILLER_GENERAL = ["Okay.", "Alright."]
+QUESTION_HINTS = (
+    "what",
+    "when",
+    "where",
+    "how much",
+    "how long",
+    "do you have",
+    "is there",
+    "are there",
+    "can you",
+    "could you",
+    "would you",
+    "do you take",
+    "do you accept",
+)
+BOOKING_CAPTURE_HINTS = (
+    "my name",
+    "i'm",
+    "i am",
+    "this is",
+    "it's",
+    "it is",
+    "i want",
+    "i need",
+    "book",
+    "appointment",
+    "schedule",
+    "cleaning",
+    "consultation",
+    "checkup",
+    "check-up",
+    "whitening",
+    "tooth pain",
+    "filling",
+    "crown",
+    "root canal",
+)
+INCOMPLETE_CAPTURE_RE = re.compile(
+    r"(?:\b(?:at|on|for|around|between|this|next)\b|\b(?:uh|um|er|hmm)\b)[\s,.;:!?-]*$",
+    re.IGNORECASE,
+)
+GREETING_RE = re.compile(
+    r"^(?:hi|hello|hey|good\s+(?:morning|afternoon|evening)|assalam(?:u|o)\s*alaikum)\b",
+    re.IGNORECASE,
+)
+OPENING_REQUEST_RE = re.compile(
+    r"\b("
+    r"i want(?: to)?|"
+    r"i need(?: to)?|"
+    r"i'?d like(?: to)?|"
+    r"book|"
+    r"schedule|"
+    r"make an appointment|"
+    r"appointment"
+    r")\b",
+    re.IGNORECASE,
+)
+INTRO_RE = re.compile(
+    r"\b(my name is|this is|i'?m|i am)\b",
+    re.IGNORECASE,
+)
+
+MICRO_ACK_DELAY_MS = min(FILLER_DEBOUNCE_MS, 180)
+MICRO_ACK_MAX_DURATION_MS = max(FILLER_MAX_DURATION_MS, 420)
+AUTO_DISCONNECT_SILENCE_MS = 1400
+AUTO_DISCONNECT_POST_GOODBYE_MS = 600
 
 
-def _choose_filler(text: str) -> str:
-    """Pick a contextually appropriate filler based on what the user said."""
-    lower = text.strip().lower()
-    # Questions → "thinking" filler
-    if lower.endswith("?") or any(w in lower for w in [
-        "do you have", "is there", "can i", "can you", "what", "when",
-        "how much", "available", "price", "cost",
-    ]):
-        return random.choice(FILLER_THINKING)
-    # User giving info (name, time, reason) → acknowledge
-    if any(w in lower for w in [
-        "my name", "i'm", "i am", "i want", "i need", "book",
-        "appointment", "schedule", "cleaning", "whitening",
-    ]):
-        return random.choice(FILLER_ACKNOWLEDGE)
-    # Everything else
-    return random.choice(FILLER_GENERAL)
+def _is_fragmented_turn(text: str) -> bool:
+    lower = " ".join((text or "").strip().lower().split())
+    if not lower:
+        return False
+    if INCOMPLETE_CAPTURE_RE.search(lower):
+        return True
+    return lower.endswith((" at", " on", " for", " around", " between", " this", " next"))
+
+
+def _is_opening_request_turn(text: str, state: Optional[PatientState] = None) -> bool:
+    lower = " ".join((text or "").strip().lower().split())
+    if not lower:
+        return False
+    if has_date_reference(lower) or has_time_reference(lower):
+        return False
+    if "phone" in lower or "email" in lower or "number" in lower:
+        return False
+    first_turn = state is not None and len(getattr(state, "recent_user_texts", [])) <= 1
+    has_greeting = GREETING_RE.search(lower) is not None
+    has_request = OPENING_REQUEST_RE.search(lower) is not None
+    has_intro = INTRO_RE.search(lower) is not None
+    return first_turn and (has_greeting or has_request or (has_intro and has_request))
+
+
+def _looks_like_schedule_capture_turn(text: str) -> bool:
+    lower = " ".join((text or "").strip().lower().split())
+    if not lower:
+        return False
+    if has_date_reference(lower) or has_time_reference(lower) or time_expression_score(lower) >= 1:
+        return True
+    if _is_fragmented_turn(lower):
+        return True
+    if re.search(r"\S+@\S+\.\S+", lower):
+        return True
+    if re.search(r"(?:\+?\d[\d\s().-]{6,})", lower):
+        return True
+    if lower.startswith(("my name is", "this is", "i'm", "i am")) and not OPENING_REQUEST_RE.search(lower):
+        return True
+    return SLOT_VALUE_RE.search(lower) is not None and not _is_opening_request_turn(lower)
+
+
+def _micro_ack_decision(
+    text: str,
+    state: Optional[PatientState] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    normalized = " ".join((text or "").strip().lower().split())
+    if not normalized:
+        return None, None
+
+    if state is not None:
+        if getattr(state, "booking_in_progress", False):
+            return None, "confirmation_turn"
+        if getattr(state, "appointment_booked", False) or getattr(state, "booking_confirmed", False):
+            return None, "confirmation_turn"
+        if getattr(state, "pending_confirm_field", None) or getattr(state, "pending_confirm", None):
+            return None, "confirmation_turn"
+        if getattr(state, "delivery_preference_pending", False):
+            return None, "confirmation_turn"
+        if getattr(state, "anything_else_pending", False):
+            return None, "confirmation_turn"
+
+    if resolve_confirmation_intent(normalized) is not None and len(normalized.split()) <= 6:
+        return None, "confirmation_turn"
+    if _is_fragmented_turn(normalized):
+        return None, "fragmented_turn"
+    if _looks_like_schedule_capture_turn(normalized):
+        return None, "capture_turn"
+    if _is_opening_request_turn(normalized, state=state):
+        if OPENING_REQUEST_RE.search(normalized):
+            return "Absolutely.", None
+        if INTRO_RE.search(normalized):
+            return "Got it.", None
+        return "Sure.", None
+    if _is_open_question(normalized):
+        return "Of course.", None
+    return None, None
+
+
+def _choose_filler(text: str, state: Optional[PatientState] = None) -> str:
+    """Deterministically pick a micro-ack based on the utterance intent."""
+    ack, _ = _micro_ack_decision(text, state=state)
+    return ack or FILLER_GENERAL[0]
+
+
+def _is_open_question(text: str) -> bool:
+    lower = " ".join((text or "").strip().lower().split())
+    if not lower:
+        return False
+    if lower.endswith("?"):
+        return True
+    return any(lower.startswith(prefix) or prefix in lower for prefix in QUESTION_HINTS)
+
+
+def _looks_like_capture_turn(text: str) -> bool:
+    return _looks_like_schedule_capture_turn(text)
 
 
 def _needs_filler(text: str, state: Optional[PatientState] = None) -> bool:
@@ -342,34 +491,256 @@ def _needs_filler(text: str, state: Optional[PatientState] = None) -> bool:
 
     Accepts optional state for context-aware suppression:
     - Suppresses when booking is already in progress or done.
-    - Suppresses when there is a pending confirmation AND the text resolves to yes/no
-      (even for longer phrases like "Alright. Yeah. Sure, please.").
+    - Suppresses all pending confirmation turns so deterministic handling or direct
+      slot capture owns the turn.
     """
-    # --- State-aware suppression (highest priority) ---
-    if state is not None:
-        if getattr(state, "booking_in_progress", False):
-            return False
-        if getattr(state, "appointment_booked", False) or getattr(state, "booking_confirmed", False):
-            return False
-        # Pending confirmation + clear yes/no intent → deterministic path owns this turn
-        if state.pending_confirm_field or state.pending_confirm:
-            if resolve_confirmation_intent(text.lower()) is not None:
-                return False
+    ack, _ = _micro_ack_decision(text, state=state)
+    return ack is not None
 
-    lower = text.strip().lower()
-    words = lower.split()
-    # Skip for yes/no
-    if len(words) <= 2 and (YES_PAT.search(lower) or NO_PAT.search(lower)):
-        return False
-    # Skip for short non-question answers (micro-confirmations)
-    if len(words) <= 2 and not lower.endswith("?"):
-        return False
-    # Skip for direct date/time answers and slot values
-    if len(words) <= 10 and (has_date_reference(text) or has_time_reference(text) or time_expression_score(text) >= 2):
-        return False
-    if SLOT_VALUE_RE.search(text.strip()):
-        return False
-    return True
+
+def _seed_state_from_recent_context(state: PatientState, schedule: dict[str, Any]) -> list[str]:
+    """Fill obvious missing slots from recent caller context without waiting on the LLM."""
+    updates: list[str] = []
+    recent_context = state.recent_user_context(limit=3)
+    if not recent_context:
+        return updates
+
+    if not state.full_name:
+        detected_name = extract_name_quick(recent_context)
+        if detected_name:
+            state.full_name = detected_name
+            updates.append(f"name={detected_name}")
+
+    if not state.reason:
+        detected_reason = extract_reason_quick(recent_context)
+        if detected_reason:
+            state.reason = detected_reason
+            state.duration_minutes = get_duration_for_service(detected_reason, schedule)
+            updates.append(f"reason={detected_reason}")
+
+    if state.full_name and state.dt_local:
+        state.contact_phase_started = True
+
+    return updates
+
+
+def _build_missing_slot_prompt(state: PatientState) -> str:
+    missing = [slot for slot in state.missing_slots() if slot != "phone_confirmed"]
+    if "full_name" in missing and "reason" in missing:
+        return "Perfect. What name should I put on the appointment, and what are you coming in for?"
+    if "full_name" in missing:
+        return "Perfect. What name should I put on the appointment?"
+    if "reason" in missing:
+        return "Perfect. What brings you in?"
+    if "datetime" in missing:
+        if state.dt_text and has_date_reference(state.dt_text) and not state.dt_local:
+            return "Perfect. What time works best for you?"
+        return "Perfect. What day and time would you like?"
+    if "phone" in missing:
+        return "What number should I use?"
+    if state.appointment_booked:
+        return "Thanks. I've got that noted."
+    return "Perfect. Let me take care of that."
+
+
+def _caller_number_confirmation_message(state: PatientState) -> str:
+    if state.using_caller_number or state.confirmed_contact_number_source == "caller_id":
+        return "Perfect, I'll use the number you're calling from."
+    return "Perfect, I've noted that down."
+
+
+def _build_post_phone_confirmation_prompt(state: PatientState) -> str:
+    follow_up = _build_missing_slot_prompt(state).strip()
+    if follow_up.startswith("Perfect. "):
+        follow_up = follow_up[len("Perfect. "):]
+    return f"{_caller_number_confirmation_message(state)} {follow_up}".strip()
+
+
+def _final_closing_text() -> str:
+    return "Wonderful. You're all set — we'll see you then. Have a great day."
+
+
+async def _handle_deterministic_confirmation_turn(
+    *,
+    text: str,
+    state: PatientState,
+    assistant_tools: AssistantTools,
+    session: AgentSession,
+    cancel_scheduled_filler: Callable[[], None],
+    interrupt_filler: Callable[..., None],
+    refresh_memory_async: Optional[Callable[[], Awaitable[None]]] = None,
+    mark_direct_response: Optional[Callable[[], None]] = None,
+) -> Literal["none", "consumed"]:
+    normalized = " ".join((text or "").strip().lower().split())
+    if not normalized:
+        return "none"
+
+    pending = state.pending_confirm_field or state.pending_confirm
+    if not pending:
+        return "none"
+
+    confirm_intent = resolve_confirmation_intent(normalized)
+    if confirm_intent is None:
+        return "none"
+
+    raw_phone = state.phone_pending or state.phone_e164 or ""
+    fingerprint = f"{pending}|{normalized}|{state.dt_local}|{raw_phone}"
+    now_pc = time.perf_counter()
+    if (
+        getattr(state, "last_confirm_fingerprint", None) == fingerprint
+        and (now_pc - getattr(state, "last_confirm_ts", 0.0)) < 1.5
+    ):
+        logger.info("[CONFIRM] Duplicate confirmation ignored (same fingerprint within 1.5s)")
+        state.turn_consumed = True
+        return "consumed"
+
+    state.last_confirm_fingerprint = fingerprint
+    state.last_confirm_ts = now_pc
+    state.turn_consumed = True
+
+    logger.info(f"[CONFIRM] Deterministic routing: pending='{pending}', yes={confirm_intent}")
+    cancel_scheduled_filler()
+    interrupt_filler(force=True)
+
+    if pending == "phone" and state.contact_phase_started:
+        t0 = time.perf_counter()
+        await assistant_tools.confirm_phone(confirmed=confirm_intent)  # type: ignore[call-arg]
+        if refresh_memory_async is not None:
+            await refresh_memory_async()
+
+        if confirm_intent and state.is_complete() and not state.appointment_booked:
+            logger.info("[CONFIRM] Fast-lane: state complete — booking directly (0 LLM hops)")
+            booking_result = await assistant_tools.confirm_and_book_appointment()  # type: ignore[call-arg]
+            if refresh_memory_async is not None:
+                await refresh_memory_async()
+            if mark_direct_response is not None:
+                mark_direct_response()
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.info(f"[CONFIRM] Fast-lane booking complete in {elapsed:.0f}ms")
+            if state.using_caller_number or state.confirmed_contact_number_source == "caller_id":
+                booking_result = f"{_caller_number_confirmation_message(state)} {booking_result}".strip()
+            session.say(booking_result, allow_interruptions=True)
+            return "consumed"
+
+        prompt = (
+            _build_post_phone_confirmation_prompt(state)
+            if confirm_intent
+            else "No problem. What number should I use instead?"
+        )
+        if mark_direct_response is not None:
+            mark_direct_response()
+        session.say(prompt, allow_interruptions=True)
+        return "consumed"
+
+    if pending == "email" and not state.email_confirmed:
+        await assistant_tools.confirm_email(confirmed=confirm_intent)  # type: ignore[call-arg]
+        if refresh_memory_async is not None:
+            await refresh_memory_async()
+
+        if confirm_intent and state.is_complete() and not state.appointment_booked:
+            booking_result = await assistant_tools.confirm_and_book_appointment()  # type: ignore[call-arg]
+            if refresh_memory_async is not None:
+                await refresh_memory_async()
+            if mark_direct_response is not None:
+                mark_direct_response()
+            session.say(booking_result, allow_interruptions=True)
+            return "consumed"
+
+        prompt = (
+            _build_missing_slot_prompt(state)
+            if confirm_intent
+            else "No problem. What's the correct email address?"
+        )
+        if mark_direct_response is not None:
+            mark_direct_response()
+        session.say(prompt, allow_interruptions=True)
+        return "consumed"
+
+    state.turn_consumed = False
+    return "none"
+
+
+async def _handle_post_booking_turn(
+    *,
+    text: str,
+    state: PatientState,
+    assistant_tools: AssistantTools,
+    session: AgentSession,
+    cancel_scheduled_filler: Callable[[], None],
+    interrupt_filler: Callable[..., None],
+    refresh_memory_async: Optional[Callable[[], Awaitable[None]]] = None,
+    mark_direct_response: Optional[Callable[[], None]] = None,
+    schedule_auto_disconnect: Optional[Callable[[Any], None]] = None,
+    cancel_auto_disconnect: Optional[Callable[[], None]] = None,
+) -> Literal["none", "consumed"]:
+    normalized = " ".join((text or "").strip().lower().split())
+    if not normalized or not state.appointment_booked:
+        return "none"
+
+    if state.final_goodbye_sent:
+        if user_said_goodbye(normalized) or user_declined_anything_else(normalized):
+            if not state.user_goodbye_detected:
+                state.user_goodbye_detected = True
+                logger.info("user_goodbye_detected")
+            if schedule_auto_disconnect is not None:
+                schedule_auto_disconnect(None)
+            if refresh_memory_async is not None:
+                await refresh_memory_async()
+            return "consumed"
+        if cancel_auto_disconnect is not None:
+            cancel_auto_disconnect()
+        state.final_goodbye_sent = False
+        state.user_declined_more_help = False
+        state.user_goodbye_detected = False
+        state.closing_state = "open"
+        if refresh_memory_async is not None:
+            await refresh_memory_async()
+        return "none"
+
+    if state.delivery_preference_pending:
+        preference = resolve_delivery_preference(normalized)
+        if preference is None:
+            return "none"
+        cancel_scheduled_filler()
+        interrupt_filler(force=True)
+        if mark_direct_response is not None:
+            mark_direct_response()
+        acknowledgement = await assistant_tools.set_delivery_preference(channel=preference)  # type: ignore[call-arg]
+        if refresh_memory_async is not None:
+            await refresh_memory_async()
+        session.say(acknowledgement, allow_interruptions=True)
+        return "consumed"
+
+    if state.anything_else_pending:
+        if user_declined_anything_else(normalized) or user_said_goodbye(normalized):
+            cancel_scheduled_filler()
+            interrupt_filler(force=True)
+            if user_said_goodbye(normalized):
+                state.user_goodbye_detected = True
+                logger.info("user_goodbye_detected")
+            state.anything_else_pending = False
+            state.user_declined_more_help = True
+            state.closing_state = "closing"
+            logger.info("closing_state_entered")
+            if mark_direct_response is not None:
+                mark_direct_response()
+            final_handle = session.say(_final_closing_text(), allow_interruptions=True)
+            state.final_goodbye_sent = True
+            state.closing_state = "final_goodbye_sent"
+            logger.info("final_goodbye_sent")
+            if refresh_memory_async is not None:
+                await refresh_memory_async()
+            if schedule_auto_disconnect is not None:
+                schedule_auto_disconnect(final_handle)
+            return "consumed"
+
+        state.anything_else_pending = False
+        state.closing_state = "open"
+        if refresh_memory_async is not None:
+            await refresh_memory_async()
+        return "none"
+
+    return "none"
 
 
 # =============================================================================
@@ -403,6 +774,7 @@ async def entrypoint(ctx: JobContext):
 
     # ── State ─────────────────────────────────────────────────────────────────
     state = PatientState()
+    disconnect_event = asyncio.Event()
 
     # ── SIP phone extraction ──────────────────────────────────────────────────
     called_num: Optional[str] = None
@@ -521,8 +893,6 @@ async def entrypoint(ctx: JobContext):
     stt_instance = pipeline["stt"]
     llm_instance = pipeline["llm"]
     tts_instance = pipeline["tts"]
-    # Use FILLER_PHRASES from config (single source of truth — no unicode ellipsis)
-    filler_phrases = FILLER_PHRASES
     logger.info(f"[PIPELINE] Active: {pipeline['pipeline_name']}")
 
     vad_instance = silero.VAD.load(
@@ -533,6 +903,65 @@ async def entrypoint(ctx: JobContext):
     # ── Tools ─────────────────────────────────────────────────────────────────
     assistant_tools = AssistantTools(state)
     function_tools = llm.find_function_tools(assistant_tools)
+    _session_refs: Dict[str, Any] = {"session": None, "agent": None}
+
+    async def refresh_agent_memory_async() -> None:
+        """Refresh the running agent instructions so state changes reach future turns."""
+        try:
+            ag = _session_refs.get("agent")
+            if ag is None:
+                return
+            updated = get_updated_instructions()
+            if hasattr(ag, "update_instructions"):
+                await ag.update_instructions(updated)
+            elif hasattr(ag, "_instructions"):
+                ag._instructions = updated
+            logger.debug(f"[MEMORY] Refreshed. State: {state.slot_summary()}")
+        except Exception as e:
+            logger.warning(f"[MEMORY] Refresh failed: {e}")
+
+    def refresh_agent_memory() -> None:
+        asyncio.create_task(refresh_agent_memory_async())
+
+    class ReceptionAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage) -> None:
+            text = (new_message.text_content or "").strip()
+            seeded = _seed_state_from_recent_context(state, schedule)
+            if seeded:
+                logger.info(f"[STATE PREFILL] {' | '.join(seeded)}")
+                refresh_agent_memory()
+
+            def _mark_direct_response() -> None:
+                if _current_turn:
+                    _current_turn.mark("direct_say")
+
+            result = await _handle_deterministic_confirmation_turn(
+                text=text,
+                state=state,
+                assistant_tools=assistant_tools,
+                session=session,
+                cancel_scheduled_filler=_cancel_scheduled_filler,
+                interrupt_filler=_interrupt_filler,
+                refresh_memory_async=refresh_agent_memory_async,
+                mark_direct_response=_mark_direct_response,
+            )
+            if result == "consumed":
+                raise llm.StopResponse()
+
+            result = await _handle_post_booking_turn(
+                text=text,
+                state=state,
+                assistant_tools=assistant_tools,
+                session=session,
+                cancel_scheduled_filler=_cancel_scheduled_filler,
+                interrupt_filler=_interrupt_filler,
+                refresh_memory_async=refresh_agent_memory_async,
+                mark_direct_response=_mark_direct_response,
+                schedule_auto_disconnect=_schedule_auto_disconnect,
+                cancel_auto_disconnect=_cancel_auto_disconnect,
+            )
+            if result == "consumed":
+                raise llm.StopResponse()
 
     # ── AgentSession + Agent ──────────────────────────────────────────────────
     # NOTE: MIN/MAX_ENDPOINTING_DELAY were previously imported from config but
@@ -559,24 +988,11 @@ async def entrypoint(ctx: JobContext):
         pass
     session = AgentSession(**_session_kwargs)
 
-    agent = Agent(
+    agent = ReceptionAgent(
         instructions=get_updated_instructions(),
         tools=function_tools,  # type: ignore[arg-type]
         allow_interruptions=True,
     )
-
-    # Store session ref for memory refresh
-    _session_refs: Dict[str, Any] = {"session": None, "agent": None}
-
-    def refresh_agent_memory():
-        """Refresh the LLM's system prompt with current state. Called after tool writes."""
-        try:
-            ag = _session_refs.get("agent")
-            if ag and hasattr(ag, "_instructions"):
-                ag._instructions = get_updated_instructions()
-                logger.debug(f"[MEMORY] Refreshed. State: {state.slot_summary()}")
-        except Exception as e:
-            logger.warning(f"[MEMORY] Refresh failed: {e}")
 
     async def _direct_say(text: str) -> None:
         """
@@ -623,6 +1039,62 @@ async def entrypoint(ctx: JobContext):
     _session_refs["session"] = session
     _session_refs["agent"] = agent
 
+    _closing_runtime: Dict[str, Any] = {
+        "auto_disconnect_task": None,
+    }
+
+    async def _disconnect_call_from_our_side() -> None:
+        room_name = getattr(ctx.room, "name", "") or ""
+        try:
+            from livekit import api as lk_api
+
+            if room_name:
+                async with lk_api.LiveKitAPI() as livekit_api:
+                    await livekit_api.room.delete_room(lk_api.DeleteRoomRequest(room=room_name))
+                    logger.info("auto_disconnect_executed")
+                    disconnect_event.set()
+                    return
+        except Exception as e:
+            logger.warning(f"[CLOSE] Room delete fallback to local disconnect: {e}")
+
+        try:
+            await ctx.room.disconnect()
+            logger.info("auto_disconnect_executed")
+        except Exception as e:
+            logger.warning(f"[CLOSE] Local room disconnect failed: {e}")
+        finally:
+            disconnect_event.set()
+
+    def _cancel_auto_disconnect(*, user_resumed: bool = False) -> None:
+        task = _closing_runtime.get("auto_disconnect_task")
+        if task and not task.done():
+            task.cancel()
+        _closing_runtime["auto_disconnect_task"] = None
+        if user_resumed:
+            logger.info("auto_disconnect_cancelled_user_resumed")
+
+    def _schedule_auto_disconnect(final_handle: Any) -> None:
+        _cancel_auto_disconnect()
+        logger.info("auto_disconnect_scheduled")
+
+        async def _runner() -> None:
+            try:
+                if final_handle is not None and hasattr(final_handle, "wait_for_playout"):
+                    await final_handle.wait_for_playout()
+                silence_ms = (
+                    AUTO_DISCONNECT_POST_GOODBYE_MS
+                    if state.user_goodbye_detected
+                    else AUTO_DISCONNECT_SILENCE_MS
+                )
+                await asyncio.sleep(silence_ms / 1000.0)
+                if not state.final_goodbye_sent:
+                    return
+                await _disconnect_call_from_our_side()
+            except asyncio.CancelledError:
+                return
+
+        _closing_runtime["auto_disconnect_task"] = asyncio.create_task(_runner())
+
     # ── Metrics (2 lines, not 40) ─────────────────────────────────────────────
     def _on_metrics(ev: MetricsCollectedEvent):
         lk_metrics.log_metrics(ev.metrics)
@@ -635,9 +1107,9 @@ async def entrypoint(ctx: JobContext):
         "sent_at": 0.0,
         "text": "",
         "scheduled_task": None,
+        "reason": None,
     }
-    # Use config constant (default 120ms, reduced from 250ms)
-    filler_debounce_ms = FILLER_DEBOUNCE_MS
+    filler_debounce_ms = MICRO_ACK_DELAY_MS
 
     def _clear_filler_state(handle: Optional[Any] = None):
         current = _filler_state.get("handle")
@@ -647,6 +1119,7 @@ async def entrypoint(ctx: JobContext):
         _filler_state["active"] = False
         _filler_state["sent_at"] = 0.0
         _filler_state["text"] = ""
+        _filler_state["reason"] = None
 
     def _clear_scheduled_filler(task: Optional[Any] = None):
         current = _filler_state.get("scheduled_task")
@@ -684,26 +1157,18 @@ async def entrypoint(ctx: JobContext):
         _t0 = time.perf_counter()
         handle = None
         try:
-            # allow_interruptions=False: prevents the session from preempting filler
-            # before any audio plays. We interrupt it ourselves after FILLER_MAX_DURATION_MS.
-            # add_to_chat_ctx=False: fillers must not appear in LLM conversation history.
+            # Fillers should never block the user or enter the LLM chat context.
             try:
-                handle = session.say(text, allow_interruptions=False, add_to_chat_ctx=False)
+                handle = session.say(text, allow_interruptions=True, add_to_chat_ctx=False)
             except TypeError:
                 # Older SDK versions may not accept add_to_chat_ctx — fall back gracefully.
-                handle = session.say(text, allow_interruptions=False)
+                handle = session.say(text, allow_interruptions=True)
             _filler_state["handle"] = handle
             _filler_state["active"] = True
             _filler_state["sent_at"] = _t0
             _filler_state["text"] = text
-            logger.info(f"[FILLER QUEUED] '{text}'")
 
-            # Small yield so speech can start before the timebox countdown begins.
-            await asyncio.sleep(0.05)
-            logger.info(f"[FILLER STARTED] '{text}'")
-
-            # Let filler play for remaining time, then manually interrupt.
-            remaining_ms = max(0, FILLER_MAX_DURATION_MS - 50)
+            remaining_ms = max(0, MICRO_ACK_MAX_DURATION_MS)
             await asyncio.sleep(remaining_ms / 1000.0)
 
             if _filler_state.get("handle") is handle and _filler_state.get("active"):
@@ -736,8 +1201,9 @@ async def entrypoint(ctx: JobContext):
             if _filler_state.get("active"):
                 return
             last_text = state.last_user_text or ""
-            filler = _choose_filler(last_text)
-            logger.debug(f"[FILLER] Sending: '{filler}'")
+            filler, _ = _micro_ack_decision(last_text, state=state)
+            if not filler:
+                return
             await _send_filler(filler)
         except asyncio.CancelledError:
             pass
@@ -757,6 +1223,13 @@ async def entrypoint(ctx: JobContext):
         state.remember_user_text(text)
         _cancel_scheduled_filler()
 
+        if state.final_goodbye_sent and not user_said_goodbye(text) and not user_declined_anything_else(text):
+            _cancel_auto_disconnect(user_resumed=True)
+            state.final_goodbye_sent = False
+            state.user_declined_more_help = False
+            state.user_goodbye_detected = False
+            state.closing_state = "open"
+
         # Start a new per-turn timer
         _current_turn = TurnTimer()
         _current_turn.mark("user_eou")
@@ -766,206 +1239,84 @@ async def entrypoint(ctx: JobContext):
         # wasting CPU and (for some SDK versions) causing a ChatContext rebuild.
         # Memory is now only refreshed inside tool calls that actually mutate state.
 
-        # Reset turn_consumed for this new utterance. _on_user_input_confirmation
-        # (registered after this handler) will set it True if it owns the turn.
+        # Reset turn ownership for this utterance before any deterministic routing.
         state.turn_consumed = False
 
         if not FILLER_ENABLED or _filler_state["active"]:
             return
-        # Pass state so _needs_filler can suppress on confirmation turns.
-        if _needs_filler(text, state=state):
+        filler_text, suppress_reason = _micro_ack_decision(text, state=state)
+        if filler_text:
+            _filler_state["reason"] = "micro_ack"
             _filler_state["scheduled_task"] = asyncio.create_task(_schedule_filler())
+            return
+        if suppress_reason == "capture_turn":
+            logger.info("micro_ack_suppressed_capture_turn")
+        elif suppress_reason == "confirmation_turn":
+            logger.info("micro_ack_suppressed_confirmation_turn")
+        elif suppress_reason == "fragmented_turn":
+            logger.info("micro_ack_suppressed_fragmented_turn")
 
     session.on("user_input_transcribed", _on_user_transcribed)
 
-    # ── Barge-in: interrupt filler and agent when user speaks ─────────────────
-    _agent_speech_handle: Dict[str, Any] = {"handle": None}
-
-    def _interrupt_agent():
-        h = _agent_speech_handle.get("handle")
-        if h:
-            try:
-                if hasattr(h, "interrupt"):
-                    h.interrupt()
-                elif hasattr(h, "cancel"):
-                    h.cancel()
-            except Exception:
-                pass
-            _agent_speech_handle["handle"] = None
-
-    def _on_user_speech_started(ev):
+    def _on_user_state_changed(ev):
+        if getattr(ev, "new_state", None) != "speaking":
+            return
+        if state.final_goodbye_sent:
+            _cancel_auto_disconnect()
         _cancel_scheduled_filler()
-        _interrupt_filler()
-        _interrupt_agent()
+        _interrupt_filler(force=True)
 
-    def _on_agent_speech_started(ev):
-        speech_text = getattr(ev, "text", "") or getattr(ev, "content", "") or ""
-        speech_handle = getattr(ev, "handle", None) or getattr(ev, "speech_handle", None)
-        is_filler = is_active_filler_event(
-            speech_text,
-            _filler_state.get("text"),
-            filler_phrases,
-            same_handle=speech_handle is _filler_state.get("handle"),
-        )
+    def _on_agent_state_changed(ev):
+        if getattr(ev, "new_state", None) != "speaking":
+            return
+        current_handle = None
+        try:
+            current_handle = session.current_speech
+        except Exception:
+            current_handle = None
 
-        # Debug log when a real response fires while filler is active
-        if _filler_state["active"]:
-            logger.info(f"[FILLER_DEBUG] Speech started while filler active. text='{speech_text}', is_filler={is_filler}")
-
-        # If this IS a filler, don't capture its handle or interrupt it
-        if is_filler:
+        if current_handle is _filler_state.get("handle"):
             if _current_turn:
                 _current_turn.mark("filler_sent")
+            logger.info("micro_ack_sent")
             return
 
+        scheduled_task = _filler_state.get("scheduled_task")
+        if scheduled_task and not scheduled_task.done() and not _filler_state["active"]:
+            logger.info("micro_ack_suppressed_fast_main_reply")
         _cancel_scheduled_filler()
-
-        # Mark speech_started on the per-turn timer and emit summary
+        if _filler_state["active"]:
+            logger.info("micro_ack_cancelled_main_reply_ready")
+            _interrupt_filler(force=True)
         if _current_turn:
             _current_turn.mark("speech_started")
             _current_turn.log_summary(state.last_user_text or "")
 
-        # Capture handle for barge-in (real LLM response only)
-        h = speech_handle
-        if h:
-            _agent_speech_handle["handle"] = h
-
-        # Real response started — interrupt any active filler
-        if _filler_state["active"]:
-            _interrupt_filler()
-
-    session.on("user_speech_started", _on_user_speech_started)  # type: ignore[arg-type]
-    session.on("agent_speech_started", _on_agent_speech_started)  # type: ignore[arg-type]
-    # Also try alternative event names for SDK compatibility
-    try:
-        session.on("user_started_speaking", _on_user_speech_started)  # type: ignore[arg-type]
-    except Exception:
-        pass
-
-    # Agent speech committed (for logging + turn timer)
-    def _on_agent_committed(msg):
-        for attr in ("text", "content", "text_content"):
-            val = getattr(msg, attr, None)
-            if isinstance(val, str) and val.strip():
-                text = val.strip()
-                is_fil = any(text.startswith(f) for f in filler_phrases)
-                prefix = "[FILLER SPOKEN]" if is_fil else "[AGENT SAID]"
-                logger.info(f"{prefix} '{text}'")
-                if not is_fil and _current_turn:
-                    _current_turn.mark("speech_committed")
-                break
-
-    try:
-        session.on("agent_speech_committed", _on_agent_committed)  # type: ignore[arg-type]
-    except Exception:
-        pass
-
-    # ── Pattern B: Deterministic yes/no routing for confirmations ─────────────
-    def _on_user_input_confirmation(ev):
-        """
-        Bypass LLM for clear yes/no during pending phone/email confirmations.
-
-        UPGRADED (2026-03-08): After phone confirmation, if all required fields
-        are already present (name, reason, time, phone), directly call
-        confirm_and_book_appointment() and session.say() the result without any
-        extra LLM roundtrip. This eliminates 2 LLM hops from the booking
-        happy path (was: generate_reply → LLM decides to book → LLM re-speaks).
-
-        Fast-lane saves 600–1500ms on the happy path booking turn.
-        Falls back to generate_reply() for ambiguous/incomplete state.
-        """
-        if not getattr(ev, "is_final", True):
+    def _on_conversation_item_added(ev):
+        item = getattr(ev, "item", None)
+        if getattr(item, "role", None) != "assistant":
             return
-        text = (getattr(ev, "transcript", "") or getattr(ev, "text", "") or "").strip().lower()
-        if not text:
-            return
+        text = getattr(item, "text_content", None)
+        if isinstance(text, str) and text.strip():
+            spoken = text.strip()
+            logger.info(f"[AGENT SAID] '{spoken}'")
+            lower = spoken.lower()
+            if state.appointment_booked and "whatsapp" in lower and "sms" in lower:
+                state.delivery_preference_pending = True
+                state.delivery_preference_asked = True
+                state.anything_else_pending = False
+                state.closing_state = "delivery_pending"
+            if "anything else i can help" in lower:
+                state.anything_else_pending = True
+                state.anything_else_asked = True
+                state.closing_state = "anything_else_pending"
+            if _current_turn:
+                _current_turn.mark("speech_committed")
 
-        pending = state.pending_confirm_field or state.pending_confirm
-        if not pending:
-            return
+    session.on("user_state_changed", _on_user_state_changed)  # type: ignore[arg-type]
+    session.on("agent_state_changed", _on_agent_state_changed)  # type: ignore[arg-type]
+    session.on("conversation_item_added", _on_conversation_item_added)  # type: ignore[arg-type]
 
-        confirm_intent = resolve_confirmation_intent(text)
-        if confirm_intent is None:
-            return
-
-        # ── Fingerprint deduplication: ignore repeated identical confirmations within 1.5s ──
-        raw_phone = state.phone_pending or state.phone_e164 or ""
-        fingerprint = f"{pending}|{text}|{state.dt_local}|{raw_phone}"
-        now_pc = time.perf_counter()
-        if (
-            getattr(state, "last_confirm_fingerprint", None) == fingerprint
-            and (now_pc - getattr(state, "last_confirm_ts", 0.0)) < 1.5
-        ):
-            logger.info("[CONFIRM] Duplicate confirmation ignored (same fingerprint within 1.5s)")
-            return
-        state.last_confirm_fingerprint = fingerprint
-        state.last_confirm_ts = now_pc
-
-        logger.info(f"[CONFIRM] Deterministic routing: pending='{pending}', yes={confirm_intent}")
-
-        # ── Cancel any scheduled or active filler immediately (sync, before async task) ──
-        _cancel_scheduled_filler()
-        _interrupt_filler(force=True)
-
-        # Mark this turn as owned by the deterministic path.
-        state.turn_consumed = True
-
-        async def _confirm_phone_async(confirmed: bool):
-            t0 = time.perf_counter()
-            # Interrupt session auto-reply that may have started concurrently.
-            try:
-                sess = _session_refs.get("session")
-                if sess and hasattr(sess, "interrupt"):
-                    sess.interrupt()
-                    logger.debug("[CONFIRM] Session interrupted to prevent concurrent LLM reply")
-            except Exception as _ie:
-                logger.debug(f"[CONFIRM] Session interrupt failed: {_ie}")
-
-            try:
-                await assistant_tools.confirm_phone(confirmed=confirmed)  # type: ignore[call-arg]
-                if confirmed:
-                    # ── FAST LANE: book directly if all info is present ──────
-                    # Check: name + reason + confirmed time + phone all present.
-                    if state.is_complete():
-                        logger.info("[CONFIRM] Fast-lane: state complete — booking directly (0 LLM hops)")
-                        if _current_turn:
-                            _current_turn.mark("direct_say")
-                        booking_result = await assistant_tools.confirm_and_book_appointment()  # type: ignore[call-arg]
-                        refresh_agent_memory()  # update prompt so LLM knows booking is done
-                        elapsed = (time.perf_counter() - t0) * 1000
-                        logger.info(f"[CONFIRM] Fast-lane booking complete in {elapsed:.0f}ms")
-                        session.say(booking_result)
-                    else:
-                        # State incomplete — missing name, reason, or time.
-                        # Let LLM decide what to ask next.
-                        logger.info(f"[CONFIRM] Phone confirmed but state incomplete: {state.missing_slots()}")
-                        await session.generate_reply()
-                else:
-                    session.say("No problem! What number should I use instead?")
-            except Exception as e:
-                logger.error(f"[CONFIRM] Phone confirm error: {e}")
-                # Fallback: let LLM recover
-                try:
-                    await session.generate_reply()
-                except Exception:
-                    pass
-
-        async def _confirm_email_async(confirmed: bool):
-            try:
-                await assistant_tools.confirm_email(confirmed=confirmed)  # type: ignore[call-arg]
-                if confirmed:
-                    await session.generate_reply()
-                else:
-                    await session.say("No problem! What's the correct email address?")
-            except Exception as e:
-                logger.error(f"[CONFIRM] Email confirm error: {e}")
-
-        if pending == "phone" and state.contact_phase_started:
-            asyncio.create_task(_confirm_phone_async(confirm_intent))
-        elif pending == "email" and not state.email_confirmed:
-            asyncio.create_task(_confirm_email_async(confirm_intent))
-
-    session.on("user_input_transcribed", _on_user_input_confirmation)
 
     # ── SIP late-join: capture phone from participant metadata ────────────────
     @ctx.room.on("participant_connected")
@@ -1051,8 +1402,6 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(_on_shutdown)
 
     # ── Wait for disconnect ───────────────────────────────────────────────────
-    disconnect_event = asyncio.Event()
-
     @ctx.room.on("disconnected")
     def _on_disconnected():
         disconnect_event.set()

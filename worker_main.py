@@ -44,14 +44,15 @@ import signal
 import asyncio
 import logging
 
-# Configure logging for LiveKit SDK
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout)],
-    force=True
-)
+# Configure root logging once for third-party libraries. The application logger
+# is configured separately in config.py and should not be force-reset here.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
 
 # FORCE PORT to avoid conflict if shell env has PORT=8080
 os.environ["PORT"] = "8080"

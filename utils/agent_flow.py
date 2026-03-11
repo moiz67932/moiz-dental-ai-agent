@@ -69,6 +69,64 @@ PHONE_INPUT_RE = re.compile(
     r"\b(phone|number|digits|calling from|this number|same number|use this number)\b|(?:\+?\d[\d\s().-]{5,})",
     re.IGNORECASE,
 )
+WHATSAPP_RE = re.compile(
+    r"\b("
+    r"whats\s?app|"
+    r"yeah whatsapp|"
+    r"yes whatsapp|"
+    r"i have whatsapp|"
+    r"use whatsapp|"
+    r"send (?:it )?(?:on|via)? whatsapp|"
+    r"on whatsapp"
+    r")\b",
+    re.IGNORECASE,
+)
+SMS_RE = re.compile(
+    r"\b("
+    r"sms|"
+    r"text me|"
+    r"message me|"
+    r"send (?:me )?(?:a )?text|"
+    r"send (?:it )?by sms|"
+    r"send sms|"
+    r"by sms|"
+    r"prefer sms|"
+    r"prefer text|"
+    r"no whatsapp|"
+    r"don't have whatsapp|"
+    r"do not have whatsapp|"
+    r"sms instead|"
+    r"text instead"
+    r")\b",
+    re.IGNORECASE,
+)
+ANYTHING_ELSE_DECLINE_RE = re.compile(
+    r"\b("
+    r"no(?: thank you| thanks)?|"
+    r"nope|"
+    r"that's all|"
+    r"that is all|"
+    r"nothing else|"
+    r"all good|"
+    r"i(?:'m| am)? good|"
+    r"i(?:'m| am)? done|"
+    r"that will be all|"
+    r"no that'?s it"
+    r")\b",
+    re.IGNORECASE,
+)
+GOODBYE_RE = re.compile(
+    r"\b("
+    r"bye(?: bye)?|"
+    r"goodbye|"
+    r"see you|"
+    r"talk to you later|"
+    r"have a (?:great|good|lovely) day|"
+    r"thanks,? bye|"
+    r"thank you,? bye"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def store_detected_phone(
@@ -246,3 +304,38 @@ def build_time_parse_candidates(
 
 def looks_like_phone_input(text: Optional[str]) -> bool:
     return PHONE_INPUT_RE.search((text or "").strip()) is not None
+
+
+def resolve_delivery_preference(text: Optional[str]) -> Optional[str]:
+    """Return 'whatsapp', 'sms', or None for ambiguous delivery preferences."""
+    if not text:
+        return None
+
+    normalized = re.sub(r"\s+", " ", str(text).strip().lower())
+    if not normalized:
+        return None
+
+    sms_positions = [match.start() for match in SMS_RE.finditer(normalized)]
+    whatsapp_positions = [match.start() for match in WHATSAPP_RE.finditer(normalized)]
+
+    if sms_positions and not whatsapp_positions:
+        return "sms"
+    if whatsapp_positions and not sms_positions:
+        return "whatsapp"
+    if sms_positions and whatsapp_positions:
+        return "sms" if sms_positions[-1] > whatsapp_positions[-1] else "whatsapp"
+    return None
+
+
+def user_declined_anything_else(text: Optional[str]) -> bool:
+    normalized = " ".join((text or "").split()).strip()
+    if not normalized:
+        return False
+    return ANYTHING_ELSE_DECLINE_RE.search(normalized) is not None
+
+
+def user_said_goodbye(text: Optional[str]) -> bool:
+    normalized = " ".join((text or "").split()).strip()
+    if not normalized:
+        return False
+    return GOODBYE_RE.search(normalized) is not None

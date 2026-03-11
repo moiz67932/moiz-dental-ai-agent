@@ -104,10 +104,21 @@ class PatientState:
 
     # SMS preference
     prefers_sms: bool = False
+    delivery_channel: Optional[str] = None
+    delivery_preference_pending: bool = False
+    delivery_preference_asked: bool = False
+    anything_else_pending: bool = False
+    anything_else_asked: bool = False
+    user_declined_more_help: bool = False
+    final_goodbye_sent: bool = False
+    user_goodbye_detected: bool = False
+    closing_state: str = "open"
 
     # Caller ID flow tracking
     caller_id_checked: bool = False
     caller_id_accepted: bool = False
+    using_caller_number: bool = False
+    confirmed_contact_number_source: Optional[str] = None
 
     # Booking state
     booking_confirmed: bool = False
@@ -197,7 +208,12 @@ class PatientState:
         if not contact_phase_allowed(self):
             lines.append("• PHONE: — (collect after time confirmed)")
         elif self.phone_e164 and self.phone_confirmed:
-            lines.append(f"• PHONE: confirmed {self.phone_e164}")
+            if self.using_caller_number or self.confirmed_contact_number_source == "caller_id":
+                lines.append("• PHONE: confirmed caller ID / this number")
+            elif self.phone_last4:
+                lines.append(f"• PHONE: confirmed ending in {self.phone_last4}")
+            else:
+                lines.append("• PHONE: confirmed")
         elif self.phone_pending or self.detected_phone:
             lines.append("• PHONE: pending confirmation — Ask: 'Should I save the number you're calling from?'")
         else:
@@ -232,6 +248,14 @@ class PatientState:
         # Booking status
         if self.booking_confirmed:
             lines.append("BOOKED!")
+            if self.delivery_preference_pending:
+                lines.append("DELIVERY: Ask WhatsApp or SMS on this number, then wait.")
+            elif self.delivery_channel:
+                lines.append(f"DELIVERY: {self.delivery_channel}")
+            if self.anything_else_pending:
+                lines.append("CLOSING: Ask if anything else is needed.")
+            elif self.final_goodbye_sent:
+                lines.append("CLOSING: Final goodbye sent. Wait briefly, then end call.")
         elif self.is_complete():
             lines.append("READY TO BOOK — Summarize & confirm")
         else:

@@ -44,13 +44,11 @@ VAD_MIN_SILENCE_DURATION = float(os.getenv("VAD_MIN_SILENCE", "0.25")) # 0.25s â
 
 # Filler speech settings
 FILLER_ENABLED = os.getenv("FILLER_ENABLED", "1") == "1"
-# Reduced from 700ms to 400ms: filler should bridge the gap, not compete with the real response.
-# LLM typically responds in 600-900ms; filler just needs to cover the first 300-400ms.
-FILLER_MAX_DURATION_MS = int(os.getenv("FILLER_MAX_MS", "400"))
-# Debounce before sending filler â€” reduced from 250ms to 120ms so filler fires earlier.
-# This gives the filler more audible time before the LLM response arrives.
-FILLER_DEBOUNCE_MS = int(os.getenv("FILLER_DEBOUNCE_MS", "120"))
-FILLER_PHRASES = ["Okay.", "One moment.", "Got it.", "Let me check."]  # Short phrases < 400ms spoken
+# Keep filler conservative: it should cover explicit lookup-style questions, not slot capture turns.
+FILLER_MAX_DURATION_MS = int(os.getenv("FILLER_MAX_MS", "250"))
+# Debounce is intentionally higher than before to avoid firing inside still-forming telephony turns.
+FILLER_DEBOUNCE_MS = int(os.getenv("FILLER_DEBOUNCE_MS", "220"))
+FILLER_PHRASES = ["One moment.", "Let me check."]
 
 # STT aggressive endpointing (Deepgram-specific)
 STT_AGGRESSIVE_ENDPOINTING = os.getenv("STT_AGGRESSIVE", "1") == "1"
@@ -87,13 +85,13 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger("snappy_agent")
 logger.setLevel(logging.DEBUG)
+logger.propagate = False
 if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
     ))
     logger.addHandler(handler)
-    logger.propagate = False  # Prevent double-logging when root logger also has a StreamHandler
 
 # =============================================================================
 # ENVIRONMENT & APPLICATION CONFIG
