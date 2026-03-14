@@ -305,10 +305,12 @@ def _normalize_knowledge_articles(rows: Any) -> list[dict[str, str]]:
             continue
         title_value = row.get("title")
         body_value = row.get("body")
+        category_value = row.get("category")
         title = title_value.strip() if isinstance(title_value, str) else ""
         body = " ".join(body_value.split()) if isinstance(body_value, str) else ""
-        if title or body:
-            normalized.append({"title": title, "body": body})
+        category = category_value.strip() if isinstance(category_value, str) else ""
+        if title or body or category:
+            normalized.append({"title": title, "body": body, "category": category})
     return normalized
 
 
@@ -318,10 +320,12 @@ def _format_clinic_faq(articles: list[dict[str, str]]) -> str:
 
     lines: list[str] = []
     for article in articles:
+        category = article.get("category", "").strip()
         title = article.get("title", "").strip()
         body = " ".join(article.get("body", "").split()[:50]).strip()
+        label = f"[{category}] " if category else ""
         if title and body:
-            lines.append(f"- {title}: {body}")
+            lines.append(f"- {label}{title}: {body}")
     return "\n".join(lines) if lines else "No additional clinic information available."
 
 
@@ -335,7 +339,7 @@ async def _fetch_clinic_knowledge_articles(clinic_id: Optional[str]) -> list[dic
     try:
         result = await asyncio.to_thread(
             lambda: supabase.table("knowledge_articles")
-            .select("title, body")
+            .select("title, body, category")
             .eq("clinic_id", clinic_id)
             .limit(20)
             .execute()
@@ -787,13 +791,15 @@ async def _handle_exit_intent_turn(
     if not normalized or not user_said_goodbye(normalized):
         return "none"
 
-    if safe_say is None:
-        def safe_say(text: str, *, allow_interruptions: bool = True) -> Any:
+    resolved_safe_say = safe_say
+    if resolved_safe_say is None:
+        def _fallback_safe_say(text: str, *, allow_interruptions: bool = True) -> Any:
             return _session_say(
                 session,
                 text,
                 allow_interruptions=allow_interruptions,
             )
+        resolved_safe_say = _fallback_safe_say
 
     cancel_scheduled_filler()
     interrupt_filler(force=True)
@@ -810,7 +816,7 @@ async def _handle_exit_intent_turn(
     if mark_direct_response is not None:
         mark_direct_response()
 
-    final_handle = safe_say(_closing_text_for_state(state))
+    final_handle = resolved_safe_say(_closing_text_for_state(state))
     if schedule_auto_disconnect is not None:
         schedule_auto_disconnect(final_handle)
     return "consumed"
@@ -832,13 +838,15 @@ async def _handle_deterministic_confirmation_turn(
     if not normalized:
         return "none"
 
-    if safe_say is None:
-        def safe_say(text: str, *, allow_interruptions: bool = True) -> Any:
+    resolved_safe_say = safe_say
+    if resolved_safe_say is None:
+        def _fallback_safe_say(text: str, *, allow_interruptions: bool = True) -> Any:
             return _session_say(
                 session,
                 text,
                 allow_interruptions=allow_interruptions,
             )
+        resolved_safe_say = _fallback_safe_say
 
     pending = state.pending_confirm_field or state.pending_confirm
     if not pending:
@@ -891,7 +899,7 @@ async def _handle_deterministic_confirmation_turn(
             # Do NOT prepend the caller-number confirmation message here.
             # confirm_and_book_appointment() already returns the complete booking sentence
             # including the delivery question. Prefixing it again creates a duplicate.
-            safe_say(booking_result)
+            resolved_safe_say(booking_result)
             return "consumed"
 
         prompt = (
@@ -901,7 +909,7 @@ async def _handle_deterministic_confirmation_turn(
         )
         if mark_direct_response is not None:
             mark_direct_response()
-        safe_say(prompt)
+        resolved_safe_say(prompt)
         return "consumed"
 
     if pending == "email" and not state.email_confirmed:
@@ -915,7 +923,7 @@ async def _handle_deterministic_confirmation_turn(
                 await refresh_memory_async()
             if mark_direct_response is not None:
                 mark_direct_response()
-            safe_say(booking_result)
+            resolved_safe_say(booking_result)
             return "consumed"
 
         prompt = (
@@ -925,7 +933,7 @@ async def _handle_deterministic_confirmation_turn(
         )
         if mark_direct_response is not None:
             mark_direct_response()
-        safe_say(prompt)
+        resolved_safe_say(prompt)
         return "consumed"
 
     state.turn_consumed = False
@@ -950,13 +958,15 @@ async def _handle_post_booking_turn(
     if not normalized or not state.appointment_booked:
         return "none"
 
-    if safe_say is None:
-        def safe_say(text: str, *, allow_interruptions: bool = True) -> Any:
+    resolved_safe_say = safe_say
+    if resolved_safe_say is None:
+        def _fallback_safe_say(text: str, *, allow_interruptions: bool = True) -> Any:
             return _session_say(
                 session,
                 text,
                 allow_interruptions=allow_interruptions,
             )
+        resolved_safe_say = _fallback_safe_say
 
     if state.final_goodbye_sent:
         if user_said_goodbye(normalized) or user_declined_anything_else(normalized):
@@ -986,7 +996,7 @@ async def _handle_post_booking_turn(
                 interrupt_filler(force=True)
                 if mark_direct_response is not None:
                     mark_direct_response()
-                answer = await assistant_tools.search_clinic_info(question=text)
+                answer = await assistant_tools.answer_clinic_question(text)
                 answer = str(answer or "").strip()
                 if answer:
                     state.anything_else_pending = False
@@ -996,7 +1006,7 @@ async def _handle_post_booking_turn(
                     state.closing_state = "delivery_pending"
                     if refresh_memory_async is not None:
                         await refresh_memory_async()
-                    safe_say(f"{answer} {_delivery_question_text(state)}")
+                    resolved_safe_say(f"{answer} {_delivery_question_text(state)}")
                     return "consumed"
             state.delivery_ask_count = getattr(state, "delivery_ask_count", 0) + 1
             if state.delivery_ask_count >= 3:
@@ -1009,7 +1019,7 @@ async def _handle_post_booking_turn(
                     mark_direct_response()
                 if refresh_memory_async is not None:
                     await refresh_memory_async()
-                safe_say(_delivery_question_text(state))
+                resolved_safe_say(_delivery_question_text(state))
                 return "consumed"
             else:
                 return "none"
@@ -1022,7 +1032,7 @@ async def _handle_post_booking_turn(
         acknowledgement = await assistant_tools.set_delivery_preference(channel=preference)  # type: ignore[call-arg]
         if refresh_memory_async is not None:
             await refresh_memory_async()
-        safe_say(acknowledgement)
+        resolved_safe_say(acknowledgement)
         return "consumed"
 
     if assistant_tools.can_answer_clinic_question(text):
@@ -1037,7 +1047,7 @@ async def _handle_post_booking_turn(
         if answer:
             if refresh_memory_async is not None:
                 await refresh_memory_async()
-            safe_say(answer)
+            resolved_safe_say(answer)
             return "consumed"
 
     if state.anything_else_pending:
@@ -1053,7 +1063,7 @@ async def _handle_post_booking_turn(
             logger.info("closing_state_entered")
             if mark_direct_response is not None:
                 mark_direct_response()
-            final_handle = safe_say(_final_closing_text())
+            final_handle = resolved_safe_say(_final_closing_text())
             state.final_goodbye_sent = True
             state.closing_state = "final_goodbye_sent"
             logger.info("final_goodbye_sent")
@@ -1823,6 +1833,15 @@ async def entrypoint(ctx: JobContext):
             task.cancel()
         _clear_scheduled_filler()
 
+    def _interrupt_handle_if_possible(handle: Any) -> None:
+        interrupt = getattr(handle, "interrupt", None)
+        if not callable(interrupt):
+            return
+        try:
+            interrupt(force=True)
+        except TypeError:
+            interrupt()
+
     def _interrupt_filler(force: bool = False):
         """Interrupt a currently active filler. Pass force=True to skip the age guard."""
         sent_at = _filler_state.get("sent_at", 0.0)
@@ -1833,11 +1852,7 @@ async def entrypoint(ctx: JobContext):
         h = _filler_state.get("handle")
         if h:
             try:
-                if hasattr(h, "interrupt"):
-                    try:
-                        h.interrupt(force=True)
-                    except TypeError:
-                        h.interrupt()
+                _interrupt_handle_if_possible(h)
                 logger.info(f"[FILLER INTERRUPTED] '{_filler_state.get('text', '')}' age={age_ms:.0f}ms")
             except Exception:
                 pass
@@ -1860,19 +1875,12 @@ async def entrypoint(ctx: JobContext):
             if _filler_state.get("handle") is handle and _filler_state.get("active"):
                 _ms = (time.perf_counter() - _t0) * 1000
                 logger.info(f"[FILLER TIMEBOX] '{text}' reached {_ms:.0f}ms, interrupting")
-                if hasattr(handle, "interrupt"):
-                    try:
-                        handle.interrupt(force=True)
-                    except TypeError:
-                        handle.interrupt()
+                _interrupt_handle_if_possible(handle)
         except asyncio.CancelledError:
             _ms = (time.perf_counter() - _t0) * 1000
             logger.info(f"[FILLER CANCELLED] '{text}' after {_ms:.0f}ms")
-            if handle and hasattr(handle, "interrupt"):
-                try:
-                    handle.interrupt(force=True)
-                except TypeError:
-                    handle.interrupt()
+            if handle:
+                _interrupt_handle_if_possible(handle)
         except Exception as e:
             logger.debug(f"[FILLER ERROR] '{text}': {e}")
         finally:

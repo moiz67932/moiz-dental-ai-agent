@@ -231,22 +231,13 @@ KNOWLEDGE_STOPWORDS = {
     "you",
     "your",
 }
+PRICE_VALUE_RE = re.compile(r"\$\s?\d", re.IGNORECASE)
 QUESTION_LEAD_IN_RE = re.compile(
     r"\b("
     r"what|when|where|how(?: much| long)?|"
     r"do you|can you|could you|would you|"
     r"tell me|i (?:want|would like) to know|"
     r"get to know|let me know"
-    r")\b",
-    re.IGNORECASE,
-)
-CLINIC_INFO_HINT_RE = re.compile(
-    r"\b("
-    r"price|prices|pricing|cost|costs|fee|fees|rate|rates|"
-    r"insurance|insured|coverage|covered|accept|take|"
-    r"hours|open|close|closing|location|located|address|parking|park|"
-    r"service|services|procedure|procedures|payment|payments|financing|"
-    r"whitening|cleaning|checkup|consultation|extraction|filling|crown|root canal"
     r")\b",
     re.IGNORECASE,
 )
@@ -264,6 +255,23 @@ INSURANCE_HINT_RE = re.compile(r"\b(insurance|insured|coverage|covered|accept|ta
 HOURS_HINT_RE = re.compile(r"\b(hours|open|close|closing)\b", re.IGNORECASE)
 LOCATION_HINT_RE = re.compile(r"\b(location|located|address)\b", re.IGNORECASE)
 PARKING_HINT_RE = re.compile(r"\b(parking|park)\b", re.IGNORECASE)
+PAYMENT_HINT_RE = re.compile(
+    r"\b(payment|payments|pay|paid|cash|visa|mastercard|mc|amex|card|cards|financing|carecredit)\b",
+    re.IGNORECASE,
+)
+STAFF_HINT_RE = re.compile(
+    r"\b(doctor|dr\.?|dentist|provider|providers|staff|team|experience|graduated)\b",
+    re.IGNORECASE,
+)
+POLICY_HINT_RE = re.compile(
+    r"\b(policy|policies|privacy|hipaa|notice|late cancel|late cancellation|cancel fee|cancellation fee)\b",
+    re.IGNORECASE,
+)
+EMERGENCY_HINT_RE = re.compile(
+    r"\b(emergency|emergencies|urgent|same[- ]day|pain|toothache)\b",
+    re.IGNORECASE,
+)
+LOGISTICS_HINT_RE = re.compile(r"\b(transit|metro|station|bus|subway|train|blocks?)\b", re.IGNORECASE)
 SERVICE_INFO_HINT_RE = re.compile(
     r"\b(service|services|procedure|procedures|whitening|cleaning|checkup|consultation|extraction|filling|crown|root canal)\b",
     re.IGNORECASE,
@@ -277,8 +285,9 @@ def _normalize_knowledge_articles(articles: Optional[Sequence[Dict[str, Any]]]) 
             continue
         title = " ".join(str(article.get("title") or "").split()).strip()
         body = " ".join(str(article.get("body") or "").split()).strip()
-        if title or body:
-            normalized.append({"title": title, "body": body})
+        category = " ".join(str(article.get("category") or "").split()).strip()
+        if title or body or category:
+            normalized.append({"title": title, "body": body, "category": category})
     return normalized
 
 
@@ -307,29 +316,84 @@ def _question_topic_terms(question: str) -> set[str]:
         terms.update({"location", "located", "address"})
     if PARKING_HINT_RE.search(lower):
         terms.update({"parking", "park"})
+    if PAYMENT_HINT_RE.search(lower):
+        terms.update({"payment", "payments", "pay", "cash", "visa", "mastercard", "amex", "card", "cards", "financing", "carecredit"})
+    if STAFF_HINT_RE.search(lower):
+        terms.update({"doctor", "dentist", "provider", "providers", "staff", "team"})
+    if POLICY_HINT_RE.search(lower):
+        terms.update({"policy", "policies", "privacy", "hipaa", "notice", "cancellation", "cancel", "fee"})
+    if EMERGENCY_HINT_RE.search(lower):
+        terms.update({"emergency", "urgent", "same", "day", "pain", "toothache"})
+    if LOGISTICS_HINT_RE.search(lower):
+        terms.update({"transit", "metro", "station", "bus", "subway", "train", "blocks"})
     if SERVICE_INFO_HINT_RE.search(lower):
         terms.update({"service", "services", "procedure", "procedures"})
     return terms
 
 
-def _knowledge_match_score(question: str, *, title: str, body: str) -> int:
+def _normalize_knowledge_category(value: Optional[str]) -> str:
+    normalized = " ".join(str(value or "").strip().lower().split())
+    return normalized
+
+
+def _question_knowledge_categories(question: str) -> set[str]:
+    lower = str(question or "").lower()
+    categories: set[str] = set()
+    if PRICING_HINT_RE.search(lower):
+        categories.update({"pricing", "services"})
+    if INSURANCE_HINT_RE.search(lower):
+        categories.add("insurance")
+    if HOURS_HINT_RE.search(lower):
+        categories.add("hours")
+    if LOCATION_HINT_RE.search(lower):
+        categories.update({"location", "logistics"})
+    if PARKING_HINT_RE.search(lower):
+        categories.update({"parking", "location", "logistics"})
+    if PAYMENT_HINT_RE.search(lower):
+        categories.add("payment")
+    if STAFF_HINT_RE.search(lower):
+        categories.add("staff")
+    if POLICY_HINT_RE.search(lower):
+        categories.add("policy")
+    if EMERGENCY_HINT_RE.search(lower):
+        categories.add("emergency")
+    if LOGISTICS_HINT_RE.search(lower):
+        categories.update({"logistics", "location"})
+    if SERVICE_INFO_HINT_RE.search(lower):
+        categories.update({"services", "pricing"})
+    return categories
+
+
+def _knowledge_match_score(question: str, *, title: str, body: str, category: str = "") -> int:
     lower_question = question.lower()
-    haystacks = f"{title} {body}".lower()
+    category_key = _normalize_knowledge_category(category)
+    routed_categories = _question_knowledge_categories(question)
+    if routed_categories and category_key and category_key not in routed_categories:
+        return 0
+
+    haystacks = f"{category} {title} {body}".lower()
     title_lower = title.lower()
     body_lower = body.lower()
+    category_lower = category.lower()
     terms = _question_topic_terms(question)
     if not terms:
         return 0
 
     score = 0
+    if category_key and category_key in routed_categories:
+        score += 14
     for term in terms:
         if term in title_lower:
             score += 4
         if term in body_lower:
             score += 2
+        if term in category_lower:
+            score += 5
 
     if PRICING_HINT_RE.search(lower_question) and PRICING_HINT_RE.search(haystacks):
         score += 8
+    if PRICING_HINT_RE.search(lower_question):
+        score += 10 if PRICE_VALUE_RE.search(title) or PRICE_VALUE_RE.search(body) else -6
     if INSURANCE_HINT_RE.search(lower_question) and INSURANCE_HINT_RE.search(haystacks):
         score += 6
     if HOURS_HINT_RE.search(lower_question) and HOURS_HINT_RE.search(haystacks):
@@ -338,10 +402,20 @@ def _knowledge_match_score(question: str, *, title: str, body: str) -> int:
         score += 6
     if PARKING_HINT_RE.search(lower_question) and PARKING_HINT_RE.search(haystacks):
         score += 6
+    if PAYMENT_HINT_RE.search(lower_question) and PAYMENT_HINT_RE.search(haystacks):
+        score += 6
+    if STAFF_HINT_RE.search(lower_question) and STAFF_HINT_RE.search(haystacks):
+        score += 6
+    if POLICY_HINT_RE.search(lower_question) and POLICY_HINT_RE.search(haystacks):
+        score += 6
+    if EMERGENCY_HINT_RE.search(lower_question) and EMERGENCY_HINT_RE.search(haystacks):
+        score += 6
+    if LOGISTICS_HINT_RE.search(lower_question) and LOGISTICS_HINT_RE.search(haystacks):
+        score += 6
 
     detected_service = extract_reason_quick(question)
     if detected_service and detected_service.lower() in haystacks:
-        score += 5
+        score += 8
 
     return score
 
@@ -352,7 +426,8 @@ def _best_knowledge_article(question: str, articles: Sequence[Dict[str, str]]) -
     for article in articles:
         title = str(article.get("title") or "")
         body = str(article.get("body") or "")
-        score = _knowledge_match_score(question, title=title, body=body)
+        category = str(article.get("category") or "")
+        score = _knowledge_match_score(question, title=title, body=body, category=category)
         if score > best_score:
             best_score = score
             best_article = article
@@ -366,8 +441,9 @@ def _compact_answer_text(text: str, *, max_words: int = 34) -> str:
     if not cleaned:
         return ""
 
-    first_sentence = re.split(r"(?<=[.!?])\s+", cleaned, maxsplit=1)[0].strip()
-    candidate = first_sentence or cleaned
+    sentences = [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", cleaned) if sentence.strip()]
+    first_sentence = sentences[0] if sentences else cleaned
+    candidate = next((sentence for sentence in sentences if PRICE_VALUE_RE.search(sentence)), first_sentence or cleaned)
     words = candidate.split()
     if len(words) > max_words:
         candidate = " ".join(words[:max_words]).rstrip(",;:") + "..."
@@ -384,7 +460,7 @@ def _looks_like_clinic_info_question(
     normalized = " ".join((question or "").split()).strip().lower()
     if not normalized:
         return False
-    if CLINIC_INFO_HINT_RE.search(normalized):
+    if _question_knowledge_categories(normalized):
         return True
     if APPOINTMENT_FLOW_HINT_RE.search(normalized):
         return False
@@ -496,7 +572,9 @@ class AssistantTools:
         if not self.can_answer_clinic_question(question):
             return None
 
-        answer = await self.search_clinic_info(question=question)
+        answer = self._compose_clinic_info_answer(question)
+        if not answer:
+            answer = "I don't have that exact detail in my notes right now, but the office can confirm it for you."
         if not include_follow_up:
             return answer
 
