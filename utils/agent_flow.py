@@ -105,6 +105,7 @@ SMS_RE = re.compile(
 DELIVERY_DEFER_RE = re.compile(
     r"\b("
     r"either(?: one| is fine| works| will work)?|"
+    r"whichever(?: one)?(?: is)?(?: good| fine| okay| ok| better| best| works?)?|"
     r"doesn't matter|"
     r"don't care|"
     r"whatever(?: works| you prefer)?|"

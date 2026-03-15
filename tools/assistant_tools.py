@@ -280,6 +280,20 @@ DETAIL_REQUEST_RE = re.compile(
     r"\b(all the details|details|everything|all about|tell me about|information|info)\b",
     re.IGNORECASE,
 )
+SERVICE_FOLLOW_UP_HINT_RE = re.compile(
+    r"\b(type|kind|option|options|better|best|difference|compare|versus|vs)\b",
+    re.IGNORECASE,
+)
+KNOWLEDGE_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|;\s+")
+GENERIC_SERVICE_TERMS = {
+    "appointment",
+    "care",
+    "dental",
+    "service",
+    "teeth",
+    "tooth",
+    "treatment",
+}
 GENERIC_KNOWLEDGE_TERMS = {
     "accept",
     "address",
@@ -402,6 +416,39 @@ def _question_specific_terms(question: str) -> set[str]:
         for term in _question_topic_terms(question)
         if term not in GENERIC_KNOWLEDGE_TERMS
     }
+
+
+def _service_specific_terms(service: Optional[str]) -> set[str]:
+    if not service:
+        return set()
+    specific_terms = {
+        term
+        for term in _knowledge_terms(service)
+        if term not in GENERIC_SERVICE_TERMS
+    }
+    if specific_terms:
+        return specific_terms
+    fallback = " ".join(str(service or "").lower().split()).strip()
+    return {fallback} if fallback else set()
+
+
+def _question_with_service_context(question: str, fallback_service: Optional[str]) -> str:
+    normalized = " ".join((question or "").split()).strip()
+    service = " ".join(str(fallback_service or "").split()).strip()
+    if not normalized or not service:
+        return normalized
+    if extract_reason_quick(normalized):
+        return normalized
+
+    lower_question = normalized.lower()
+    lower_service = service.lower()
+    if lower_service in lower_question:
+        return normalized
+
+    routed_categories = _question_knowledge_categories(normalized)
+    if routed_categories.intersection({"pricing", "services"}) or SERVICE_FOLLOW_UP_HINT_RE.search(normalized):
+        return f"{normalized} about {service}"
+    return normalized
 
 
 def _specific_knowledge_match_count(question: str, *, title: str, body: str) -> int:
@@ -593,6 +640,67 @@ def _render_knowledge_article(question: str, article: Dict[str, str]) -> str:
         details = body if body else title
         return _voice_answer_text(f"The doctor's name is {title}. {details}")
 
+    detected_service = extract_reason_quick(question)
+    specific_terms = _question_specific_terms(question)
+    wants_pricing = PRICING_HINT_RE.search(lower_question) is not None
+    sentences = [
+        " ".join(sentence.split()).strip()
+        for sentence in KNOWLEDGE_SENTENCE_SPLIT_RE.split(body)
+        if " ".join(sentence.split()).strip()
+    ]
+    if body and len(sentences) > 1:
+        service_terms = _service_specific_terms(detected_service)
+        scored_sentences: list[tuple[int, int, str, bool]] = []
+        for idx, sentence in enumerate(sentences):
+            lower_sentence = sentence.lower()
+            score = 0
+            service_match = False
+            sentence_service = extract_reason_quick(sentence)
+
+            if detected_service and sentence_service and sentence_service.lower() == detected_service.lower():
+                score += 18
+                service_match = True
+            if service_terms and any(term in lower_sentence for term in service_terms):
+                score += 12
+                service_match = True
+            for term in specific_terms:
+                if term in lower_sentence:
+                    score += 4
+            if wants_pricing and PRICE_VALUE_RE.search(sentence):
+                score += 4
+            if wants_pricing and PRICING_HINT_RE.search(lower_sentence):
+                score += 2
+            if score > 0:
+                scored_sentences.append((score, idx, sentence, service_match))
+
+        selected_sentences: list[str] = []
+        if scored_sentences:
+            service_specific = [item for item in scored_sentences if item[3]]
+            if service_specific:
+                _, best_idx, best_sentence, _ = max(
+                    service_specific,
+                    key=lambda item: (item[0], -item[1]),
+                )
+                selected_sentences.append(best_sentence)
+                next_idx = best_idx + 1
+                if next_idx < len(sentences):
+                    next_sentence = sentences[next_idx]
+                    next_service = extract_reason_quick(next_sentence)
+                    next_conflicts = bool(
+                        detected_service
+                        and next_service
+                        and next_service.lower() != detected_service.lower()
+                    )
+                    if not next_conflicts and PRICE_VALUE_RE.search(next_sentence):
+                        selected_sentences.append(next_sentence)
+            else:
+                best_sentence = max(scored_sentences, key=lambda item: (item[0], -item[1]))[2]
+                selected_sentences.append(best_sentence)
+
+        if selected_sentences:
+            combined = " ".join(selected_sentences)
+            return _voice_answer_text(combined, max_words=60 if DETAIL_REQUEST_RE.search(lower_question) else 48)
+
     if body:
         return _voice_answer_text(body, max_words=60 if DETAIL_REQUEST_RE.search(lower_question) else 48)
     if title:
@@ -685,25 +793,36 @@ class AssistantTools:
         logger.info(f"[TOOLS] Instance clinic context updated: {clinic_info.get('name')}, tz={self._clinic_tz}")
 
     def can_answer_clinic_question(self, question: Optional[str]) -> bool:
+        contextual_question = _question_with_service_context(
+            " ".join((question or "").split()).strip(),
+            getattr(self.state, "reason", None),
+        )
         return _looks_like_clinic_info_question(
-            question,
+            contextual_question,
             knowledge_articles=self._knowledge_articles,
         )
 
     def _compose_clinic_info_answer(self, question: str) -> Optional[str]:
         normalized = " ".join((question or "").split()).strip()
-        if not self.can_answer_clinic_question(normalized):
+        contextual_question = _question_with_service_context(
+            normalized,
+            getattr(self.state, "reason", None),
+        )
+        if not _looks_like_clinic_info_question(
+            contextual_question,
+            knowledge_articles=self._knowledge_articles,
+        ):
             return None
 
-        routed_categories = _question_knowledge_categories(normalized)
-        ranked_articles = _rank_knowledge_articles(normalized, self._knowledge_articles)
-        detected_service = extract_reason_quick(normalized)
+        routed_categories = _question_knowledge_categories(contextual_question)
+        ranked_articles = _rank_knowledge_articles(contextual_question, self._knowledge_articles)
+        detected_service = extract_reason_quick(contextual_question)
         if routed_categories.intersection({"pricing", "services"}) and not detected_service:
-            specific_terms = _question_specific_terms(normalized)
+            specific_terms = _question_specific_terms(contextual_question)
             top_specific_match = max(
                 (
                     _specific_knowledge_match_count(
-                        normalized,
+                        contextual_question,
                         title=str(article.get("title") or ""),
                         body=str(article.get("body") or ""),
                     )
@@ -714,13 +833,13 @@ class AssistantTools:
             if not specific_terms or top_specific_match == 0:
                 return "I want to make sure I give you the right pricing. Which treatment would you like details for?"
 
-        composed = _compose_knowledge_answer(normalized, self._knowledge_articles)
+        composed = _compose_knowledge_answer(contextual_question, self._knowledge_articles)
         if composed:
             return composed
 
         service = detected_service or self.state.reason
         service_phrase = service.lower() if isinstance(service, str) else "that service"
-        lower = normalized.lower()
+        lower = contextual_question.lower()
 
         if PRICING_HINT_RE.search(lower):
             return f"I don't have the exact pricing for {service_phrase} in my notes right now, but the office can confirm the current rate for you."

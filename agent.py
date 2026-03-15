@@ -991,7 +991,8 @@ async def _handle_post_booking_turn(
     if state.delivery_preference_pending:
         preference = resolve_delivery_preference(normalized)
         if preference is None:
-            if assistant_tools.can_answer_clinic_question(text):
+            can_answer_clinic_question = assistant_tools.can_answer_clinic_question(text)
+            if can_answer_clinic_question is True:
                 cancel_scheduled_filler()
                 interrupt_filler(force=True)
                 if mark_direct_response is not None:
@@ -1035,7 +1036,8 @@ async def _handle_post_booking_turn(
         resolved_safe_say(acknowledgement)
         return "consumed"
 
-    if assistant_tools.can_answer_clinic_question(text):
+    can_answer_clinic_question = assistant_tools.can_answer_clinic_question(text)
+    if can_answer_clinic_question is True:
         cancel_scheduled_filler()
         interrupt_filler(force=True)
         if mark_direct_response is not None:
@@ -1852,7 +1854,11 @@ async def entrypoint(ctx: JobContext):
         h = _filler_state.get("handle")
         if h:
             try:
-                _interrupt_handle_if_possible(h)
+                if callable(getattr(h, "interrupt", None)):
+                    try:
+                        h.interrupt(force=True)
+                    except TypeError:
+                        h.interrupt()
                 logger.info(f"[FILLER INTERRUPTED] '{_filler_state.get('text', '')}' age={age_ms:.0f}ms")
             except Exception:
                 pass
