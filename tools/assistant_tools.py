@@ -285,6 +285,7 @@ SERVICE_FOLLOW_UP_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 KNOWLEDGE_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|;\s+")
+ANYTHING_ELSE_FOLLOW_UP_TEXT = "Is there anything else I can help you with today?"
 GENERIC_SERVICE_TERMS = {
     "appointment",
     "care",
@@ -355,6 +356,25 @@ GENERIC_KNOWLEDGE_TERMS = {
     "urgent",
     "visa",
 }
+SERVICE_BOUNDARY_TERMS = (
+    "teeth whitening",
+    "whitening",
+    "root canal",
+    "night guards",
+    "night guard",
+    "cleaning",
+    "check-up",
+    "checkup",
+    "exam",
+    "consultation",
+    "consult",
+    "extraction",
+    "extract",
+    "filling",
+    "crown",
+    "tooth pain",
+    "toothache",
+)
 
 
 def _normalize_knowledge_articles(articles: Optional[Sequence[Dict[str, Any]]]) -> list[Dict[str, str]]:
@@ -701,11 +721,86 @@ def _render_knowledge_article(question: str, article: Dict[str, str]) -> str:
             combined = " ".join(selected_sentences)
             return _voice_answer_text(combined, max_words=60 if DETAIL_REQUEST_RE.search(lower_question) else 48)
 
+    focused_excerpt = _service_focused_excerpt(question, body)
+    if focused_excerpt:
+        return _voice_answer_text(
+            focused_excerpt,
+            max_words=60 if DETAIL_REQUEST_RE.search(lower_question) else 48,
+        )
+
     if body:
         return _voice_answer_text(body, max_words=60 if DETAIL_REQUEST_RE.search(lower_question) else 48)
     if title:
         return _voice_answer_text(title)
     return ""
+
+
+def _service_focused_excerpt(question: str, body: str) -> Optional[str]:
+    cleaned_body = " ".join((body or "").split()).strip()
+    if not cleaned_body:
+        return None
+
+    detected_service = extract_reason_quick(question)
+    if not detected_service:
+        return None
+
+    service_terms = sorted(_service_specific_terms(detected_service), key=len, reverse=True)
+    if not service_terms:
+        return None
+
+    lower_body = cleaned_body.lower()
+    service_positions = [
+        match.start()
+        for term in service_terms
+        for match in re.finditer(re.escape(term), lower_body)
+    ]
+    if not service_positions:
+        return None
+
+    first_service_pos = min(service_positions)
+    start = 0
+    for match in re.finditer(r"[.!?;]\s+", cleaned_body):
+        if match.end() <= first_service_pos:
+            start = match.end()
+        else:
+            break
+
+    conflict_pos: Optional[int] = None
+    service_term_set = {term.lower() for term in service_terms}
+    for term in SERVICE_BOUNDARY_TERMS:
+        normalized_term = term.lower()
+        if any(
+            normalized_term == current
+            or normalized_term in current
+            or current in normalized_term
+            for current in service_term_set
+        ):
+            continue
+        for match in re.finditer(re.escape(term), lower_body):
+            if match.start() <= first_service_pos:
+                continue
+            conflict_pos = match.start() if conflict_pos is None else min(conflict_pos, match.start())
+            break
+
+    end = len(cleaned_body)
+    if conflict_pos is not None:
+        previous_boundary_end: Optional[int] = None
+        for match in re.finditer(r"[.!?;]\s+", cleaned_body):
+            if match.end() <= conflict_pos:
+                previous_boundary_end = match.end()
+                continue
+            break
+        if previous_boundary_end is not None and previous_boundary_end > first_service_pos:
+            end = previous_boundary_end - 1
+        else:
+            end = conflict_pos
+
+    excerpt = cleaned_body[start:end].strip(" ,;:")
+    if not excerpt:
+        return None
+    if PRICING_HINT_RE.search(question) and not PRICE_VALUE_RE.search(excerpt):
+        return None
+    return excerpt
 
 
 def _compose_knowledge_answer(question: str, articles: Sequence[Dict[str, str]]) -> Optional[str]:
@@ -722,6 +817,129 @@ def _compose_knowledge_answer(question: str, articles: Sequence[Dict[str, str]])
     if not parts:
         return None
     return " ".join(parts)
+
+
+def _has_conflicting_service_mentions(text: str, target_service: Optional[str]) -> bool:
+    normalized = " ".join((text or "").split()).strip().lower()
+    if not normalized:
+        return False
+
+    target_terms = {term.lower() for term in _service_specific_terms(target_service)}
+    if not target_terms and target_service:
+        target_terms.add(" ".join(str(target_service).lower().split()))
+
+    for term in SERVICE_BOUNDARY_TERMS:
+        normalized_term = term.lower()
+        if any(
+            normalized_term == current
+            or normalized_term in current
+            or current in normalized_term
+            for current in target_terms
+        ):
+            continue
+        if re.search(rf"(?<!\w){re.escape(term)}(?!\w)", normalized):
+            return True
+    return False
+
+
+def compose_clinic_info_answer(
+    question: str,
+    articles: Optional[Sequence[Dict[str, Any]]],
+    *,
+    fallback_service: Optional[str] = None,
+) -> Optional[str]:
+    normalized_articles = _normalize_knowledge_articles(articles)
+    normalized = " ".join((question or "").split()).strip()
+    contextual_question = _question_with_service_context(
+        normalized,
+        fallback_service,
+    )
+    if not _looks_like_clinic_info_question(
+        contextual_question,
+        knowledge_articles=normalized_articles,
+    ):
+        return None
+
+    routed_categories = _question_knowledge_categories(contextual_question)
+    ranked_articles = _rank_knowledge_articles(contextual_question, normalized_articles)
+    detected_service = extract_reason_quick(contextual_question)
+    if routed_categories.intersection({"pricing", "services"}) and not detected_service:
+        specific_terms = _question_specific_terms(contextual_question)
+        top_specific_match = max(
+            (
+                _specific_knowledge_match_count(
+                    contextual_question,
+                    title=str(article.get("title") or ""),
+                    body=str(article.get("body") or ""),
+                )
+                for _, article in ranked_articles[:3]
+            ),
+            default=0,
+        )
+        if not specific_terms or top_specific_match == 0:
+            return "I want to make sure I give you the right pricing. Which treatment would you like details for?"
+
+    composed = _compose_knowledge_answer(contextual_question, normalized_articles)
+    if composed:
+        return composed
+
+    service = detected_service or fallback_service
+    service_phrase = service.lower() if isinstance(service, str) else "that service"
+    lower = contextual_question.lower()
+
+    if PRICING_HINT_RE.search(lower):
+        return f"I don't have the exact pricing for {service_phrase} in my notes right now, but the office can confirm the current rate for you."
+    if INSURANCE_HINT_RE.search(lower):
+        return "I don't have the exact insurance details in my notes right now, but the office can confirm coverage for you."
+    if HOURS_HINT_RE.search(lower):
+        return "I don't have the exact office hours in my notes right now, but the office can confirm them for you."
+    if LOCATION_HINT_RE.search(lower) or PARKING_HINT_RE.search(lower):
+        return "I don't have that location detail in my notes right now, but the office can confirm it for you."
+    return "I don't have that exact detail in my notes right now, but the office can confirm it for you."
+
+
+def prune_clinic_response_for_tts(
+    user_question: Optional[str],
+    spoken_text: Optional[str],
+    articles: Optional[Sequence[Dict[str, Any]]],
+    *,
+    fallback_service: Optional[str] = None,
+) -> str:
+    normalized_spoken = " ".join((spoken_text or "").split()).strip()
+    normalized_question = " ".join((user_question or "").split()).strip()
+    if not normalized_spoken or not normalized_question:
+        return normalized_spoken
+
+    contextual_question = _question_with_service_context(
+        normalized_question,
+        fallback_service,
+    )
+    routed_categories = _question_knowledge_categories(contextual_question)
+    if not routed_categories.intersection({"pricing", "services"}):
+        return normalized_spoken
+
+    deterministic = compose_clinic_info_answer(
+        contextual_question,
+        articles,
+        fallback_service=fallback_service,
+    )
+    if not deterministic:
+        return normalized_spoken
+
+    preserve_follow_up = "is there anything else i can help" in normalized_spoken.lower()
+    sanitized = deterministic
+    if preserve_follow_up and ANYTHING_ELSE_FOLLOW_UP_TEXT.lower() not in sanitized.lower():
+        sanitized = f"{sanitized} {ANYTHING_ELSE_FOLLOW_UP_TEXT}"
+
+    spoken_word_count = len(normalized_spoken.split())
+    sanitized_word_count = len(sanitized.split())
+    detected_service = extract_reason_quick(contextual_question) or fallback_service
+
+    if _has_conflicting_service_mentions(normalized_spoken, detected_service):
+        return sanitized
+    if spoken_word_count > sanitized_word_count + 8:
+        return sanitized
+    return normalized_spoken
 
 
 def _looks_like_clinic_info_question(
@@ -803,53 +1021,11 @@ class AssistantTools:
         )
 
     def _compose_clinic_info_answer(self, question: str) -> Optional[str]:
-        normalized = " ".join((question or "").split()).strip()
-        contextual_question = _question_with_service_context(
-            normalized,
-            getattr(self.state, "reason", None),
+        return compose_clinic_info_answer(
+            question,
+            self._knowledge_articles,
+            fallback_service=getattr(self.state, "reason", None),
         )
-        if not _looks_like_clinic_info_question(
-            contextual_question,
-            knowledge_articles=self._knowledge_articles,
-        ):
-            return None
-
-        routed_categories = _question_knowledge_categories(contextual_question)
-        ranked_articles = _rank_knowledge_articles(contextual_question, self._knowledge_articles)
-        detected_service = extract_reason_quick(contextual_question)
-        if routed_categories.intersection({"pricing", "services"}) and not detected_service:
-            specific_terms = _question_specific_terms(contextual_question)
-            top_specific_match = max(
-                (
-                    _specific_knowledge_match_count(
-                        contextual_question,
-                        title=str(article.get("title") or ""),
-                        body=str(article.get("body") or ""),
-                    )
-                    for _, article in ranked_articles[:3]
-                ),
-                default=0,
-            )
-            if not specific_terms or top_specific_match == 0:
-                return "I want to make sure I give you the right pricing. Which treatment would you like details for?"
-
-        composed = _compose_knowledge_answer(contextual_question, self._knowledge_articles)
-        if composed:
-            return composed
-
-        service = detected_service or self.state.reason
-        service_phrase = service.lower() if isinstance(service, str) else "that service"
-        lower = contextual_question.lower()
-
-        if PRICING_HINT_RE.search(lower):
-            return f"I don't have the exact pricing for {service_phrase} in my notes right now, but the office can confirm the current rate for you."
-        if INSURANCE_HINT_RE.search(lower):
-            return "I don't have the exact insurance details in my notes right now, but the office can confirm coverage for you."
-        if HOURS_HINT_RE.search(lower):
-            return "I don't have the exact office hours in my notes right now, but the office can confirm them for you."
-        if LOCATION_HINT_RE.search(lower) or PARKING_HINT_RE.search(lower):
-            return "I don't have that location detail in my notes right now, but the office can confirm it for you."
-        return "I don't have that exact detail in my notes right now, but the office can confirm it for you."
 
     @llm.function_tool(
         description=(
@@ -886,7 +1062,7 @@ class AssistantTools:
         state.user_goodbye_detected = False
         state.closing_state = "anything_else_pending"
         _refresh_memory()
-        return f"{answer} Is there anything else I can help you with today?"
+        return f"{answer} {ANYTHING_ELSE_FOLLOW_UP_TEXT}"
 
     @llm.function_tool(
         description=(

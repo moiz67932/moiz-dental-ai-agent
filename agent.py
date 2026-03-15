@@ -131,7 +131,12 @@ from utils.agent_flow import (
     user_declined_anything_else,
     user_said_goodbye,
 )
-from tools.assistant_tools import AssistantTools, _delivery_question_text, update_global_clinic_info
+from tools.assistant_tools import (
+    AssistantTools,
+    _delivery_question_text,
+    prune_clinic_response_for_tts,
+    update_global_clinic_info,
+)
 
 # =============================================================================
 # Per-turn latency instrumentation
@@ -244,6 +249,8 @@ WORKFLOW — 1 question at a time, 1-2 sentences max:
 10. Only after the caller is done, give a brief closing and end the call.
 
 RULES:
+- CLINIC INFO is only a routing/index aid. Never read it verbatim to the caller.
+- For pricing, insurance, hours, parking, or service-detail questions, use `search_clinic_info` or the deterministic clinic-info path instead of improvising from CLINIC INFO.
 - Call update_patient_record IMMEDIATELY when you hear any info. Never wait.
 - Normalize spoken input before saving: "three one zero" -> "310", "at gmail dot com" -> "@gmail.com".
 - Once caller ID is confirmed, refer to it as "the number you're calling from", "this number", or "your number" — do not repeat the full digits unless the caller asks.
@@ -322,10 +329,9 @@ def _format_clinic_faq(articles: list[dict[str, str]]) -> str:
     for article in articles:
         category = article.get("category", "").strip()
         title = article.get("title", "").strip()
-        body = " ".join(article.get("body", "").split()[:50]).strip()
         label = f"[{category}] " if category else ""
-        if title and body:
-            lines.append(f"- {label}{title}: {body}")
+        if title:
+            lines.append(f"- {label}{title}")
     return "\n".join(lines) if lines else "No additional clinic information available."
 
 
@@ -352,8 +358,8 @@ async def _fetch_clinic_knowledge_articles(clinic_id: Optional[str]) -> list[dic
 
 async def _fetch_clinic_faq(clinic_id: Optional[str]) -> str:
     """
-    Fetch clinic FAQ articles in one query and return as a compact text block.
-    Injected into the system prompt — no tool call needed per question.
+    Fetch clinic FAQ article titles/categories as a compact index for the system prompt.
+    Exact clinic details should still come from deterministic knowledge answering.
     """
     return _format_clinic_faq(await _fetch_clinic_knowledge_articles(clinic_id))
 
@@ -1161,15 +1167,40 @@ async def entrypoint(ctx: JobContext):
         """Return False after disconnect has been signalled."""
         return not disconnect_event.is_set()
 
+    def _sanitize_spoken_output_for_tts(text: str) -> str:
+        cleaned = " ".join((text or "").split()).strip()
+        if not cleaned or not clinic_knowledge_articles:
+            return cleaned
+
+        user_question = (
+            state.last_user_text
+            or turn_tracker.snapshot.current_turn_accumulated_text
+            or turn_tracker.snapshot.latest_finalized_text
+        )
+        sanitized = prune_clinic_response_for_tts(
+            user_question,
+            cleaned,
+            clinic_knowledge_articles,
+            fallback_service=state.reason,
+        )
+        if sanitized and sanitized != cleaned:
+            logger.info(
+                f"[TTS SANITIZE] clinic_info_pruned user='{str(user_question or '')[:80]}' "
+                f"from='{cleaned[:120]}' to='{sanitized[:120]}'"
+            )
+            return sanitized
+        return cleaned
+
     def _safe_say(text: str, *, allow_interruptions: bool = True, add_to_chat_ctx: bool = True):
         """Speech wrapper that silently no-ops after disconnect."""
         if not _is_session_alive():
             logger.debug(f"[SAFE_SAY] Suppressed post-disconnect say: '{text[:40]}'")
             return None
+        spoken_text = _sanitize_spoken_output_for_tts(text)
         try:
             return _session_say(
                 session,
-                text,
+                spoken_text,
                 allow_interruptions=allow_interruptions,
                 add_to_chat_ctx=add_to_chat_ctx,
             )
