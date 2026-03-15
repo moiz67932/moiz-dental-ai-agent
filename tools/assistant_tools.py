@@ -629,11 +629,26 @@ def _select_knowledge_articles_for_answer(
     wants_details = bool(DETAIL_REQUEST_RE.search(question))
     min_score = max(4, top_score - (8 if wants_details else 4))
 
+    # When a specific service is detected (e.g. "teeth whitening"), only return
+    # articles whose title+body actually contain a service-specific term.
+    # This prevents unrelated articles (e.g. "Root Canal", "Night Guards") from
+    # being included just because a generic word like "teeth" appears in them.
+    detected_service = extract_reason_quick(question)
+    service_filter_terms = _service_specific_terms(detected_service) if detected_service else set()
+
     selected: list[Dict[str, str]] = []
     seen_bodies: set[str] = set()
     for score, article in ranked:
         if score < min_score:
             break
+
+        if service_filter_terms:
+            article_text = (
+                f"{article.get('title', '')} {article.get('body', '')}"
+            ).lower()
+            if not any(term in article_text for term in service_filter_terms):
+                continue
+
         body_key = " ".join(
             (
                 str(article.get("title") or ""),
