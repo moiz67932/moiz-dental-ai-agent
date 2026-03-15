@@ -1543,9 +1543,7 @@ async def entrypoint(ctx: JobContext):
                 )
                 spoken_text = await assistant_tools.answer_clinic_question(
                     question_text,
-                    include_follow_up=bool(
-                        state.appointment_booked and not state.delivery_preference_pending
-                    ),
+                    include_follow_up=not state.delivery_preference_pending,
                 )
                 spoken_text = str(spoken_text or "").strip()
                 if turn_tracker.snapshot.filler_spoken_for_turn:

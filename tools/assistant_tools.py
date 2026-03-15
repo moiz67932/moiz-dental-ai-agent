@@ -818,6 +818,58 @@ def _service_focused_excerpt(question: str, body: str) -> Optional[str]:
     return excerpt
 
 
+def _prune_sentences_for_service(text: str, detected_service: str) -> str:
+    """Strip sentences that mention a dental service OTHER than the one asked about.
+
+    This is the final safety net: even if article selection or sentence scoring
+    lets unrelated sentences through, this removes them so the caller only hears
+    about the service they asked about.
+
+    Two checks are applied per sentence:
+    1. extract_reason_quick — catches services it knows (whitening, root canal, etc.)
+    2. SERVICE_BOUNDARY_TERMS — catches terms not in extract_reason_quick's map
+       (e.g. "night guards") so those sentences are also excluded.
+    """
+    sentences = [s.strip() for s in KNOWLEDGE_SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    if len(sentences) <= 1:
+        return text
+
+    service_terms = _service_specific_terms(detected_service)
+    lower_target = detected_service.lower()
+    kept: list[str] = []
+
+    for sentence in sentences:
+        lower_sentence = sentence.lower()
+
+        # Check 1: if extract_reason_quick recognises a DIFFERENT service, drop it
+        sentence_service = extract_reason_quick(sentence)
+        if sentence_service and sentence_service.lower() != lower_target:
+            continue
+
+        # Check 2: if the sentence contains a SERVICE_BOUNDARY_TERM that is NOT
+        # related to our target service, and our target term is absent, drop it.
+        if service_terms:
+            has_target = any(term in lower_sentence for term in service_terms)
+            if not has_target:
+                for boundary_term in SERVICE_BOUNDARY_TERMS:
+                    norm = boundary_term.lower()
+                    # Skip boundary terms that overlap with our target service
+                    if any(
+                        norm == t or norm in t or t in norm
+                        for t in service_terms
+                    ):
+                        continue
+                    if re.search(rf"(?<!\w){re.escape(norm)}(?!\w)", lower_sentence):
+                        # Sentence mentions another service and not ours — drop it
+                        sentence = ""
+                        break
+
+        if sentence:
+            kept.append(sentence)
+
+    return " ".join(kept) if kept else text
+
+
 def _compose_knowledge_answer(question: str, articles: Sequence[Dict[str, str]]) -> Optional[str]:
     selected = _select_knowledge_articles_for_answer(question, articles)
     if not selected:
@@ -831,7 +883,17 @@ def _compose_knowledge_answer(question: str, articles: Sequence[Dict[str, str]])
 
     if not parts:
         return None
-    return " ".join(parts)
+
+    result = " ".join(parts)
+
+    # Final safety net: remove sentences about other services when a specific
+    # service was requested (e.g. asking about whitening should never include
+    # root canal or night guard sentences, regardless of article structure).
+    detected_service = extract_reason_quick(question)
+    if detected_service:
+        result = _prune_sentences_for_service(result, detected_service)
+
+    return result or None
 
 
 def _has_conflicting_service_mentions(text: str, target_service: Optional[str]) -> bool:
